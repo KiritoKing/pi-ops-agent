@@ -66,3 +66,9 @@ DeepSeek key 通过 `systemd-creds encrypt` 生成 `/etc/ops-agent/credentials/d
 ## 尚未覆盖
 
 MVP 不抵御内核漏洞、root-helper 自身内存安全漏洞、被替换的软件源/包签名根、已获得 root 的攻击者或 systemd credential 主密钥泄露。公网发布前应增加 fuzz、协议兼容测试、包管理器隔离测试和外部安全审计。
+
+### Pi 0.83.0 上游依赖告警
+
+截至 2026-08-05，官方 npm 上最新的 `@earendil-works/pi-coding-agent` 仍是 0.83.0，发布包自带 shrinkwrap，固定 `undici@8.5.0` 和 `minimatch@10.2.5`/`brace-expansion@5.0.7`。`npm audit` 因此报告 2 个 high、1 个 moderate；根项目 `overrides` 会被该 shrinkwrap 阻断，不能用伪造 lockfile 宣称已修复。
+
+本 harness 禁用了 Pi 内置工具、skill、extension、prompt template 和 context file；模型不能提供 model glob，HTTP cache/retry/cookie/blob API 也未暴露为 agent tool。因此当前已知利用路径不直接由消息输入触发，但这不是漏洞修复。部署应保持单审批者、固定模型 endpoint 和 systemd 重启/限流；上游发布包含 `undici >= 8.9.0`、`brace-expansion >= 5.0.9` 的版本后，应优先升级并重新执行完整冒烟。若威胁模型包含恶意模型 endpoint、共享 HTTP cache 或不可信本地配置写入者，应在上游修复前停止部署。
