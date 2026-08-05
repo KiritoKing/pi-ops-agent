@@ -1,0 +1,35 @@
+{
+  "name": "pi-ops-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A least-privilege, auditable Linux operations agent built on Pi.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "ops-agent": "dist/client/index.js",
+    "ops-agentd": "dist/agentd/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && node --check integrations/botmux/adapter.mjs && npm run test && go test ./...",
+    "start:agentd": "node dist/agentd/index.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "typebox": "1.3.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.2",
+    "@types/node": "26.1.2",
+    "eslint": "10.8.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.66.0",
+    "vitest": "4.1.10"
+  }
+}

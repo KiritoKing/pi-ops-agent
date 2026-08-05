@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+bin/
+*.log
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.credential
+*.cred
+*.secret
+artifacts/
+tmp/

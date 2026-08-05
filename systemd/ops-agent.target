@@ -1,0 +1,8 @@
+[Unit]
+Description=Pi Ops Agent control plane
+Documentation=file:/opt/pi-ops-agent/docs/operations.md
+Wants=network-online.target ops-root-helper.service ops-systemd-helper.service ops-agentd.service ops-agent-healthcheck.timer
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

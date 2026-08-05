@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the Pi Ops Agent read-only health report periodically
+PartOf=ops-agent.target
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+RandomizedDelaySec=30s
+AccuracySec=15s
+Persistent=yes
+Unit=ops-agent-healthcheck.service
+
+[Install]
+WantedBy=timers.target

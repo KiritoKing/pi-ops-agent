@@ -1,0 +1,16 @@
+{
+  "socketPath": "/run/ops-agent/agentd/agentd.sock",
+  "rootHelperSocket": "/run/ops-agent/helper/root-helper.sock",
+  "systemdHelperSocket": "/run/ops-agent/helper/systemd-helper.sock",
+  "stateDir": "/var/lib/ops-agent",
+  "workspaceDir": "/var/lib/ops-agent/workspace",
+  "sessionDir": "/var/lib/ops-agent/sessions",
+  "agentDir": "/var/lib/ops-agent/pi",
+  "modelsPath": "/etc/ops-agent/models.json",
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "apiKeyCredential": "deepseek_api_key",
+  "auditPath": "/var/log/ops-agent/agentd/audit.jsonl",
+  "bwrapPath": "/usr/bin/bwrap",
+  "bashPath": "/bin/bash"
+}

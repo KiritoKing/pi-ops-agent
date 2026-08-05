@@ -1,0 +1,14 @@
+[
+  {
+    "name": "ops-agent",
+    "cliId": "pi",
+    "cliPathOverride": "/opt/pi-ops-agent/bin/ops-agent-botmux",
+    "defaultWorkingDir": "/var/lib/ops-agent/workspace",
+    "allowedUsers": ["owner@example.com"],
+    "p2pOpen": false,
+    "disableCliBypass": true,
+    "backendType": "tmux",
+    "sandbox": false,
+    "writableTerminalLinkInCard": false
+  }
+]
