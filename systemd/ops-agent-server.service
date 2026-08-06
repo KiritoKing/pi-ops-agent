@@ -1,0 +1,47 @@
+[Unit]
+Description=Pi Ops Agent per-machine mTLS server
+Documentation=file:/opt/pi-ops-agent/current/docs/architecture.md
+PartOf=ops-agent.target
+Requires=ops-root-helper.service
+After=ops-root-helper.service network-online.target
+ConditionPathExists=/etc/ops-agent/server-identity.json
+ConditionPathExists=/etc/ops-agent/targets.json
+ConditionPathExists=/etc/ops-agent/tls/server.crt
+ConditionPathExists=/etc/ops-agent/tls/server.key
+ConditionPathExists=/etc/ops-agent/tls/client-ca.crt
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ops-agent-server
+Group=ops-agent-server
+SupplementaryGroups=ops-agent
+ExecStart=/opt/pi-ops-agent/current/bin/ops-agent-server --listen=0.0.0.0:7443 --identity-file=/etc/ops-agent/server-identity.json --target-policy=/etc/ops-agent/targets.json --tls-cert=/etc/ops-agent/tls/server.crt --tls-key=/etc/ops-agent/tls/server.key --client-ca=/etc/ops-agent/tls/client-ca.crt --root-helper-socket=/run/ops-agent/helper/root-helper.sock --plugin-catalog=/opt/pi-ops-agent/current/catalog
+Restart=always
+RestartSec=3s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent /run/ops-agent/helper
+
+[Install]
+WantedBy=multi-user.target

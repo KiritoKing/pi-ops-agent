@@ -1,9 +1,18 @@
 import { createConnection, type Socket } from "node:net";
+import { randomUUID } from "node:crypto";
 import {
   optionalString,
   requireRecord,
   requireString,
 } from "../shared/guards.js";
+import {
+  parseMachineId,
+  parseSessionId,
+  parseTargetId,
+  parseTurnId,
+  type TurnId,
+} from "../shared/domain.js";
+import { requireExactRecord } from "../shared/strict.js";
 import { encodeFrame, FrameDecoder } from "../shared/framing.js";
 import type {
   AgentClientMessage,
@@ -17,28 +26,53 @@ export interface AgentConnectionHandlers {
 }
 
 function parseAgentServerMessage(value: unknown): AgentServerMessage {
-  const input = requireRecord(value, "agent response");
-  const type = requireString(input.type, "agent response.type", { max: 32 });
+  const base = requireRecord(value, "agent response");
+  const type = requireString(base.type, "agent response.type", { max: 32 });
+  const correlation = (input: Record<string, unknown>) => {
+    const machineId = optionalString(input.machineId, "agent response.machineId", { max: 160 });
+    const targetId = optionalString(input.targetId, "agent response.targetId", { max: 160 });
+    return {
+      sessionId: parseSessionId(input.sessionId, "agent response.sessionId"),
+      turnId: parseTurnId(input.turnId, "agent response.turnId"),
+      ...(machineId === undefined ? {} : { machineId: parseMachineId(machineId) }),
+      ...(targetId === undefined ? {} : { targetId: parseTargetId(targetId) }),
+    };
+  };
   switch (type) {
-    case "ready":
+    case "ready": {
+      const input = requireExactRecord(base, "agent ready response", ["type", "sessionId"]);
       return {
         type,
-        sessionId: requireString(input.sessionId, "agent response.sessionId", { max: 160 }),
+        sessionId: parseSessionId(input.sessionId, "agent response.sessionId"),
       };
+    }
     case "status": {
+      const input = requireExactRecord(base, "agent status response", [
+        "type", "state", "route", "sessionId", "turnId", "machineId", "targetId",
+      ]);
       const state = requireString(input.state, "agent response.state", { max: 16 });
       if (state !== "idle" && state !== "working") {
         throw new Error(`unsupported agent status: ${state}`);
       }
       const route = optionalString(input.route, "agent response.route", { max: 512 });
-      return route === undefined ? { type, state } : { type, state, route };
+      return route === undefined
+        ? { type, state, ...correlation(input) }
+        : { type, state, route, ...correlation(input) };
     }
-    case "delta":
+    case "delta": {
+      const input = requireExactRecord(base, "agent delta response", [
+        "type", "text", "sessionId", "turnId", "machineId", "targetId",
+      ]);
       return {
         type,
         text: requireString(input.text, "agent response.text", { min: 0, max: 256 * 1024 }),
+        ...correlation(input),
       };
+    }
     case "tool": {
+      const input = requireExactRecord(base, "agent tool response", [
+        "type", "phase", "name", "isError", "sessionId", "turnId", "machineId", "targetId",
+      ]);
       const phase = requireString(input.phase, "agent response.phase", { max: 16 });
       if (phase !== "start" && phase !== "end") {
         throw new Error(`unsupported tool phase: ${phase}`);
@@ -50,16 +84,35 @@ function parseAgentServerMessage(value: unknown): AgentServerMessage {
         type,
         phase,
         name: requireString(input.name, "agent response.name", { max: 256 }),
+        ...correlation(input),
       };
       return input.isError === undefined ? message : { ...message, isError: input.isError };
     }
-    case "error":
+    case "error": {
+      const input = requireExactRecord(base, "agent error response", [
+        "type", "message", "sessionId", "turnId", "machineId", "targetId",
+      ]);
+      const sessionId = optionalString(input.sessionId, "agent response.sessionId", { max: 160 });
+      const turnId = optionalString(input.turnId, "agent response.turnId", { max: 160 });
+      const machineId = optionalString(input.machineId, "agent response.machineId", { max: 160 });
+      const targetId = optionalString(input.targetId, "agent response.targetId", { max: 160 });
       return {
         type,
         message: requireString(input.message, "agent response.message", { max: 64 * 1024 }),
+        ...(sessionId === undefined ? {} : { sessionId: parseSessionId(sessionId) }),
+        ...(turnId === undefined ? {} : { turnId: parseTurnId(turnId) }),
+        ...(machineId === undefined ? {} : { machineId: parseMachineId(machineId) }),
+        ...(targetId === undefined ? {} : { targetId: parseTargetId(targetId) }),
       };
-    case "done":
+    }
+    case "done": {
+      const input = requireExactRecord(base, "agent done response", [
+        "type", "sessionId", "turnId", "machineId", "targetId",
+      ]);
+      return { type, ...correlation(input) };
+    }
     case "pong":
+      requireExactRecord(base, "agent pong response", ["type"]);
       return { type };
     default:
       throw new Error(`unsupported agent response type: ${type}`);
@@ -67,7 +120,7 @@ function parseAgentServerMessage(value: unknown): AgentServerMessage {
 }
 
 export interface AgentTransport {
-  sendPrompt(text: string): void;
+  sendPrompt(text: string): TurnId;
   abort(): void;
   close(): void;
 }
@@ -119,8 +172,10 @@ export class AgentConnection implements AgentTransport {
     });
   }
 
-  sendPrompt(text: string): void {
-    this.#send({ type: "prompt", text });
+  sendPrompt(text: string): TurnId {
+    const turnId = parseTurnId(randomUUID());
+    this.#send({ type: "prompt", turnId, text });
+    return turnId;
   }
 
   abort(): void {

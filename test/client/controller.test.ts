@@ -1,6 +1,9 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { AgentTransport } from "../../src/client/agent-connection.js";
+import { parseSessionId, parseTurnId } from "../../src/shared/domain.js";
+import { parseChangeId, parseMachineId, parseServerId, parseTargetId } from "../../src/shared/domain.js";
+import { encodeChangeRef } from "../../src/shared/approval.js";
 import { ClientController, type HelperCaller } from "../../src/client/controller.js";
 import type {
   ClientCompletionEvent,
@@ -8,13 +11,22 @@ import type {
 } from "../../src/client/events.js";
 import type { HelperRequest } from "../../src/shared/messages.js";
 
+const CHANGE_REF = encodeChangeRef({
+  version: 1,
+  serverId: parseServerId("server-12345678"),
+  machineId: parseMachineId("machine-12345678"),
+  targetId: parseTargetId("target-12345678"),
+  changeId: parseChangeId("change-1234"),
+});
+
 class FakeAgent implements AgentTransport {
   readonly prompts: string[] = [];
   abortCount = 0;
   closeCount = 0;
 
-  sendPrompt(text: string): void {
+  sendPrompt(text: string): ReturnType<typeof parseTurnId> {
     this.prompts.push(text);
+    return parseTurnId("turn-12345678");
   }
 
   abort(): void {
@@ -60,19 +72,23 @@ describe("ClientController", () => {
     controller.submit("second");
     expect(agent.prompts).toEqual([]);
 
-    controller.handleAgentMessage({ type: "ready", sessionId: "session-1234" });
+    const sessionId = parseSessionId("session-1234");
+    const turnId = parseTurnId("turn-12345678");
+    controller.handleAgentMessage({ type: "ready", sessionId });
     expect(agent.prompts).toEqual(["first"]);
-    controller.handleAgentMessage({ type: "status", state: "working" });
-    controller.handleAgentMessage({ type: "delta", text: "result" });
-    controller.handleAgentMessage({ type: "done" });
+    controller.handleAgentMessage({ type: "status", state: "working", sessionId, turnId });
+    controller.handleAgentMessage({ type: "delta", text: "result", sessionId, turnId });
+    controller.handleAgentMessage({ type: "done", sessionId, turnId });
     await controller.waitForEvents();
     expect(agent.prompts).toEqual(["first", "second"]);
     expect(output.read()).toContain("Working...\nresult\n");
-    expect(eventSink.events).toEqual([{
+    expect(eventSink.events).toMatchObject([{
       version: 1,
       type: "completion",
       outcome: "success",
       content: "result",
+      sessionId,
+      turnId,
     }]);
     expect(eventSink.events.map((event) => event.content).join("\n")).not.toContain("Working...");
   });
@@ -101,7 +117,7 @@ describe("ClientController", () => {
       eventSink,
     });
 
-    controller.submit("/approve change-1234");
+    controller.submit(`/approve ${CHANGE_REF}`);
     await controller.waitForDirectCommands();
     await controller.waitForEvents();
     expect(agent.prompts).toEqual([]);
@@ -111,7 +127,7 @@ describe("ClientController", () => {
     });
     expect(output.read()).toContain("Working...");
     expect(output.read()).toContain("state=COMMITTED");
-    expect(eventSink.events).toEqual([{
+    expect(eventSink.events).toMatchObject([{
       version: 1,
       type: "completion",
       outcome: "success",
@@ -141,7 +157,7 @@ describe("ClientController", () => {
       helperCaller,
     });
 
-    controller.submit("/rollback change-1234");
+    controller.submit(`/rollback ${CHANGE_REF}`);
     await controller.waitForDirectCommands();
     expect(timeoutMs).toBeGreaterThan(9 * 60_000);
     expect(output.read()).toContain("state=ROLLED_BACK");
@@ -158,8 +174,10 @@ describe("ClientController", () => {
     });
     controller.submit("must not run");
     controller.abort();
-    controller.handleAgentMessage({ type: "ready", sessionId: "session-1234" });
-    controller.handleAgentMessage({ type: "done" });
+    const sessionId = parseSessionId("session-1234");
+    const turnId = parseTurnId("turn-12345678");
+    controller.handleAgentMessage({ type: "ready", sessionId });
+    controller.handleAgentMessage({ type: "done", sessionId, turnId });
     expect(agent.abortCount).toBe(1);
     expect(agent.prompts).toEqual([]);
   });
@@ -188,7 +206,7 @@ describe("ClientController", () => {
     await controller.waitForEvents();
 
     expect(eventSink.events).toHaveLength(3);
-    expect(eventSink.events[0]?.content).toContain("usage: /approve <changeId>");
+    expect(eventSink.events[0]?.content).toContain("usage: /approve <changeRef>");
     expect(eventSink.events[0]?.outcome).toBe("error");
     expect(eventSink.events[1]?.content).toBe(
       "[agentd error] upstream token=[REDACTED] authorization: [REDACTED]",
@@ -216,7 +234,7 @@ describe("ClientController", () => {
     controller.submit("/status");
     await controller.waitForEvents();
     expect(eventSink.events).toHaveLength(1);
-    expect(output.read()).toContain("[input error] usage: /status <changeId>");
+    expect(output.read()).toContain("[input error] usage: /status <changeRef>");
     expect(output.read()).toContain("[event sink error] send failed");
   });
 });

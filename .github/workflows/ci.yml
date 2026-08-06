@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 permissions:
@@ -27,5 +27,13 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
-      - run: go test ./cmd/... ./internal/...
+      - name: Validate native installer and packaging shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          bash -n scripts/*.sh packaging/*.sh
+      - run: go vet ./cmd/... ./internal/...
+      - run: go test -race ./internal/...
       - run: go build ./cmd/...
+      - run: git diff --check

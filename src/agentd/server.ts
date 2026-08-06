@@ -1,7 +1,9 @@
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { AgentConfig } from "../shared/config.js";
+import { parseTurnId, type SessionId, type TurnId } from "../shared/domain.js";
 import { encodeFrame, FrameDecoder } from "../shared/framing.js";
 import { parseAgentClientMessage, type AgentServerMessage } from "../shared/messages.js";
 import { callHelper, deadline, requestId } from "../shared/rpc.js";
@@ -59,6 +61,8 @@ export class AgentServer {
   #handleConnection(socket: Socket): void {
     const decoder = new FrameDecoder();
     let session: OpsSession | undefined;
+    let sessionId: SessionId | undefined;
+    let activeTurnId: TurnId | undefined;
     let queue = Promise.resolve();
     const emit = (message: AgentServerMessage): void => {
       if (!socket.destroyed) socket.write(encodeFrame(message));
@@ -79,19 +83,33 @@ export class AgentServer {
               const message = parseAgentClientMessage(frame);
               if (message.type === "hello") {
                 if (session) throw new Error("hello already received");
+                sessionId = message.sessionId;
                 session = await this.#sessions.open(message.sessionId, emit);
                 emit({ type: "ready", sessionId: message.sessionId });
-                if (message.initialPrompt) await session.prompt(message.initialPrompt);
+                if (message.initialPrompt) {
+                  activeTurnId = parseTurnId(randomUUID());
+                  await session.prompt(message.initialPrompt, activeTurnId);
+                  activeTurnId = undefined;
+                }
                 return;
               }
               if (!session) throw new Error("hello must be the first message");
-              if (message.type === "prompt") await session.prompt(message.text);
+              if (message.type === "prompt") {
+                activeTurnId = message.turnId;
+                await session.prompt(message.text, message.turnId);
+                activeTurnId = undefined;
+              }
               else if (message.type === "abort") await session.abort();
               else emit({ type: "pong" });
             })
             .catch((error: unknown) => {
               const message = error instanceof Error ? error.message : String(error);
-              emit({ type: "error", message });
+              emit({
+                type: "error",
+                message,
+                ...(sessionId === undefined ? {} : { sessionId }),
+                ...(activeTurnId === undefined ? {} : { turnId: activeTurnId }),
+              });
               void this.#audit.append({ type: "connection_error", message });
             });
         }

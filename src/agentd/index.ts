@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const config = await loadAgentConfig(configPath);
   await Promise.all([
     mkdir(config.stateDir, { recursive: true, mode: 0o750 }),
-    mkdir(config.workspaceDir, { recursive: true, mode: 0o750 }),
+    mkdir(config.workspaceRoot, { recursive: true, mode: 0o750 }),
     mkdir(config.sessionDir, { recursive: true, mode: 0o750 }),
     mkdir(config.agentDir, { recursive: true, mode: 0o700 }),
   ]);

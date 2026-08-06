@@ -1,4 +1,6 @@
 import type { Writable } from "node:stream";
+import { randomUUID } from "node:crypto";
+import type { MachineId, SessionId, TargetId, TurnId } from "../shared/domain.js";
 import type { AgentServerMessage, HelperResponse } from "../shared/messages.js";
 import { redactText } from "../shared/redaction.js";
 import { callHelper } from "../shared/rpc.js";
@@ -9,6 +11,7 @@ import {
   type ClientEventSink,
 } from "./events.js";
 import { helperRequestFor, helperTimeoutFor, parseDirectCommand } from "./commands.js";
+import type { ApprovalCommandHandler } from "./approval-router.js";
 
 export type HelperCaller = typeof callHelper;
 
@@ -17,6 +20,7 @@ export interface ClientControllerOptions {
   rootHelperSocket: string;
   output: Writable;
   helperCaller?: HelperCaller;
+  directCommandHandler?: ApprovalCommandHandler;
   hasInitialPrompt?: boolean;
   eventSink?: ClientEventSink | undefined;
 }
@@ -58,6 +62,7 @@ export class ClientController {
   readonly #rootHelperSocket: string;
   readonly #output: Writable;
   readonly #helperCaller: HelperCaller;
+  readonly #directCommandHandler: ApprovalCommandHandler;
   readonly #eventSink: ClientEventSink | undefined;
   readonly #pendingPrompts: string[] = [];
   #ready = false;
@@ -67,12 +72,23 @@ export class ClientController {
   #assistantContent = "";
   #assistantContentTruncated = false;
   #lastOutputEndedWithNewline = true;
+  #sessionId: SessionId | undefined;
+  #activeTurnId: TurnId | undefined;
+  #activeMachineId: MachineId | undefined;
+  #activeTargetId: TargetId | undefined;
 
   constructor(options: ClientControllerOptions) {
     this.#agent = options.agent;
     this.#rootHelperSocket = options.rootHelperSocket;
     this.#output = options.output;
     this.#helperCaller = options.helperCaller ?? callHelper;
+    this.#directCommandHandler = options.directCommandHandler ?? (async (command) =>
+      await this.#helperCaller(
+        this.#rootHelperSocket,
+        helperRequestFor(command),
+        undefined,
+        helperTimeoutFor(command),
+      ));
     this.#eventSink = options.eventSink;
     this.#agentBusy = options.hasInitialPrompt ?? false;
   }
@@ -92,12 +108,7 @@ export class ClientController {
       this.#directQueue = this.#directQueue
         .then(async () => {
           this.#writeLine("Working...");
-          const response = await this.#helperCaller(
-            this.#rootHelperSocket,
-            helperRequestFor(command),
-            undefined,
-            helperTimeoutFor(command),
-          );
+          const response = await this.#directCommandHandler(command);
           const formatted = formatHelperResponse(response);
           this.#writeLine(formatted);
           this.#queueEvent(
@@ -129,16 +140,19 @@ export class ClientController {
   handleAgentMessage(message: AgentServerMessage): void {
     switch (message.type) {
       case "ready":
+        this.#sessionId = message.sessionId;
         this.#ready = true;
         this.#drainPrompts();
         break;
       case "status":
+        this.#captureCorrelation(message);
         if (message.state === "working") {
           this.#agentBusy = true;
           this.#writeLine("Working...");
         }
         break;
       case "delta":
+        this.#captureCorrelation(message);
         this.#write(message.text);
         if (!this.#assistantContentTruncated) {
           const bounded = boundClientEventContent(`${this.#assistantContent}${message.text}`);
@@ -147,8 +161,10 @@ export class ClientController {
         }
         break;
       case "tool":
+        this.#captureCorrelation(message);
         break;
       case "done":
+        this.#captureCorrelation(message);
         this.#ensureNewline();
         this.#queueEvent(this.#assistantContent, "success");
         this.#resetAssistantContent();
@@ -156,6 +172,14 @@ export class ClientController {
         this.#drainPrompts();
         break;
       case "error":
+        if (message.sessionId !== undefined && message.turnId !== undefined) {
+          this.#captureCorrelation({
+            sessionId: message.sessionId,
+            turnId: message.turnId,
+            ...(message.machineId === undefined ? {} : { machineId: message.machineId }),
+            ...(message.targetId === undefined ? {} : { targetId: message.targetId }),
+          });
+        }
         this.#ensureNewline();
         this.#writeAndNotifyError("agentd", message.message);
         this.#resetAssistantContent();
@@ -180,6 +204,10 @@ export class ClientController {
     await this.#eventQueue;
   }
 
+  isIdle(): boolean {
+    return this.#ready && !this.#agentBusy && this.#pendingPrompts.length === 0;
+  }
+
   #drainPrompts(): void {
     if (!this.#ready || this.#agentBusy) return;
     const prompt = this.#pendingPrompts.shift();
@@ -187,7 +215,7 @@ export class ClientController {
     this.#agentBusy = true;
     this.#resetAssistantContent();
     try {
-      this.#agent.sendPrompt(prompt);
+      this.#activeTurnId = this.#agent.sendPrompt(prompt);
     } catch (error) {
       this.#agentBusy = false;
       this.#writeAndNotifyError("agentd", error);
@@ -213,12 +241,21 @@ export class ClientController {
   #queueEvent(content: string, outcome: ClientCompletionOutcome): void {
     const eventSink = this.#eventSink;
     if (!eventSink || content.length === 0) return;
+    const correlation = {
+      ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
+      ...(this.#activeTurnId === undefined ? {} : { turnId: this.#activeTurnId }),
+      ...(this.#activeMachineId === undefined ? {} : { machineId: this.#activeMachineId }),
+      ...(this.#activeTargetId === undefined ? {} : { targetId: this.#activeTargetId }),
+    };
+    const eventId = randomUUID();
     this.#eventQueue = this.#eventQueue
       .then(async () => await eventSink.publish({
         version: 1,
         type: "completion",
+        eventId,
         outcome,
         content,
+        ...correlation,
       }))
       .catch((error: unknown) => {
         this.#writeLine(`[event sink error] ${errorMessage(error)}`);
@@ -234,5 +271,17 @@ export class ClientController {
   #resetAssistantContent(): void {
     this.#assistantContent = "";
     this.#assistantContentTruncated = false;
+  }
+
+  #captureCorrelation(message: {
+    sessionId: SessionId;
+    turnId: TurnId;
+    machineId?: MachineId;
+    targetId?: TargetId;
+  }): void {
+    this.#sessionId = message.sessionId;
+    this.#activeTurnId = message.turnId;
+    if (message.machineId !== undefined) this.#activeMachineId = message.machineId;
+    if (message.targetId !== undefined) this.#activeTargetId = message.targetId;
   }
 }

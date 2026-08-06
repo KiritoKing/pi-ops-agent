@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/KiritoKing/pi-ops-agent/internal/pluginpkg"
 	"github.com/KiritoKing/pi-ops-agent/internal/protocol"
 )
 
@@ -61,6 +62,9 @@ type OSExecutor struct {
 	AllowedRoots    []string
 	AllowBreakglass bool
 	Runner          CommandRunner
+	PluginRoot      string
+	PluginCatalog   string
+	PluginBinRoot   string
 }
 
 func (e *OSExecutor) Prepare(ctx context.Context, changeID string, operation protocol.Operation) (ExecutionResult, error) {
@@ -77,6 +81,8 @@ func (e *OSExecutor) Prepare(ctx context.Context, changeID string, operation pro
 		return e.prepareService(ctx, value)
 	case *protocol.FileWrite:
 		return e.prepareFile(changeID, value)
+	case *protocol.PluginInstall:
+		return e.preparePluginInstall(changeID, value)
 	case *protocol.BreakglassScript:
 		return e.prepareBreakglass(ctx, changeID, value)
 	default:
@@ -99,6 +105,8 @@ func (e *OSExecutor) Execute(ctx context.Context, changeID string, operation pro
 		return err
 	case *protocol.FileWrite:
 		return e.executeFile(value, result)
+	case *protocol.PluginInstall:
+		return e.executePluginInstall(changeID, value)
 	case *protocol.BreakglassScript:
 		scriptPath := filepath.Join(e.StateDir, "changes", changeID, "script.sh")
 		_, err := e.runCapsule(ctx, changeID, scriptPath, value.BackupPaths)
@@ -119,6 +127,15 @@ func (e *OSExecutor) ValidateOperation(operation protocol.Operation) error {
 		return nil
 	case *protocol.FileWrite:
 		return e.ensureAllowedPath(value.Path)
+	case *protocol.PluginInstall:
+		if value.PluginID != "adapter.botmux" {
+			return errors.New("this release only implements the adapter.botmux installer")
+		}
+		catalog := e.pluginCatalog()
+		if _, err := pluginpkg.Inspect(value.CatalogPath, catalog); err != nil {
+			return err
+		}
+		return nil
 	case *protocol.BreakglassScript:
 		if !e.AllowBreakglass {
 			return errors.New("break-glass execution is disabled")
@@ -171,6 +188,20 @@ func (e *OSExecutor) Verify(ctx context.Context, _ string, operation protocol.Op
 			return "", errors.New("written file digest mismatch")
 		}
 		return "sha256:" + hex.EncodeToString(actual[:]), nil
+	case *protocol.PluginInstall:
+		packageInfo, err := pluginpkg.Inspect(value.CatalogPath, e.pluginCatalog())
+		if err != nil {
+			return "", err
+		}
+		if err := packageInfo.ValidateExpected(value.PluginID, value.Version, value.Digest); err != nil {
+			return "", err
+		}
+		destination := filepath.Join(e.pluginRoot(), value.PluginID, value.Version)
+		entrypoint := filepath.Join(destination, filepath.FromSlash(packageInfo.Manifest.Entrypoint))
+		if info, statErr := os.Stat(entrypoint); statErr != nil || !info.Mode().IsRegular() {
+			return "", errors.New("installed plugin entrypoint is missing or not a regular file")
+		}
+		return "installed " + value.PluginID + " " + value.Version + " " + value.Digest, nil
 	case *protocol.BreakglassScript:
 		if value.VerifyScript == "" {
 			return "script completed; no verification script supplied", nil
@@ -227,6 +258,8 @@ func (e *OSExecutor) Rollback(ctx context.Context, _ string, operation protocol.
 			return err
 		}
 		return atomicReplace(value.Path, payload, os.FileMode(rollback.Mode), rollback.UID, rollback.GID)
+	case *protocol.PluginInstall:
+		return e.rollbackPluginInstall(value, result)
 	case *protocol.BreakglassScript:
 		var rollback breakglassRollback
 		if err := json.Unmarshal(result.RollbackData, &rollback); err != nil {
@@ -256,6 +289,15 @@ type fileRollback struct {
 type breakglassRollback struct {
 	ChangeID string `json:"changeId"`
 	Archive  string `json:"archive"`
+}
+
+type pluginInstallRollback struct {
+	Destination    string `json:"destination"`
+	CurrentLink    string `json:"currentLink"`
+	PreviousLink   string `json:"previousLink,omitempty"`
+	WrapperPath    string `json:"wrapperPath,omitempty"`
+	WrapperBackup  string `json:"wrapperBackup,omitempty"`
+	WrapperExisted bool   `json:"wrapperExisted"`
 }
 
 func (e *OSExecutor) preparePackage(ctx context.Context, operation *protocol.PackageInstall) (ExecutionResult, error) {
@@ -398,6 +440,164 @@ func (e *OSExecutor) executeFile(operation *protocol.FileWrite, result Execution
 		mode = os.FileMode(parsed)
 	}
 	return atomicReplace(operation.Path, []byte(operation.Content), mode, uid, gid)
+}
+
+func (e *OSExecutor) preparePluginInstall(changeID string, operation *protocol.PluginInstall) (ExecutionResult, error) {
+	packageInfo, err := pluginpkg.Inspect(operation.CatalogPath, e.pluginCatalog())
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	if err := packageInfo.ValidateExpected(operation.PluginID, operation.Version, operation.Digest); err != nil {
+		return ExecutionResult{}, err
+	}
+	destination := filepath.Join(e.pluginRoot(), operation.PluginID, operation.Version)
+	if _, err := os.Lstat(destination); err == nil {
+		return ExecutionResult{}, errors.New("plugin version is already installed")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ExecutionResult{}, err
+	}
+	changeDir := filepath.Join(e.StateDir, "changes", changeID)
+	if err := os.MkdirAll(changeDir, 0o700); err != nil {
+		return ExecutionResult{}, err
+	}
+	rollback := pluginInstallRollback{
+		Destination: destination,
+		CurrentLink: filepath.Join(e.pluginRoot(), operation.PluginID, "current"),
+	}
+	if previous, err := os.Readlink(rollback.CurrentLink); err == nil {
+		rollback.PreviousLink = previous
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ExecutionResult{}, errors.New("plugin current pointer is not a symbolic link")
+	}
+	if operation.PluginID == "adapter.botmux" {
+		rollback.WrapperPath = filepath.Join(e.pluginBinRoot(), "ops-agent-botmux")
+		if info, err := os.Lstat(rollback.WrapperPath); err == nil {
+			if !info.Mode().IsRegular() {
+				return ExecutionResult{}, errors.New("existing BotMux launcher is not a regular file")
+			}
+			rollback.WrapperExisted = true
+			rollback.WrapperBackup = filepath.Join(changeDir, "ops-agent-botmux.backup")
+			if err := copyFile(rollback.WrapperPath, rollback.WrapperBackup, 0o600); err != nil {
+				return ExecutionResult{}, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return ExecutionResult{}, err
+		}
+	}
+	payload, _ := json.Marshal(rollback)
+	refs := []string{}
+	if rollback.WrapperBackup != "" {
+		refs = append(refs, rollback.WrapperBackup)
+	}
+	return ExecutionResult{BackupRefs: refs, RollbackData: payload, RollbackAvailable: true}, nil
+}
+
+func (e *OSExecutor) executePluginInstall(changeID string, operation *protocol.PluginInstall) error {
+	packageInfo, err := pluginpkg.Inspect(operation.CatalogPath, e.pluginCatalog())
+	if err != nil {
+		return err
+	}
+	if err := packageInfo.ValidateExpected(operation.PluginID, operation.Version, operation.Digest); err != nil {
+		return err
+	}
+	pluginDirectory := filepath.Join(e.pluginRoot(), operation.PluginID)
+	if err := os.MkdirAll(pluginDirectory, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(e.pluginRoot(), 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(pluginDirectory, 0o755); err != nil {
+		return err
+	}
+	staging := filepath.Join(pluginDirectory, ".staging-"+safeUnitFragment(changeID))
+	if err := os.RemoveAll(staging); err != nil {
+		return err
+	}
+	if err := packageInfo.Extract(staging); err != nil {
+		_ = os.RemoveAll(staging)
+		return err
+	}
+	destination := filepath.Join(pluginDirectory, operation.Version)
+	if err := os.Rename(staging, destination); err != nil {
+		_ = os.RemoveAll(staging)
+		return err
+	}
+	temporaryLink := filepath.Join(pluginDirectory, ".current-"+safeUnitFragment(changeID))
+	_ = os.Remove(temporaryLink)
+	if err := os.Symlink(operation.Version, temporaryLink); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryLink, filepath.Join(pluginDirectory, "current")); err != nil {
+		return err
+	}
+	if operation.PluginID == "adapter.botmux" {
+		if err := os.MkdirAll(e.pluginBinRoot(), 0o755); err != nil {
+			return err
+		}
+		if err := os.Chmod(e.pluginBinRoot(), 0o755); err != nil {
+			return err
+		}
+		launcher := "#!/bin/sh\nset -eu\nexport OPS_AGENT_CORE_ROOT=/opt/pi-ops-agent/current\nexec /opt/pi-ops-agent/current/runtime/node /opt/pi-ops-agent/plugins/adapter.botmux/current/adapter.mjs \"$@\"\n"
+		if err := atomicReplace(filepath.Join(e.pluginBinRoot(), "ops-agent-botmux"), []byte(launcher), 0o755, -1, -1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *OSExecutor) rollbackPluginInstall(operation *protocol.PluginInstall, result ExecutionResult) error {
+	var rollback pluginInstallRollback
+	if err := json.Unmarshal(result.RollbackData, &rollback); err != nil {
+		return err
+	}
+	expectedDestination := filepath.Join(e.pluginRoot(), operation.PluginID, operation.Version)
+	if rollback.Destination != expectedDestination || filepath.Clean(rollback.Destination) != rollback.Destination {
+		return errors.New("plugin rollback destination does not match the operation")
+	}
+	if err := os.RemoveAll(rollback.Destination); err != nil {
+		return err
+	}
+	_ = os.Remove(rollback.CurrentLink)
+	if rollback.PreviousLink != "" {
+		if err := os.Symlink(rollback.PreviousLink, rollback.CurrentLink); err != nil {
+			return err
+		}
+	}
+	if rollback.WrapperPath != "" {
+		if rollback.WrapperExisted {
+			payload, err := os.ReadFile(rollback.WrapperBackup)
+			if err != nil {
+				return err
+			}
+			return atomicReplace(rollback.WrapperPath, payload, 0o755, -1, -1)
+		}
+		if err := os.Remove(rollback.WrapperPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *OSExecutor) pluginRoot() string {
+	if e.PluginRoot != "" {
+		return e.PluginRoot
+	}
+	return "/opt/pi-ops-agent/plugins"
+}
+
+func (e *OSExecutor) pluginCatalog() string {
+	if e.PluginCatalog != "" {
+		return e.PluginCatalog
+	}
+	return "/opt/pi-ops-agent/current/catalog"
+}
+
+func (e *OSExecutor) pluginBinRoot() string {
+	if e.PluginBinRoot != "" {
+		return e.PluginBinRoot
+	}
+	return "/opt/pi-ops-agent/bin"
 }
 
 func (e *OSExecutor) prepareBreakglass(ctx context.Context, changeID string, operation *protocol.BreakglassScript) (ExecutionResult, error) {

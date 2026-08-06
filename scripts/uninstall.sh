@@ -37,11 +37,12 @@ if [[ "${PURGE_STATE}" == true ]] && [[ "${CONFIRMED}" != true ]]; then
 fi
 
 systemctl disable --now ops-agent-healthcheck.timer ops-agent.target >/dev/null 2>&1 || true
-systemctl stop ops-agentd.service ops-systemd-helper.service ops-root-helper.service >/dev/null 2>&1 || true
+systemctl stop ops-agentd.service ops-agent-server.service ops-systemd-helper.service ops-root-helper.service >/dev/null 2>&1 || true
 
 for file in \
   ops-agent.target \
   ops-agentd.service \
+  ops-agent-server.service \
   ops-root-helper.service \
   ops-systemd-helper.service \
   ops-agent-healthcheck.service \
@@ -49,6 +50,10 @@ for file in \
   rm -f -- "/etc/systemd/system/${file}"
 done
 rm -f -- /etc/tmpfiles.d/ops-agent.conf
+if [[ -L /usr/local/bin/ops-agent ]] \
+  && [[ "$(readlink /usr/local/bin/ops-agent)" == "/opt/pi-ops-agent/current/bin/ops-agent" ]]; then
+  rm -f -- /usr/local/bin/ops-agent
+fi
 
 if [[ -d "${APP_ROOT}" ]]; then
   find "${APP_ROOT}" -mindepth 1 -depth -delete

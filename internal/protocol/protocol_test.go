@@ -65,3 +65,24 @@ func TestParseRequestRejectsExpiredAndDistantDeadline(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteRequestScopeAndPluginOperationsAreStrict(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	base := fmt.Sprintf(`{"version":1,"requestId":"request-remote-0001","deadline":%q,"method":"change.prepare","serverId":"server-12345678","machineId":"machine-12345678","targetId":"hermes","sessionId":"session-12345678","turnId":"turn-12345678","policyRevision":"policy-12345678","callerRole":"agent","operation":{"kind":"plugin.install","pluginId":"adapter.botmux","version":"1.0.0","digest":"sha256:%s","catalogPath":"/var/lib/ops-agent/plugins/catalog/adapter-botmux.opspkg"}}`, now.Add(time.Minute).Format(time.RFC3339Nano), strings.Repeat("a", 64))
+	request, err := ParseRequest([]byte(base), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, ok := request.Operation.(*PluginInstall)
+	if !ok || operation.PluginID != "adapter.botmux" || request.TargetID != "hermes" {
+		t.Fatalf("unexpected remote operation %#v", request)
+	}
+	missingRole := strings.Replace(base, `,"callerRole":"agent"`, "", 1)
+	if _, err := ParseRequest([]byte(missingRole), now); err == nil {
+		t.Fatal("remote request without caller role was accepted")
+	}
+	remoteURL := strings.Replace(base, `"catalogPath":"/var/lib/ops-agent/plugins/catalog/adapter-botmux.opspkg"`, `"catalogPath":"https://example.com/adapter.opspkg"`, 1)
+	if _, err := ParseRequest([]byte(remoteURL), now); err == nil {
+		t.Fatal("remote plugin URL was accepted as a local catalog path")
+	}
+}

@@ -1,11 +1,12 @@
-import { parseChangeId, type HelperRequest } from "../shared/messages.js";
+import { parseChangeRef, type ChangeRef } from "../shared/approval.js";
+import type { HelperRequest } from "../shared/messages.js";
 import { deadline, requestId } from "../shared/rpc.js";
 
 export type DirectCommand =
-  | { kind: "approve"; changeId: string }
-  | { kind: "rollback"; changeId: string }
-  | { kind: "reject"; changeId: string }
-  | { kind: "status"; changeId: string };
+  | { kind: "approve"; changeRef: ChangeRef }
+  | { kind: "rollback"; changeRef: ChangeRef }
+  | { kind: "reject"; changeRef: ChangeRef }
+  | { kind: "status"; changeRef: ChangeRef };
 
 const SHORT_DEADLINE_SECONDS = 30;
 const MUTATION_DEADLINE_SECONDS = 9 * 60;
@@ -23,13 +24,13 @@ export function parseDirectCommand(text: string): DirectCommand | undefined {
   ) return undefined;
 
   if (parameters.length !== 1) {
-    throw new Error(`usage: ${name} <changeId>`);
+    throw new Error(`usage: ${name} <changeRef>`);
   }
-  const changeId = parseChangeId(parameters[0]);
-  if (name === "/approve") return { kind: "approve", changeId };
-  if (name === "/rollback") return { kind: "rollback", changeId };
-  if (name === "/reject") return { kind: "reject", changeId };
-  return { kind: "status", changeId };
+  const changeRef = parseChangeRef(parameters[0]);
+  if (name === "/approve") return { kind: "approve", changeRef };
+  if (name === "/rollback") return { kind: "rollback", changeRef };
+  if (name === "/reject") return { kind: "reject", changeRef };
+  return { kind: "status", changeRef };
 }
 
 export function helperRequestFor(command: DirectCommand): HelperRequest {
@@ -40,15 +41,15 @@ export function helperRequestFor(command: DirectCommand): HelperRequest {
     deadline: deadline(isLongMutation ? MUTATION_DEADLINE_SECONDS : SHORT_DEADLINE_SECONDS),
   };
   if (command.kind === "approve") {
-    return { ...base, method: "change.approve", changeId: command.changeId };
+    return { ...base, method: "change.approve", changeId: command.changeRef.changeId };
   }
   if (command.kind === "rollback") {
-    return { ...base, method: "change.rollback", changeId: command.changeId };
+    return { ...base, method: "change.rollback", changeId: command.changeRef.changeId };
   }
   if (command.kind === "reject") {
-    return { ...base, method: "change.reject", changeId: command.changeId };
+    return { ...base, method: "change.reject", changeId: command.changeRef.changeId };
   }
-  return { ...base, method: "change.status", changeId: command.changeId };
+  return { ...base, method: "change.status", changeId: command.changeRef.changeId };
 }
 
 export function helperTimeoutFor(command: DirectCommand): number {

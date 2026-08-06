@@ -2,39 +2,43 @@
 
 ## 保护目标
 
-1. 模型或 agentd 被 prompt injection 控制后，不能自行获得 root，也不能批准自己准备的变更。
-2. 每个高权限变更都能回答“谁批准、执行了什么、备份在哪里、验证结果如何”。
-3. 执行失败时优先自动回滚；无法安全回滚时进入 `RECOVERY_REQUIRED`，禁止谎报成功。
-4. 密钥不进入 Git、普通配置、环境变量、进程参数、prompt 或审计正文。
+1. Prompt、模型、日志、远端 server 或 Adapter 被控制后，不能自行获得或批准 root。
+2. 一个 machine/session 被控制后，不能静默扩展到未注册机器、Target 或其他 workspace。
+3. 每个高权限变更可证明目标、计划、审批、备份、验证、终态和恢复证据。
+4. 断线、重试、进程崩溃和重复 webhook 不会重复业务 mutation。
+5. 模型、IM、transport、enrollment 与审批 credential 相互隔离。
 
-## 不信任输入
+同一 LAN 不是信任边界。Prompt、工具参数、capability manifest、日志、文件、软件源、
+网络响应和历史记忆均是不可信输入。
 
-飞书消息、模型回复、工具参数、日志、journal、文件内容、软件包元数据和网络响应全部是不可信数据。系统提示只能改善行为，不能提供权限保证。
+## 分层边界
 
-## 分层控制
+| 层 | 强制控制 |
+|---|---|
+| Harness | 禁用 Pi 原生工具/skill/extension；固定类型化工具；不可信 capability 只能取交集 |
+| Session | 独占 workspace 和 writer lease；机器/Target 由 Harness 绑定 |
+| Sandbox | bubblewrap 无网络、系统只读、只挂当前 workspace；独立非 root UID |
+| Registry | 稳定 serverId、证书 pin、管理员注册；IP 不是身份 |
+| Transport | HTTPS/mTLS、角色分离、严格 schema、deadline、限流、幂等、防重放 |
+| Server | 非 root 网络前端；root policy 和 credential 只读 |
+| Root helper | Unix-only、peer identity、tagged union、资源 allowlist、无 raw root API |
+| Approval | 模型外 principal；绑定不可变 plan 和短期 nonce；执行前重新校验 |
+| Recovery | 写前备份、fsync、验证、自动回滚或 `RECOVERY_REQUIRED` |
 
-| 层 | 控制 | 被绕过后的下一层 |
-|---|---|---|
-| harness | 固定系统提示、禁用 Pi 内置工具/skill/extension、只注册四个 ops 工具 | agentd 独立 UID |
-| 命令预检 | 拒绝 `sudo`、mount、块设备、容器 socket、fork bomb 等明显危险命令 | bubblewrap |
-| 沙箱 | user/mount/network 等 namespace、只读系统目录、无网络、唯一 workspace bind | 非特权 `ops-agent` UID |
-| RPC | 最大帧、schema、deadline、固定 tagged union、无 raw root command | peer UID + 审批状态机 |
-| 审批 | `SO_PEERCRED` 校验配置的真实审批 UID；摘要绑定不可变计划 | root-helper 执行器 |
-| 恢复 | 写前备份、原子替换、验证、失败回滚 | root-only 备份与审计 |
-| 宿主 | systemd hardening、独立目录、能力裁剪、restart 限流 | 人工恢复流程 |
+黑名单和 System Prompt 只减少误触，不是权限证明。
 
-### 为什么保留 Bash
+## Target 与路径权限
 
-运维需要组合现有诊断工具，完全取消 Bash 会把大量日常只读工作重新实现成专用 RPC。这里保留的是两类能力：
+Root-owned policy 把 `targetId` 映射为 UID/GID、允许的路径、unit 和 recipe。模型不能提交
+用户名、UID 或 `runAs`。路径授权必须在 canonical/fd 层阻止 symlink/rename 逃逸；Linux
+实现优先使用 `openat2` 的 `RESOLVE_BENEATH/NO_SYMLINKS` 或等价机制。Unit 使用精确
+allowlist，输出、deadline、并发和资源大小有硬上限。
 
-- `ops_bash`：适合解析文本、生成配置草案和离线脚本测试；运行于离线 bubblewrap，不能看宿主 credential、systemd socket、Docker socket或 workspace 之外的可写目录。
-- `breakglass.script`：面向类型化操作覆盖不到的罕见 root 任务，默认关闭。开启后必须显式列出备份路径、验证脚本和网络需求，计划摘要不可变，仍需真实用户批准。
+策略结果为 `deny/read/prepare/human-approve/local-console-only`。MVP 中有副作用的
+文件、服务、包、root 及插件安装全部需要人工审批；远端任意脚本和 breakglass 不发布为
+capability。
 
-黑名单只减少误触和低成本攻击。真正的边界是 namespace、文件映射、独立 UID 和 root-helper 协议；不应通过不断扩充正则表达式来宣称 shell “安全”。
-
-agentd unit 保留 `ProtectProc=invisible`，但不能启用 `ProcSubset=pid`：bubblewrap 创建 user namespace 时需要只读访问 `/proc/sys/kernel/overflowuid` 与 `overflowgid`。它还需要 `AF_NETLINK` 在新网络 namespace 内初始化隔离 loopback；agentd 没有 `CAP_NET_ADMIN`，sandbox command 仍无宿主网络。内核参数仍由 `ProtectKernelTunables=yes` 禁止写入。
-
-## 高权限状态机
+## 审批与状态机
 
 ```text
 PREPARED -> APPROVED -> EXECUTING -> COMMITTED
@@ -44,31 +48,61 @@ PREPARED -> APPROVED -> EXECUTING -> COMMITTED
                                   +-> RECOVERY_REQUIRED
 ```
 
-- `PREPARED` 必须包含规范化操作、摘要、备份计划和验证计划。
-- 审批绑定 `changeId` 和内容摘要；prepare 后不能修改内容。
-- 只有 root-helper 返回 `COMMITTED` 才能向用户声称成功。
-- `RECOVERY_REQUIRED` 需要人类从 root-only 备份恢复，不得继续自动尝试。
+ApprovalGrant 至少绑定：
 
-## 密钥模型
+```text
+serverId, machineId, targetId, changeId,
+planHash, policyRevision, capabilityRevision,
+preconditions, issuedAt, expiresAt, nonce, approver identity
+```
 
-DeepSeek key 通过 `systemd-creds encrypt` 生成 `/etc/ops-agent/credentials/deepseek_api_key.cred`。unit 使用 `LoadCredentialEncrypted=`，systemd 在服务私有 credential 目录解密为只读文件；agentd 通过 `CREDENTIALS_DIRECTORY` 读取后放入 Pi 的内存 credential store。
+Agent credential 不能生成 ApprovalGrant。Server 与 root helper 都必须重新校验，任何
+identity、plan、policy、capability 或 precondition 变化都会使旧审批失效。只有 root helper
+返回 `COMMITTED` 才能宣告成功。
 
-禁止把 key 放进 `models.json` 的 `apiKey`、`Environment=`、`.env`、命令行或消息 prompt。消息桥自身的 IM 凭据也应使用独立的 encrypted credential；两组 credential 不共享。core 的完成事件协议只使用继承的 FD，不读取消息桥环境变量；任何 adapter 都必须在启动 core 前剥离厂商 credential。
+## 插件与秘密
 
-## 默认拒绝与可扩展性
+插件包必须有严格 manifest、固定 publisher/version/digest、SBOM 和受信 catalog 记录。
+GitHub Release artifact attestation 是发布来源证明；没有执行 attestation 验证时只能声称
+验证了 HTTPS + checksum，不能声称独立签名已验证。
 
-- `file.write` 默认只允许 `/etc`、`/opt`；新增根目录需要 root-owned systemd override 和安全评审。
-- package install 是类型化包名/版本，不接受拼接参数。
-- service action 只接受合法 `.service` unit 和固定 action。
-- 原始磁盘、内核模块、主机生命周期、firewall、容器/VM 控制默认拒绝。
-- 消息桥应只把 allowlist 用户的私聊映射到可写会话；群聊默认只读或完全禁用审批命令。
+插件不得携带 root shell installer。Agent 只能准备由 root helper 认识的类型化安装操作。
+MVP 没有通用 secret broker，也不让模型发起 secret 请求。BotMux Adapter 文件提交后，
+只有交互式 TUI 的精确 `/botmux-setup` 能在模型外把终端交给 `botmux setup`；ops-agent
+不读取 secret，transcript、argv 和审计正文均不包含 secret。BotMux 当前把 Lark secret
+明文保存在管理员账户的 `~/.botmux/bots.json`；hardener 强制配置和备份为 `0600`。这是
+明确的第三方存储边界，不能描述成 systemd encrypted credential 或 ops-agent broker。
 
-## 尚未覆盖
+Adapter 只有在能验证 sender、区分私聊/群聊/转发/机器人、持久去重并签名绑定
+principal + ingress ID + changeRef 时，才可声明 approval capability；否则只能聊天/只读，
+审批回到 TUI。
 
-MVP 不抵御内核漏洞、root-helper 自身内存安全漏洞、被替换的软件源/包签名根、已获得 root 的攻击者或 systemd credential 主密钥泄露。公网发布前应增加 fuzz、协议兼容测试、包管理器隔离测试和外部安全审计。
+## Release 与供应链
 
-### Pi 0.83.0 上游依赖告警
+目标机不运行 npm/Go 构建。Release workflow 固定依赖、编译 amd64/arm64、下载并校验
+固定 Node runtime，生成 tar、Debian package、SPDX SBOM、manifest、checksums 和 GitHub
+artifact attestation。安装器在任何解包/主机写入前校验 archive checksum；版本目录与
+配置/状态分离，激活使用原子 `current` 切换。
 
-截至 2026-08-05，官方 npm 上最新的 `@earendil-works/pi-coding-agent` 仍是 0.83.0，发布包自带 shrinkwrap，固定 `undici@8.5.0` 和 `minimatch@10.2.5`/`brace-expansion@5.0.7`。`npm audit` 因此报告 2 个 high、1 个 moderate；根项目 `overrides` 会被该 shrinkwrap 阻断，不能用伪造 lockfile 宣称已修复。
+Checksum 与 artifact 位于同一 GitHub Release，只能检测传输损坏或资产不一致，不能
+替代独立签名/attestation。高价值环境必须执行 `gh attestation verify` 或从已验证的内部
+镜像部署。
 
-本 harness 禁用了 Pi 内置工具、skill、extension、prompt template 和 context file；模型不能提供 model glob，HTTP cache/retry/cookie/blob API 也未暴露为 agent tool。因此当前已知利用路径不直接由消息输入触发，但这不是漏洞修复。部署应保持单审批者、固定模型 endpoint 和 systemd 重启/限流；上游发布包含 `undici >= 8.9.0`、`brace-expansion >= 5.0.9` 的版本后，应优先升级并重新执行完整冒烟。若威胁模型包含恶意模型 endpoint、共享 HTTP cache 或不可信本地配置写入者，应在上游修复前停止部署。
+## 已知边界
+
+MVP 不抵御内核漏洞、root helper 自身漏洞、被控制的软件源、已获得 root 的攻击者或
+systemd credential 主密钥泄漏。Controller HA、多方审批、外部审计锚定、自动低风险写入、
+远端任意脚本和记忆插件均不在 MVP。
+
+后续“结构化/AI 辅助审核”不能按文本行拆 shell，必须按 Shell AST 和源跨度展示命令、
+管道、重定向、变量及风险；findings 以结构化节点返回。任何局部修改都要重新
+prepare/hash/审批。审核模型只能提高风险或提示遗漏，不能降低确定性策略或授权，并须
+披露额外 Token。
+
+后续记忆插件也不能修改工具、权限或系统 Prompt。记忆区分 machine、machine-target 和
+global scope，带适用条件；上线前必须用真实历史 Session replay 披露平均/P95 在线、后台
+及总体 Token 增量和比例，未经成本确认不能启用。
+
+Enrollment bundle 由 controller 离线签名并绑定 origin、endpoint identity、证书、policy
+和期限。MVP 不维护在线 nonce 消费表，因此不能声称单次使用；有效期内的复制件可重放。
+文件权限、短期限、成功后删除和 credential 轮换是当前补偿控制。

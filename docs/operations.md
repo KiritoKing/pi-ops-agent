@@ -1,14 +1,22 @@
-# 运维、审计与恢复
+# 运维、升级、审计与恢复
 
-## 日常命令
+## 日常入口
+
+TUI 是始终安装、与任何外部 IM 无关的保底入口：
 
 ```bash
-sudo /opt/pi-ops-agent/scripts/healthcheck.sh
-systemctl status ops-agent.target ops-agentd ops-systemd-helper ops-root-helper --no-pager
-journalctl -u ops-agentd -u ops-systemd-helper -u ops-root-helper -f
+ops-agent tui
 ```
 
-计划维护时停止整个 target，避免 watchdog 重新拉起 agentd：
+服务与健康检查：
+
+```bash
+sudo /opt/pi-ops-agent/current/scripts/healthcheck.sh
+systemctl status ops-agent.target ops-agentd ops-root-helper --no-pager
+journalctl -u ops-agentd -u ops-root-helper -f
+```
+
+计划维护时停止整个 target，避免 systemd/guardian 重新拉起 agentd：
 
 ```bash
 sudo systemctl stop ops-agent.target
@@ -16,60 +24,146 @@ sudo systemctl stop ops-agent.target
 sudo systemctl start ops-agent.target
 ```
 
-不要单独长时间停止 agentd；systemd-helper 会把它视为故障。
+## 程序升级与回退
 
-## credential 轮换
+程序安装在不可变版本目录，`current` 是唯一激活指针：
 
-```bash
-sudo /opt/pi-ops-agent/scripts/encrypt-credential.sh --force
-sudo systemctl restart ops-agentd.service
+```text
+/opt/pi-ops-agent/
+├── current -> releases/0.1.0
+└── releases/
+    ├── 0.1.0/
+    └── 0.2.0/
 ```
 
-脚本从无回显 stdin 读取 key，经管道直接交给 `systemd-creds encrypt`，不创建明文临时文件。轮换后检查 agentd journal 和一次只读模型请求；旧 encrypted credential 被原子替换。
+配置、credential、Session、MachineContext、备份和审计都位于 `/etc`、`/var/lib`、
+`/var/log`，不随程序目录切换。升级前必须先校验 Release checksum/attestation、协议
+兼容性和配置迁移计划，再安装新版本并原子切换 `current`。
 
-## 配置升级
+若启动或冒烟失败，停止 target，将 `current` 原子指回旧版本，执行
+`systemctl daemon-reload` 后重新启动。程序回退不能自动回退数据 schema；存在不可逆迁移
+时，Release 必须在安装前拒绝并要求显式迁移计划。
 
-重复执行 installer 时保留 `/etc/ops-agent/agentd.json` 和 `models.json`，新默认值写入相邻 `.dist`。人工比较后再合并：
+已有配置不会被覆盖；新默认写到相邻 `.dist`：
 
 ```bash
 diff -u /etc/ops-agent/agentd.json /etc/ops-agent/agentd.json.dist
 diff -u /etc/ops-agent/models.json /etc/ops-agent/models.json.dist
 ```
 
-改配置后先运行构建测试和 `systemd-analyze verify`，再重启 target。不要在生产机上把供应商 model ID 改成未经验证的自动 fallback。
+## Credential 与证书
+
+模型 credential 轮换：
+
+```bash
+sudo /opt/pi-ops-agent/current/scripts/encrypt-credential.sh --force
+sudo systemctl restart ops-agentd.service
+```
+
+模型、Adapter、agent-role、approver-role 和 admin-role credential 必须分开。轮换远端
+server 证书时先建立新证书的重叠有效期，验证 identity/policy digest 后再吊销旧证书；
+不能因 endpoint IP 不变而接受 identity 漂移。
+
+Enrollment bundle 是短期离线 bootstrap bearer，不是长期 credential。它绑定 controller
+origin、endpoint identity、证书、policy 和期限，但 MVP 没有在线消费记录，不能保证
+“用过即失效”。成功接入后立即删除所有复制件；失败重试生成新 bundle，并禁用 issuer
+预先写入但未完成 smoke 的待接入注册项。
+
+## Machine、Target 与策略漂移
+
+机器以稳定 `machineId/serverId` 标识，地址只是 locator。每次重连刷新 observed endpoint、
+capability digest、policy revision 和证书期限，但不能让 server 覆盖本地 trust pin 或 alias。
+
+以下变化必须 fail-closed 并要求管理员检查：
+
+- server identity、machineId 或证书 pin 变化；
+- Target 对应 UID/GID/账号变化；
+- capability 新增写/root 能力；
+- policy revision 在 prepare 与 approve 之间变化；
+- 已审批计划的 precondition、backup 或 verification digest 变化。
+
+机器下线时先禁用新 Session 和 prepare，等待在途 change 到达权威终态，然后吊销证书并
+归档审计。删除注册表记录不能删除远端备份或 root helper 状态。
+
+## Adapter 生命周期
+
+统一状态为：
+
+```text
+AVAILABLE -> INSTALLED -> CONFIGURED -> VERIFIED -> ENABLED
+                                             \-> DEGRADED / DISABLED
+```
+
+插件安装、升级和删除都必须由 Agent 准备类型化 change，管理员在模型外审批。Adapter
+失败不能影响 TUI 和核心服务。升级后重新验证 sender identity、私聊语义、防重放、入站、
+出站及 approval intent；任一失败都不能保留审批能力。
+
+BotMux 本体不由 `init` 或 Adapter 插件安装。`/botmux-setup` 只在交互式 TUI 中运行，并
+依次调用 BotMux 官方 setup、固定 hardener 和 restart；配置变化前保存 `0600` 备份。
+BotMux 配置内的明文 Lark secret 由该管理员账户负责保护。回退 Adapter 不会删除 BotMux
+配置或 secret；永久清理必须由管理员在模型外按 BotMux 自身流程执行。
+
+卸载 Adapter 默认保留 encrypted credential 和最小 outbox/state 以便恢复。永久清理
+秘密是另一项显式、不可恢复操作。
+
+## 变更状态与恢复
+
+权威状态位于目标机器 root helper，不位于对话 Session：
+
+```text
+PREPARED -> APPROVED -> EXECUTING -> COMMITTED
+     |          |           |
+     v          v           +-> ROLLED_BACK
+ REJECTED    EXPIRED             |
+                                  +-> RECOVERY_REQUIRED
+```
+
+连接中断、controller 重启或 Session 损坏后，只能用原
+`serverId + changeId + requestId` 查询状态，不能重新提交 mutation。
+
+恢复步骤：
+
+1. 冻结目标资源的新 mutation；必要时停止目标 endpoint；
+2. 读取 root-only change state 和审计，不相信模型总结；
+3. `COMMITTED`：独立检查 verification；
+4. `ROLLED_BACK`：核对资源摘要和服务状态；
+5. `RECOVERY_REQUIRED`：按审计定位备份，由真实管理员显式 rollback 或人工恢复；
+6. 恢复后先做只读 smoke，再解除资源锁。
+
+文件原子替换可以提供强回滚；service action 和 package install 只有有限或 best-effort
+回滚语义，不能把 `rollbackAvailable=true` 描述成完整事务保证。
 
 ## 审计
 
-| 日志 | 内容 | 写权限 |
-|---|---|---|
-| `/var/log/ops-agent/agentd/audit.jsonl` | prompt 路由、工具调用、模型事件 | `ops-agent` |
-| `/var/log/ops-agent/root-helper/audit.jsonl` | prepare、审批者 UID、执行、验证、回滚 | root |
-| `/var/log/ops-agent/systemd-helper/audit.jsonl` | heartbeat、只读检查、watchdog restart | root |
+至少关联：
 
-日志是 hash chain；应由日志采集器只追加上传到另一台机器。链能发现事后改写，但不能阻止已获得 root 的攻击者同时替换日志和程序。审计中仍应通过 BotMux message ID/session ID 与 helper `requestId/changeId/auditId` 做关联。
+```text
+adapter ingress/message ID
+principal ID
+agentSessionId / turnId
+serverId / machineId / targetId
+requestId / changeId / planHash
+policy and capability revisions
+approver identity / approval nonce
+backup / verification / rollback evidence
+```
 
-## 失败恢复
-
-1. 先停止 `ops-agent.target`，冻结自动重试。
-2. 读取 root-helper audit，确认最终状态和备份路径；不要相信模型总结。
-3. 若状态是 `ROLLED_BACK`，独立验证文件摘要、包版本和 unit 状态。
-4. 若状态是 `RECOVERY_REQUIRED` 且 `/status <changeId>` 显示 `rollbackAvailable=true`，由真实审批者先执行 `/rollback <changeId>`，再独立验证 `ROLLED_BACK`。若 root-helper 报告回滚不可用或回滚失败，再从 `/var/lib/ops-agent/root-helper` 下的 root-only 备份按审计记录人工恢复。
-5. 恢复后做只读健康检查，再启动 target；不要重复提交同一个业务变更来“试试看”。
-
-agentd session 损坏只影响对话上下文，不应影响 root-helper 的权威变更状态。可先备份再移走单个 session JSONL，让同一 BotMux chat 创建新会话；禁止清空整个 state 目录来修一个会话。
+Agent、server 和 root helper 分别写审计，root 审计不能由 `ops-agent` 改写。Hash chain
+只能发现本地篡改，不能抵御已获得 root 的攻击者整体替换程序与日志；生产部署应把摘要
+只追加传送到独立系统。
 
 ## 卸载
 
-默认卸载保留 credential、会话、备份和审计：
+默认卸载程序和 unit，但保留配置、credential、Session、MachineContext、备份与审计：
 
 ```bash
-sudo /opt/pi-ops-agent/scripts/uninstall.sh
+sudo /opt/pi-ops-agent/current/scripts/uninstall.sh
 ```
 
-确认已导出审计和备份后，才永久清理：
+确认数据已经导出后才执行永久清理：
 
 ```bash
-sudo /opt/pi-ops-agent/scripts/uninstall.sh --purge-state --yes --remove-user
+sudo /opt/pi-ops-agent/current/scripts/uninstall.sh --purge-state --yes --remove-user
 ```
 
-`--purge-state` 不可恢复，会删除 systemd encrypted credential。默认路径更适合升级、回滚程序版本或暂时停用。
+`--purge-state` 不可恢复。它不能被模型自行准备为低风险操作，也不能由 IM 群聊审批。

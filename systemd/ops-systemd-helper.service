@@ -1,6 +1,6 @@
 [Unit]
 Description=Pi Ops Agent systemd watchdog and read-only inspection helper
-Documentation=file:/opt/pi-ops-agent/docs/architecture.md
+Documentation=file:/opt/pi-ops-agent/current/docs/architecture.md
 PartOf=ops-agent.target
 Before=ops-agentd.service
 After=local-fs.target dbus.service
@@ -12,7 +12,7 @@ Type=simple
 User=root
 Group=root
 EnvironmentFile=/etc/ops-agent/runtime.env
-ExecStart=/opt/pi-ops-agent/bin/ops-systemd-helper --socket=/run/ops-agent/helper/systemd-helper.sock --socket-gid=${OPS_AGENT_GID} --audit-file=/var/log/ops-agent/systemd-helper/audit.jsonl --agent-uid=${OPS_AGENT_UID} --agent-unit=ops-agentd.service --heartbeat-timeout=45s --check-interval=5s --restart-cooldown=20s --max-restarts=3 --restart-window=5m
+ExecStart=/opt/pi-ops-agent/current/bin/ops-systemd-helper --socket=/run/ops-agent/helper/systemd-helper.sock --socket-gid=${OPS_AGENT_GID} --audit-file=/var/log/ops-agent/systemd-helper/audit.jsonl --agent-uid=${OPS_AGENT_UID} --agent-unit=ops-agentd.service --heartbeat-timeout=45s --check-interval=5s --restart-cooldown=20s --max-restarts=3 --restart-window=5m
 Restart=always
 RestartSec=2s
 UMask=0077

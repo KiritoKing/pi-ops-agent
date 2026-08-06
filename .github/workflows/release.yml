@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.19.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Verify tag and manifests use the package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p 'require("./package.json").version')"
+          plugin_version="$(node -p 'require("./plugins/adapter-botmux/manifest.json").version')"
+          test "${version}" = "${package_version}"
+          test "${version}" = "${plugin_version}"
+      - run: npm run check
+      - run: npm run build
+      - run: go vet ./cmd/... ./internal/...
+      - run: go test -race ./internal/...
+      - run: git diff --check
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            node_arch: x64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            node_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - run: npm run build
+      - run: npm prune --omit=dev --ignore-scripts
+      - name: Build static Go commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-bin
+          for command_dir in cmd/*; do
+            test -f "${command_dir}/main.go" || continue
+            command_name="$(basename "${command_dir}")"
+            CGO_ENABLED=0 go build -trimpath \
+              -ldflags="-s -w" \
+              -o "release-bin/${command_name}" "./${command_dir}"
+          done
+      - name: Download and verify the pinned Node runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_archive="node-v${NODE_VERSION}-linux-${{ matrix.node_arch }}.tar.xz"
+          node_base="https://nodejs.org/dist/v${NODE_VERSION}"
+          curl -fsSLO "${node_base}/${node_archive}"
+          curl -fsSLO "${node_base}/SHASUMS256.txt"
+          grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict
+          mkdir -p node-runtime
+          tar -xJf "${node_archive}" --strip-components=1 -C node-runtime
+      - name: Build native archive and Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          packaging/build-release.sh \
+            --version "${GITHUB_REF_NAME#v}" \
+            --arch "${{ matrix.arch }}" \
+            --node-runtime-dir node-runtime \
+            --bin-dir release-bin \
+            --output-dir release
+          mkdir -p sbom-root
+          tar -xzf "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" -C sbom-root
+      - name: Generate installed-payload SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: sbom-root/payload/app
+          format: spdx-json
+          output-file: release/ops-agent-linux-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: release
+          merge-multiple: true
+      - name: Build the optional BotMux adapter plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/build-botmux-plugin.sh "${GITHUB_REF_NAME#v}" release
+      - name: Generate release manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/create-release-manifest.sh \
+            release "${GITHUB_REF_NAME#v}" "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+          (
+            cd release
+            sha256sum -- * | sort -k 2 > checksums.txt
+          )
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/*.deb
+            release/*.tar.gz
+            release/*.opspkg
+            release/*.spdx.json
+            release/manifest.json
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release/* \
+              --verify-tag --generate-notes --title "Pi Ops Agent ${GITHUB_REF_NAME}"
+          fi

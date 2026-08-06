@@ -3,8 +3,11 @@
   "rootHelperSocket": "/run/ops-agent/helper/root-helper.sock",
   "systemdHelperSocket": "/run/ops-agent/helper/systemd-helper.sock",
   "stateDir": "/var/lib/ops-agent",
-  "workspaceDir": "/var/lib/ops-agent/workspace",
+  "workspaceRoot": "/var/lib/ops-agent/workspaces",
   "sessionDir": "/var/lib/ops-agent/sessions",
+  "sessionRegistryPath": "/var/lib/ops-agent/registry/sessions.json",
+  "serverRegistryPath": "/etc/ops-agent/servers.json",
+  "machineContextDir": "/var/lib/ops-agent/machines",
   "agentDir": "/var/lib/ops-agent/pi",
   "modelsPath": "/etc/ops-agent/models.json",
   "provider": "deepseek",
@@ -12,5 +15,6 @@
   "apiKeyCredential": "deepseek_api_key",
   "auditPath": "/var/log/ops-agent/agentd/audit.jsonl",
   "bwrapPath": "/usr/bin/bwrap",
-  "bashPath": "/bin/bash"
+  "bashPath": "/bin/bash",
+  "sandboxEnabled": true
 }

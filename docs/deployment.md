@@ -1,168 +1,182 @@
-# 部署、BotMux 与飞书冒烟
+# 原生部署与接入
 
-## 前置条件
+Pi Ops Agent 只支持以 systemd 为 PID 1 的 Linux。MVP 不提供 Docker、OCI、
+Compose 或非 systemd 部署；PVE LXC 直接使用原生安装。
 
-- systemd Linux；启用非特权 user namespace。
-- Node.js 22.19+、Go 1.23+、bubblewrap、Git 和 npm。
-- 一个专用的 BotMux 本机账户。该账户代表真实审批者，不能和 `ops-agent` 共用 UID，也不应使用 root。
-- DeepSeek V4 Flash 可用的 OpenAI Chat Completions 兼容 endpoint 和 key。
+目标机不需要 Git、Go、Node.js 或 npm，也不会运行源码构建和 npm lifecycle。
+GitHub Release 已包含编译后的 TypeScript、production dependencies、固定 Node runtime
+和当前架构的静态 Go 命令。
 
-先验证 bubblewrap 基础能力：
+## 第一台机器：`init`
 
-```bash
-bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind /bin /bin --proc /proc --dev /dev /bin/true
-```
-
-若内核或企业安全策略禁止 user namespace，应修复宿主策略或改用 VM/container 作为更外层隔离；不要删掉 bwrap 或放宽 systemd unit 来“让测试通过”。
-
-## 构建与安装
-
-构建必须使用普通账户，避免以 root 执行 npm lifecycle。两只 Go helper 必须在目标 Linux 构建，或显式交叉编译成与目标匹配的 Linux ELF；安装器会在任何系统写入前验证格式和架构，拒绝把 macOS Mach-O/其他架构产物覆盖到服务：
+GitHub Raw 上的脚本只是下载和校验 bootstrap。真正的主机修改由 Release 包内、
+与版本绑定的 `install-release.sh` 完成：
 
 ```bash
-npm ci
-npm run check
-npm run build
-mkdir -p bin
-go build -trimpath -o bin/ops-root-helper ./cmd/ops-root-helper
-go build -trimpath -o bin/ops-systemd-helper ./cmd/ops-systemd-helper
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init
 ```
 
-安装器只复制已构建产物，不访问网络。以实际 BotMux 运行账户为审批账户：
+通过 `sudo` 运行时，`SUDO_USER` 成为首个本地管理员；root 直接执行时必须显式指定：
 
 ```bash
-sudo ./scripts/install.sh --approver-user botmux
-sudo /opt/pi-ops-agent/scripts/encrypt-credential.sh
-sudo systemctl start ops-agent.target ops-agent-healthcheck.timer
-sudo /opt/pi-ops-agent/scripts/healthcheck.sh
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init --admin-user alice
 ```
 
-安装后检查：
+安装器通过 `/dev/tty` 无回显读取模型 credential，生成 systemd encrypted
+credential，启动服务并运行健康检查。需要先落盘、稍后再配置 credential 时可使用
+`--no-start`。
+
+`init` 的边界是：
+
+- 安装 controller、Pi Harness、本机 endpoint、root helper、健康托管和 TUI；
+- 创建 `ops-agent` 非特权账户、运行目录、配置和 systemd unit；
+- 初始化空的机器与 Session 注册表；
+- 安装并启动核心服务，执行只读冒烟；
+- **不安装、不初始化、不配置 BotMux 或任何外部 Adapter**；
+- **不读取 Lark/BotMux credential，也不创建 BotMux 服务账户**。
+
+完成后重新登录，使 `ops-agent` supplementary group 生效，然后进入保底入口：
 
 ```bash
-systemctl status ops-root-helper ops-systemd-helper ops-agentd --no-pager
-systemd-analyze security ops-agentd.service ops-systemd-helper.service ops-root-helper.service
-journalctl -u ops-agentd -u ops-systemd-helper -u ops-root-helper -n 100 --no-pager
+ops-agent tui
 ```
 
-## BotMux 接入
+## Release 选择与完整性
 
-使用仓库中的可选 BotMux adapter 包装 core client。它是 `integrations/botmux/` 下的独立集成，不被 `src/` 中的 agent 核心 import。首次 spawn 的实际形式为：
+默认安装 GitHub `latest` Release。生产安装应同时把 Raw 脚本和 Release 固定到同一 Tag：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/v0.1.0/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=v0.1.0 sh -s -- init
+```
+
+Bootstrap 只接受 HTTPS，下载 `checksums.txt` 和与本机架构对应的 archive，并在解包
+前校验 SHA-256。Release workflow 还为 `.tar.gz`、`.deb`、`.opspkg`、SBOM 和
+manifest 生成 GitHub artifact attestation。
+
+如果目标机安装了 GitHub CLI，bootstrap 会额外执行：
+
+```bash
+gh attestation verify <archive> --repo KiritoKing/pi-ops-agent
+```
+
+没有 `gh` 时安装器会明确提示：此时验证边界只有 GitHub HTTPS 加同一 Release 中的
+checksum，不能声称已经验证了独立签名。高价值主机可先在管理机执行 attestation
+验证，再把已验证 archive 放入受控镜像，并通过 `OPS_AGENT_RELEASE_BASE` 指向镜像。
+
+Release 包含：
 
 ```text
-/opt/pi-ops-agent/bin/ops-agent-botmux --session-id <BotMux生成的UUID> '<initialPrompt>'
+ops-agent-linux-amd64.tar.gz
+ops-agent-linux-arm64.tar.gz
+ops-agent-all_<version>_amd64.deb
+ops-agent-all_<version>_arm64.deb
+ops-agent-linux-amd64.spdx.json
+ops-agent-linux-arm64.spdx.json
+adapter-botmux_<version>.opspkg
+manifest.json
+checksums.txt
 ```
 
-后续消息由 BotMux 在同一个 PTY 中用 bracketed paste 写入。session ID 由 adapter 生成并维护，不要在 `bots.json` 手写占位符。
-
-把 `config/botmux.bots.json.example` 中的对象合并进 BotMux 账户的 `~/.botmux/bots.json`。最小关键配置如下：
-
-```json
-{
-  "name": "ops-agent",
-  "cliId": "pi",
-    "cliPathOverride": "/opt/pi-ops-agent/bin/ops-agent-botmux",
-  "defaultWorkingDir": "/var/lib/ops-agent/workspace",
-  "allowedUsers": ["owner@example.com"],
-  "p2pOpen": false,
-  "disableCliBypass": true,
-  "backendType": "tmux",
-  "sandbox": false,
-  "writableTerminalLinkInCard": false
-}
-```
-
-这里的 `sandbox: false` 是必须配置，不是为了给模型放权。BotMux 的 Linux 文件 sandbox 会用私有 tmpfs 覆盖 `/run`，导致 core client 看不到 `/run/ops-agent/agentd/agentd.sock` 和 root-helper socket。模型实际运行在独立 `ops-agent` UID 的 `ops-agentd.service` 中；`ops_bash` 仍由 agentd 自己的离线 bubblewrap 约束，高权限操作仍只能通过 `SO_PEERCRED` 校验和类型化 root-helper 协议执行。不要用 BotMux `sandboxReadonlyPaths` 暴露 socket 来替代这套边界。
-
-adapter 为 core 创建专用 FD 3。core 只写版本化 `completion.v1` NDJSON；adapter 读取事件、校验当前 session，再以固定 argv 和 0600 临时文件发送。adapter 会在 spawn core 前移除 `BOTMUX_*`、`FEISHU_*`、`LARK_*` 环境变量。不要改成 `OPS_AGENT_CALLBACK=<command>` 一类任意回调：这会把消息桥环境变成命令执行入口。接入其他 IM 时应新增 `integrations/<bridge>/` adapter，复用事件协议而不修改 core。
-
-BotMux Pi adapter 对较长的首次 prompt 可能传入 `@<absolute-file>`；client 只会读取当前 UID 所有、非符号链接的普通文件，且上限为 64 KiB。adapter 在 durable/deferred 首次投递时还可能注入 `--extension <path>`，client 会接受并忽略该参数，不会加载或执行扩展。当前不实现 BotMux 的 deferred extension 命令语义；此兼容仅避免冷启动因未知参数退出，定时任务应优先续用已存在的 session，并在目标版本上做端到端验证。
-
-不要配置 `allowedChatGroups`：当前语义会允许该群全员 talk，不符合审批者隔离要求。`allowedUsers` 可使用完整邮箱或确定的 `ou_xxx`，必须是真实 owner/canOperate 身份。
-
-当前 BotMux Pi adapter 的 resume 命令会调用 PATH 中的 `pi --session-id ...`，只配置 `cliPathOverride` 不足以恢复旧会话。安装器提供 `/opt/pi-ops-agent/botmux-bin/pi`；启动 BotMux daemon 时必须把该目录放在 PATH 最前面。若 BotMux 由 systemd 托管，可基于 `config/botmux-systemd-dropin.conf` 添加 drop-in：
-
-```ini
-[Service]
-SupplementaryGroups=ops-agent
-Environment=PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-NoNewPrivileges=yes
-```
-
-修改组或 drop-in 后必须重启 BotMux 服务；只在当前 shell 执行 `newgrp` 不会改变既有 daemon 的 supplementary groups。若使用 `botmux autostart enable`，不要再叠加另一套 PM2/user-systemd 守护；选择一种生命周期管理方式，并确认 daemon 实际继承了上述 PATH。
-
-现有 bot 可先用 `botmux setup edit` 修改 CLI，再运行 `node /opt/pi-ops-agent/scripts/configure-botmux.mjs` 原子备份并收紧非密钥字段。脚本要求恰好一个 owner、零群聊，并只输出字段计数和备份路径，不回显 App Secret。
-
-BotMux 初始化与核验：
+`.deb` 只安装已验证的 Release payload，不自动初始化服务。手工安装后执行：
 
 ```bash
-botmux setup --no-open-platform-auto
-# 合并 config/botmux.bots.json.example 到 ~/.botmux/bots.json
-botmux setup list --json
-botmux restart
-botmux status
-botmux logs --lines 150
+sudo dpkg -i ops-agent-all_0.1.0_amd64.deb
+sudo ops-agent-bootstrap init --admin-user "$USER"
 ```
 
-`--no-open-platform-auto` 避免自动申请超出当前用途的飞书开放平台权限。
+## 后续机器：`join`
 
-BotMux 侧必须满足：
-
-1. daemon 的本机 `User=` 与安装时 `--approver-user` 完全一致，并通过 `SupplementaryGroups=ops-agent` 获得 socket 访问。
-2. 飞书 `allowedUsers` 在 BotMux 层执行；不允许模型根据名字或消息正文判断身份。
-3. `/approve`、`/rollback` 与 `/reject` 仅接受 allowlist 用户私聊。群消息、转发、机器人消息和定时任务不得发审批命令。
-4. 每个 chat 最多一个在途 prompt；超时先发送 Ctrl-C/中止，再重启该 worker，不能并发写同一个 stdin。
-5. 不把 DeepSeek key 交给 BotMux。BotMux 仅有飞书 connector credential 和两个 Unix socket 的组权限。
-6. 交互回复由独立 adapter 调用固定参数的 `botmux send`；core 和 agentd 不查找 BotMux CLI，也不读取 BotMux 配置。
-
-## 分阶段冒烟
-
-### 1. 本地 client
-
-以审批账户执行：
+管理员在 controller 上运行 `ops-agent endpoint-token`（或底层
+`ops-agent-server issue-enrollment`），在模型外生成一个短期签名 enrollment bundle。
+Bundle 内只包含指定 controller origin、endpoint 身份、证书和初始 policy；把它保存为
+仅 owner 可读的文件后，在新机器执行：
 
 ```bash
-/opt/pi-ops-agent/bin/ops-agent --session-id local-smoke-001
+chmod 600 ./ops-agent-enrollment.opstoken
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- join \
+      --controller https://controller.example:7443 \
+      --token-file ./ops-agent-enrollment.opstoken
 ```
 
-输入只读请求，确认响应状态包含 `deepseek-v4-flash`，并检查三份 audit 均新增记录。随后准备一个 `package.install`，先 `/status` 再 `/reject`，确认没有宿主变更。
-
-### 2. 恢复与边界
-
-```bash
-sudo systemctl kill --signal=SIGKILL ops-agentd.service
-sleep 50
-systemctl is-active ops-agentd.service
-journalctl -u ops-systemd-helper -n 50 --no-pager
-```
-
-预期 systemd 或 watchdog 在限流范围内恢复 agentd，并记录原因。再要求模型执行 `sudo`、读取 `/root/.ssh`、访问 Docker socket或联网的 `ops_bash`；预期在 sandbox/协议层失败。
-
-### 3. 飞书端到端
-
-在 allowlist 私聊中依次发送：
+Bundle 内容不接受裸 argv 或环境变量。安装器只接受普通、非符号链接且无 group/world 权限
+的文件，复制到 root-only 临时文件后调用：
 
 ```text
-只读巡检这台机器，给出负载、磁盘、内存和失败 unit，不要做任何修改
-准备安装 jq，但不要执行；列出备份、验证和回滚计划
-/status <changeId>
-/reject <changeId>
+ops-agent-server enroll --controller <url> --token-file <root-only-file>
 ```
 
-验收证据：飞书回复、BotMux message ID 与 session ID 映射、agentd route、root-helper `changeId/auditId`、`REJECTED` 终态。最后才在一次性测试包上验证 `/approve`、`COMMITTED`、`/rollback` 和 `ROLLED_BACK`。
+只有签名、期限、controller origin、证书、identity/policy 落盘和只读 smoke 全部成功，
+才启用 `ops-agent-server`。它是离线 bearer bundle：MVP 没有在线“消费一次”状态，所以在
+有效期内复制件仍可重放。成功后必须立即安全删除 controller 和 endpoint 上的 bundle；
+怀疑泄露时等待其过期并轮换对应 endpoint credential。Issuer 会在发放时先写 controller
+注册表，endpoint 安装失败时管理员必须禁用或删除该待接入记录。
 
-## 定时巡检
+## PVE LXC 与 bubblewrap
 
-`ops-agent-healthcheck.timer` 每 5 分钟运行无网络、只读检查，报告进入：
+安装器始终要求 systemd。`ops_bash` 还要求非特权 user namespace 和 bubblewrap：
 
 ```bash
-journalctl -u ops-agent-healthcheck.service --since today --no-pager
+bwrap --unshare-all --die-with-parent \
+  --ro-bind /usr /usr --ro-bind /bin /bin \
+  --proc /proc --dev /dev /bin/true
 ```
 
-如需飞书主动推送，只允许 BotMux 账户读取最新报告，并对既有 session 调用：
+如果 LXC 禁止 user namespace，不得关闭 sandbox 或扩大 systemd 权限。核心、TUI、
+注册表和远端类型化工具仍可运行，但 Harness 不注册 `ops_bash`；健康检查应把这一状态
+报告为受限能力而不是静默降级。
+
+## 通过 Agent 安装 Adapter
+
+TUI 不实现独立的“插件管理业务页面”。用户直接与 Agent 对话：
+
+```text
+帮我安装 BotMux adapter
+```
+
+Agent 通过固定插件工具完成 catalog 查询、manifest/兼容性检查、安装计划准备和状态
+查询，并向用户解释 publisher、版本、digest 和 root 文件变更。插件包不包含 BotMux
+本体，也不会让 root helper 执行 npm 或联网脚本；先按
+[BotMux 官方安装说明](https://deepcoldy.github.io/botmux/)为当前管理员安装 `botmux`。
+
+Adapter 文件安装是一项高权限 change：Agent 只能 prepare，真实管理员必须在 TUI 中
+执行 `/approve <changeRef>`。root helper 只验证、解包固定 digest，并原子维护插件
+`current` 与固定 launcher；不会执行 manifest 中的 installer、callback 或任意命令。
+
+提交成功后，在交互式 TUI 输入 `/botmux-setup`。这个精确 client 命令不发送给模型；它
+临时退出 raw input，依次运行固定 argv 的 `botmux setup`、插件 hardener 和
+`botmux restart`。Hardener 要求首个 bot 恰好一个 `allowedUsers`、禁止群聊，设置
+`cliId=pi`、固定 `cliPathOverride`、`p2pOpen=false`、`disableCliBypass=true` 和
+`sandbox=false`。最后一个设置不是关闭 ops-agent sandbox，而是避免 BotMux 再包一层
+未知文件沙箱；真正的 Harness 仍由 systemd + bubblewrap 隔离。
+
+Lark App Secret 由 BotMux 官方交互直接读取，ops-agent 不读取、不代理也不记录。按
+BotMux 当前设计，它以明文保存在当前管理员的 `~/.botmux/bots.json`；hardener 把文件和
+带时间戳备份都设为 `0600`，输出只含非秘密摘要。该边界不同于 systemd encrypted
+credential，部署者必须接受并保护该账户。
+
+插件不能携带 root shell installer。ops-agent 的 BotMux Adapter 是独立
+`adapter-botmux_<version>.opspkg`，不在 `init` 中解包、配置或启用。其他 IM Adapter
+复用相同的 Agent 驱动流程。
+
+## 部署验收
 
 ```bash
-botmux send --session-id <既有session> --no-mention --content-file <report.md>
+systemctl status ops-agent.target ops-agentd ops-root-helper --no-pager
+sudo /opt/pi-ops-agent/current/scripts/healthcheck.sh
+ops-agent tui
 ```
 
-也可显式使用 `--top-level --chat-id <oc_xxx>`。该命令需要读取 BotMux session data 和飞书 connector credential，因此不能由 `ops-agentd` 调用，也不能把 `bots.json` 或飞书 key 共享给 agentd。本 MVP 未实现跨 UID reporter；默认报告留在 journal，并在下一次会话中由用户要求摘要。定时任务不得带 `/approve`，也不得直接调用 root-helper mutation 方法。
+至少验证：
+
+1. `/opt/pi-ops-agent/current` 指向期望版本，配置和状态不在版本目录内；
+2. 目标机未安装 Node/Go/npm 仍可运行；
+3. TUI 可创建 Session 且 Session workspace 互相隔离；
+4. agent credential 无法批准写操作；
+5. BotMux 尚未安装时核心与 TUI 仍健康；
+6. LXC 无 user namespace 时只禁用 `ops_bash`，类型化工具继续工作；
+7. 重复 request/change 查询不会重放 mutation。
+8. 安装 Adapter 后，`/botmux-setup` 不进入 transcript，BotMux 配置为 `0600` 且输出不含 secret。

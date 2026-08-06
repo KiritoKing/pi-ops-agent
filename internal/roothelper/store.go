@@ -13,20 +13,25 @@ import (
 )
 
 type Change struct {
-	ID                string          `json:"id"`
-	PlanHash          string          `json:"planHash"`
-	Kind              string          `json:"kind"`
-	Summary           string          `json:"summary"`
-	Operation         json.RawMessage `json:"operation"`
-	State             string          `json:"state"`
-	PreparedAt        string          `json:"preparedAt"`
-	UpdatedAt         string          `json:"updatedAt"`
-	ApprovedByUID     *uint32         `json:"approvedByUid,omitempty"`
-	BackupRefs        []string        `json:"backupRefs,omitempty"`
-	RollbackData      json.RawMessage `json:"rollbackData,omitempty"`
-	RollbackAvailable bool            `json:"rollbackAvailable"`
-	Verification      string          `json:"verification,omitempty"`
-	LastError         string          `json:"lastError,omitempty"`
+	ID                 string          `json:"id"`
+	ServerID           string          `json:"serverId,omitempty"`
+	MachineID          string          `json:"machineId,omitempty"`
+	TargetID           string          `json:"targetId,omitempty"`
+	PolicyRevision     string          `json:"policyRevision,omitempty"`
+	CapabilityRevision string          `json:"capabilityRevision,omitempty"`
+	PlanHash           string          `json:"planHash"`
+	Kind               string          `json:"kind"`
+	Summary            string          `json:"summary"`
+	Operation          json.RawMessage `json:"operation"`
+	State              string          `json:"state"`
+	PreparedAt         string          `json:"preparedAt"`
+	UpdatedAt          string          `json:"updatedAt"`
+	ApprovedByUID      *uint32         `json:"approvedByUid,omitempty"`
+	BackupRefs         []string        `json:"backupRefs,omitempty"`
+	RollbackData       json.RawMessage `json:"rollbackData,omitempty"`
+	RollbackAvailable  bool            `json:"rollbackAvailable"`
+	Verification       string          `json:"verification,omitempty"`
+	LastError          string          `json:"lastError,omitempty"`
 }
 
 type requestRecord struct {
@@ -36,8 +41,9 @@ type requestRecord struct {
 }
 
 type persistedState struct {
-	Changes  map[string]*Change       `json:"changes"`
-	Requests map[string]requestRecord `json:"requests"`
+	Changes        map[string]*Change       `json:"changes"`
+	Requests       map[string]requestRecord `json:"requests"`
+	ApprovalNonces map[string]string        `json:"approvalNonces,omitempty"`
 }
 
 type Store struct {
@@ -53,7 +59,7 @@ func OpenStore(dir string) (*Store, error) {
 	}
 	store := &Store{
 		dir: dir, path: filepath.Join(dir, "state.json"),
-		state: persistedState{Changes: make(map[string]*Change), Requests: make(map[string]requestRecord)},
+		state: persistedState{Changes: make(map[string]*Change), Requests: make(map[string]requestRecord), ApprovalNonces: make(map[string]string)},
 	}
 	payload, err := os.ReadFile(store.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -70,6 +76,9 @@ func OpenStore(dir string) (*Store, error) {
 	}
 	if store.state.Requests == nil {
 		store.state.Requests = make(map[string]requestRecord)
+	}
+	if store.state.ApprovalNonces == nil {
+		store.state.ApprovalNonces = make(map[string]string)
 	}
 	for id, change := range store.state.Changes {
 		if change == nil || change.ID != id {
@@ -126,6 +135,16 @@ func (s *Store) Cache(requestID string, uid uint32, fingerprint string, response
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Requests[requestID] = requestRecord{UID: uid, Fingerprint: fingerprint, Response: response}
+	return s.persistLocked()
+}
+
+func (s *Store) UseApprovalNonce(nonce, changeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if previous, exists := s.state.ApprovalNonces[nonce]; exists {
+		return fmt.Errorf("approval nonce was already used for %s", previous)
+	}
+	s.state.ApprovalNonces[nonce] = changeID
 	return s.persistLocked()
 }
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=Pi Ops Agent privileged root helper
-Documentation=file:/opt/pi-ops-agent/docs/security-model.md
+Documentation=file:/opt/pi-ops-agent/current/docs/security-model.md
 PartOf=ops-agent.target
 Before=ops-agentd.service
 After=local-fs.target
@@ -12,7 +12,7 @@ Type=simple
 User=root
 Group=root
 EnvironmentFile=/etc/ops-agent/runtime.env
-ExecStart=/opt/pi-ops-agent/bin/ops-root-helper --socket=/run/ops-agent/helper/root-helper.sock --socket-gid=${OPS_AGENT_GID} --state-dir=/var/lib/ops-agent/root-helper --audit-file=/var/log/ops-agent/root-helper/audit.jsonl --agent-uid=${OPS_AGENT_UID} --approver-uid=${OPS_APPROVER_UID} --write-root=/etc --write-root=/opt
+ExecStart=/opt/pi-ops-agent/current/bin/ops-root-helper --socket=/run/ops-agent/helper/root-helper.sock --socket-gid=${OPS_SERVER_GID} --state-dir=/var/lib/ops-agent/root-helper --audit-file=/var/log/ops-agent/root-helper/audit.jsonl --agent-uid=${OPS_SERVER_UID} --approver-uid=${OPS_APPROVER_UID} --target-policy=/etc/ops-agent/targets.json --approval-key-id=local-approver-v1 --approval-public-key=/etc/ops-agent/tls/approval.pub.pem --write-root=/etc --write-root=/opt
 Restart=always
 RestartSec=2s
 UMask=0077
@@ -29,7 +29,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE CAP_SYS_BOOT CAP_SYS_TIME CAP_AUDIT_CONTROL CAP_MAC_ADMIN CAP_MAC_OVERRIDE CAP_SYSLOG CAP_WAKE_ALARM CAP_BLOCK_SUSPEND CAP_PERFMON CAP_BPF CAP_CHECKPOINT_RESTORE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
 
 [Install]
-WantedBy=ops-agent.target
+WantedBy=multi-user.target

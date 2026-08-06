@@ -2,6 +2,7 @@
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   copyFileSync,
   fsyncSync,
   lstatSync,
@@ -11,9 +12,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
-const configPath = process.argv[2] ?? join(homedir(), ".botmux", "bots.json");
+const configPath = process.argv[2] ?? process.env.BOTS_CONFIG ?? join(homedir(), ".botmux", "bots.json");
+if (!isAbsolute(configPath)) {
+  throw new Error("bots.json path must be absolute");
+}
 const botIndex = Number.parseInt(process.argv[3] ?? "0", 10);
 if (!Number.isInteger(botIndex) || botIndex < 0) {
   throw new Error("bot index must be a non-negative integer");
@@ -35,11 +39,6 @@ const bot = bots[botIndex];
 if (typeof bot !== "object" || bot === null || Array.isArray(bot)) {
   throw new Error("configured bot must be an object");
 }
-if (bot.cliId !== "pi" || bot.cliPathOverride !== "/opt/pi-ops-agent/bin/ops-agent-botmux") {
-  throw new Error(
-    "configure cliId=pi and cliPathOverride=/opt/pi-ops-agent/bin/ops-agent-botmux first",
-  );
-}
 if (!Array.isArray(bot.allowedUsers) || bot.allowedUsers.length !== 1) {
   throw new Error("ops bot must have exactly one allowed user");
 }
@@ -53,6 +52,8 @@ copyFileSync(configPath, backupPath);
 chmodSync(backupPath, 0o600);
 
 Object.assign(bot, {
+  cliId: "pi",
+  cliPathOverride: "/opt/pi-ops-agent/bin/ops-agent-botmux",
   p2pOpen: false,
   disableCliBypass: true,
   sandbox: false,
@@ -62,7 +63,11 @@ delete bot.sandboxHidePaths;
 delete bot.sandboxNetwork;
 
 const temporaryPath = `${configPath}.ops-agent.tmp`;
-const file = openSync(temporaryPath, "w", 0o600);
+const file = openSync(
+  temporaryPath,
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+  0o600,
+);
 try {
   writeFileSync(file, `${JSON.stringify(bots, undefined, 2)}\n`);
   fsyncSync(file);

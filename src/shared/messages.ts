@@ -4,27 +4,41 @@ import {
   requireRecord,
   requireString,
 } from "./guards.js";
-
-const SESSION_ID = /^[a-zA-Z0-9._:-]{8,160}$/;
-const CHANGE_ID = /^[a-zA-Z0-9._-]{8,160}$/;
+import {
+  parseChangeId as parseDomainChangeId,
+  parseSessionId,
+  parseTurnId,
+  type MachineId,
+  type SessionId,
+  type TargetId,
+  type TurnId,
+} from "./domain.js";
+import { requireExactRecord } from "./strict.js";
 
 export type AgentClientMessage =
   | {
       type: "hello";
-      sessionId: string;
+      sessionId: SessionId;
       initialPrompt?: string;
     }
-  | { type: "prompt"; text: string }
+  | { type: "prompt"; turnId: TurnId; text: string }
   | { type: "abort" }
   | { type: "ping" };
 
+interface AgentCorrelation {
+  sessionId: SessionId;
+  turnId: TurnId;
+  machineId?: MachineId;
+  targetId?: TargetId;
+}
+
 export type AgentServerMessage =
-  | { type: "ready"; sessionId: string }
-  | { type: "status"; state: "idle" | "working"; route?: string }
-  | { type: "delta"; text: string }
-  | { type: "tool"; phase: "start" | "end"; name: string; isError?: boolean }
-  | { type: "done" }
-  | { type: "error"; message: string }
+  | { type: "ready"; sessionId: SessionId }
+  | ({ type: "status"; state: "idle" | "working"; route?: string } & AgentCorrelation)
+  | ({ type: "delta"; text: string } & AgentCorrelation)
+  | ({ type: "tool"; phase: "start" | "end"; name: string; isError?: boolean } & AgentCorrelation)
+  | ({ type: "done" } & AgentCorrelation)
+  | ({ type: "error"; message: string } & Partial<AgentCorrelation>)
   | { type: "pong" };
 
 export type RootOperation =
@@ -39,6 +53,13 @@ export type RootOperation =
       path: string;
       content: string;
       mode?: string;
+    }
+  | {
+      kind: "plugin.install";
+      pluginId: string;
+      version: string;
+      digest: string;
+      catalogPath: string;
     }
   | {
       kind: "breakglass.script";
@@ -97,14 +118,12 @@ export interface HelperResponse {
 }
 
 export function parseAgentClientMessage(value: unknown): AgentClientMessage {
-  const input = requireRecord(value, "agent message");
-  const type = requireString(input.type, "agent message.type", { max: 32 });
+  const base = requireRecord(value, "agent message");
+  const type = requireString(base.type, "agent message.type", { max: 32 });
   switch (type) {
     case "hello": {
-      const sessionId = requireString(input.sessionId, "sessionId", {
-        max: 160,
-        pattern: SESSION_ID,
-      });
+      const input = requireExactRecord(base, "agent hello", ["type", "sessionId", "initialPrompt"]);
+      const sessionId = parseSessionId(input.sessionId);
       const initialPrompt = optionalString(input.initialPrompt, "initialPrompt", {
         max: 64 * 1024,
       });
@@ -112,14 +131,19 @@ export function parseAgentClientMessage(value: unknown): AgentClientMessage {
         ? { type, sessionId }
         : { type, sessionId, initialPrompt };
     }
-    case "prompt":
+    case "prompt": {
+      const input = requireExactRecord(base, "agent prompt", ["type", "turnId", "text"]);
       return {
         type,
+        turnId: parseTurnId(input.turnId),
         text: requireString(input.text, "prompt.text", { max: 64 * 1024 }),
       };
+    }
     case "abort":
-    case "ping":
+    case "ping": {
+      requireExactRecord(base, `agent ${type}`, ["type"]);
       return { type };
+    }
     default:
       throw new Error(`unsupported agent message type: ${type}`);
   }
@@ -149,7 +173,7 @@ export function parseHelperResponse(value: unknown): HelperResponse {
 }
 
 export function parseChangeId(value: unknown): string {
-  return requireString(value, "changeId", { max: 160, pattern: CHANGE_ID });
+  return parseDomainChangeId(value);
 }
 
 export function isAgentServerMessage(value: unknown): value is AgentServerMessage {

@@ -94,7 +94,13 @@ async function main() {
     process.stderr.write("ops-agent-botmux: session binding mismatch; outbound replies disabled\n");
   }
 
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const configuredRoot = process.env.OPS_AGENT_CORE_ROOT;
+  const root = configuredRoot === undefined
+    ? resolve(dirname(fileURLToPath(import.meta.url)), "../..")
+    : resolve(configuredRoot);
+  if (configuredRoot !== undefined && root !== "/opt/pi-ops-agent/current") {
+    throw new Error("OPS_AGENT_CORE_ROOT must resolve to /opt/pi-ops-agent/current");
+  }
   const coreExecutable = resolve(root, "bin/ops-agent");
   const childEnvironment = { ...process.env, OPS_AGENT_EVENT_FD: "3" };
   for (const key of Object.keys(childEnvironment)) {

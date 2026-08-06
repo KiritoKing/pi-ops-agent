@@ -39,6 +39,7 @@ check_unit() {
 check_socket() {
   local name="$1"
   local path="$2"
+  local expected_group="$3"
   if [[ ! -S "${path}" ]]; then
     report FAIL "socket:${name}" "missing: ${path}"
     return
@@ -47,8 +48,8 @@ check_socket() {
   owner="$(stat -c '%U' "${path}" 2>/dev/null || printf '?')"
   group="$(stat -c '%G' "${path}" 2>/dev/null || printf '?')"
   mode="$(stat -c '%a' "${path}" 2>/dev/null || printf '?')"
-  if [[ "${group}" != "ops-agent" ]] || [[ "${mode}" != "660" ]]; then
-    report FAIL "socket:${name}" "owner=${owner}:${group} mode=${mode}, expected group=ops-agent mode=660"
+  if [[ "${group}" != "${expected_group}" ]] || [[ "${mode}" != "660" ]]; then
+    report FAIL "socket:${name}" "owner=${owner}:${group} mode=${mode}, expected group=${expected_group} mode=660"
   else
     report PASS "socket:${name}" "owner=${owner}:${group} mode=${mode}"
   fi
@@ -67,13 +68,14 @@ fi
 command -v bwrap >/dev/null 2>&1 \
   && report PASS bubblewrap "$(command -v bwrap)" \
   || report FAIL bubblewrap "not found"
-[[ -x /opt/pi-ops-agent/runtime/node ]] \
-  && report PASS node "$(/opt/pi-ops-agent/runtime/node --version 2>/dev/null || printf broken)" \
+[[ -x /opt/pi-ops-agent/current/runtime/node ]] \
+  && report PASS node "$(/opt/pi-ops-agent/current/runtime/node --version 2>/dev/null || printf broken)" \
   || report FAIL node "runtime missing"
 
 check_unit ops-root-helper.service
 check_unit ops-systemd-helper.service
 check_unit ops-agentd.service
+check_unit ops-agent-server.service
 check_unit ops-agent-healthcheck.timer
 
 failed_units="$(systemctl --failed --no-legend --plain 2>/dev/null | awk 'NF {count++} END {print count+0}')"
@@ -82,9 +84,9 @@ if [[ "${failed_units}" == "0" ]]; then
 else
   report WARN failed-units "count=${failed_units}; inspect with systemctl --failed"
 fi
-check_socket root-helper /run/ops-agent/helper/root-helper.sock
-check_socket systemd-helper /run/ops-agent/helper/systemd-helper.sock
-check_socket agentd /run/ops-agent/agentd/agentd.sock
+check_socket root-helper /run/ops-agent/helper/root-helper.sock ops-agent-server
+check_socket systemd-helper /run/ops-agent/helper/systemd-helper.sock ops-agent
+check_socket agentd /run/ops-agent/agentd/agentd.sock ops-agent
 
 credential=/etc/ops-agent/credentials/deepseek_api_key.cred
 if [[ -f "${credential}" ]]; then

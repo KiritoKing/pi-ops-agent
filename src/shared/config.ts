@@ -7,8 +7,11 @@ export interface AgentConfig {
   rootHelperSocket: string;
   systemdHelperSocket: string;
   stateDir: string;
-  workspaceDir: string;
+  workspaceRoot: string;
   sessionDir: string;
+  sessionRegistryPath: string;
+  serverRegistryPath: string;
+  machineContextDir: string;
   agentDir: string;
   modelsPath: string;
   provider: string;
@@ -17,6 +20,7 @@ export interface AgentConfig {
   auditPath: string;
   bwrapPath: string;
   bashPath: string;
+  sandboxEnabled: boolean;
 }
 
 const DEFAULTS: AgentConfig = {
@@ -24,8 +28,11 @@ const DEFAULTS: AgentConfig = {
   rootHelperSocket: "/run/ops-agent/root-helper.sock",
   systemdHelperSocket: "/run/ops-agent/systemd-helper.sock",
   stateDir: "/var/lib/ops-agent",
-  workspaceDir: "/var/lib/ops-agent/workspace",
+  workspaceRoot: "/var/lib/ops-agent/workspaces",
   sessionDir: "/var/lib/ops-agent/sessions",
+  sessionRegistryPath: "/var/lib/ops-agent/registry/sessions.json",
+  serverRegistryPath: "/etc/ops-agent/servers.json",
+  machineContextDir: "/var/lib/ops-agent/machines",
   agentDir: "/var/lib/ops-agent/pi",
   modelsPath: "/etc/ops-agent/models.json",
   provider: "deepseek",
@@ -34,17 +41,26 @@ const DEFAULTS: AgentConfig = {
   auditPath: "/var/log/ops-agent/agentd-audit.jsonl",
   bwrapPath: "/usr/bin/bwrap",
   bashPath: "/bin/bash",
+  sandboxEnabled: true,
 };
 
 export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const raw = JSON.parse(await readFile(path, "utf8")) as unknown;
   const input = requireRecord(raw, "agent config");
   const config = { ...DEFAULTS };
-  for (const key of Object.keys(DEFAULTS) as Array<keyof AgentConfig>) {
+  const stringKeys = (Object.keys(DEFAULTS) as Array<keyof AgentConfig>)
+    .filter((key): key is Exclude<keyof AgentConfig, "sandboxEnabled"> => key !== "sandboxEnabled");
+  for (const key of stringKeys) {
     const next = optionalString(input[key], `config.${key}`, { max: 4096 });
     if (next !== undefined) {
       config[key] = next;
     }
+  }
+  if (input.sandboxEnabled !== undefined) {
+    if (typeof input.sandboxEnabled !== "boolean") {
+      throw new Error("config.sandboxEnabled must be a boolean");
+    }
+    config.sandboxEnabled = input.sandboxEnabled;
   }
   return config;
 }

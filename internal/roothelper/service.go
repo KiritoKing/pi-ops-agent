@@ -13,6 +13,7 @@ import (
 	"github.com/KiritoKing/pi-ops-agent/internal/audit"
 	"github.com/KiritoKing/pi-ops-agent/internal/peercred"
 	"github.com/KiritoKing/pi-ops-agent/internal/protocol"
+	"github.com/KiritoKing/pi-ops-agent/internal/targetpolicy"
 )
 
 const (
@@ -34,6 +35,9 @@ type Service struct {
 	Store           *Store
 	Audit           *audit.Log
 	Executor        Executor
+	Inspector       Inspector
+	Policy          *targetpolicy.Policy
+	Approval        *ApprovalVerifier
 	Now             func() time.Time
 	RollbackTimeout time.Duration
 }
@@ -81,6 +85,12 @@ func (s *Service) Handle(ctx context.Context, peer peercred.Credential, request 
 		response.Error = "request deadline expired"
 		return response
 	}
+	if s.Policy != nil {
+		if err := s.Policy.Authorize(request); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+	}
 	fingerprint := sha256.Sum256(request.Raw)
 	fingerprintText := hex.EncodeToString(fingerprint[:])
 	if cached, ok, err := s.Store.Cached(request.RequestID, peer.UID, fingerprintText); err != nil {
@@ -102,6 +112,8 @@ func (s *Service) Handle(ctx context.Context, peer peercred.Credential, request 
 		result = s.reject(peer, request, now())
 	case protocol.MethodChangeRollback:
 		result = s.rollback(ctx, peer, request, now())
+	case protocol.MethodHostSnapshot, protocol.MethodProcessList, protocol.MethodSystemdUnit, protocol.MethodJournalTail, protocol.MethodFileMetadata, protocol.MethodFileRead:
+		result = s.inspect(ctx, peer, request)
 	default:
 		result = response
 		result.Error = "method is not served by root-helper"
@@ -146,12 +158,13 @@ func (s *Service) prepare(peer peercred.Credential, request protocol.Request, no
 	if err != nil {
 		return failed(request, err)
 	}
-	plan := sha256.Sum256(payload)
+	planInput := append([]byte(request.ServerID+"\x00"+request.MachineID+"\x00"+request.TargetID+"\x00"+request.PolicyRevision+"\x00"+request.CapabilityRevision+"\x00"), payload...)
+	plan := sha256.Sum256(planInput)
 	changeID, err := randomChangeID()
 	if err != nil {
 		return failed(request, err)
 	}
-	change := &Change{ID: changeID, PlanHash: "sha256:" + hex.EncodeToString(plan[:]), Kind: request.Operation.Kind(), Summary: request.Operation.Summary(), Operation: payload, State: StatePendingApproval, PreparedAt: timestamp(now), UpdatedAt: timestamp(now)}
+	change := &Change{ID: changeID, ServerID: request.ServerID, MachineID: request.MachineID, TargetID: request.TargetID, PolicyRevision: request.PolicyRevision, CapabilityRevision: request.CapabilityRevision, PlanHash: "sha256:" + hex.EncodeToString(plan[:]), Kind: request.Operation.Kind(), Summary: request.Operation.Summary(), Operation: payload, State: StatePendingApproval, PreparedAt: timestamp(now), UpdatedAt: timestamp(now)}
 	if err := s.Store.PutChange(change); err != nil {
 		return failed(request, err)
 	}
@@ -170,11 +183,14 @@ func (s *Service) status(peer peercred.Credential, request protocol.Request) pro
 	if !ok {
 		return denied(request, "change not found")
 	}
+	if err := matchChangeScope(change, request); err != nil {
+		return denied(request, err.Error())
+	}
 	auditID, err := s.appendAudit(peer, request, map[string]interface{}{"type": "change_status", "changeId": change.ID, "state": change.State})
 	if err != nil {
 		return failed(request, err)
 	}
-	data := map[string]interface{}{"planHash": change.PlanHash, "kind": change.Kind, "backupRefs": change.BackupRefs, "verification": change.Verification, "rollbackAvailable": change.RollbackAvailable}
+	data := map[string]interface{}{"serverId": change.ServerID, "machineId": change.MachineID, "targetId": change.TargetID, "policyRevision": change.PolicyRevision, "planHash": change.PlanHash, "kind": change.Kind, "backupRefs": change.BackupRefs, "verification": change.Verification, "rollbackAvailable": change.RollbackAvailable}
 	if change.LastError != "" {
 		data["lastError"] = change.LastError
 	}
@@ -182,12 +198,15 @@ func (s *Service) status(peer peercred.Credential, request protocol.Request) pro
 }
 
 func (s *Service) approve(ctx context.Context, peer peercred.Credential, request protocol.Request, now time.Time) protocol.Response {
-	if peer.UID != s.ApproverUID {
-		return denied(request, "only the configured approver UID may approve")
-	}
 	change, ok := s.Store.Change(request.ChangeID)
 	if !ok {
 		return denied(request, "change not found")
+	}
+	if err := s.authorizeApproval(peer, request, change, "approve", now); err != nil {
+		return denied(request, err.Error())
+	}
+	if err := matchChangeScope(change, request); err != nil {
+		return denied(request, err.Error())
 	}
 	if change.State != StatePendingApproval {
 		return denied(request, "change is not pending approval")
@@ -259,12 +278,15 @@ func (s *Service) approve(ctx context.Context, peer peercred.Credential, request
 }
 
 func (s *Service) reject(peer peercred.Credential, request protocol.Request, now time.Time) protocol.Response {
-	if peer.UID != s.ApproverUID {
-		return denied(request, "only the configured approver UID may reject")
-	}
 	change, ok := s.Store.Change(request.ChangeID)
 	if !ok {
 		return denied(request, "change not found")
+	}
+	if err := s.authorizeApproval(peer, request, change, "reject", now); err != nil {
+		return denied(request, err.Error())
+	}
+	if err := matchChangeScope(change, request); err != nil {
+		return denied(request, err.Error())
 	}
 	if change.State != StatePendingApproval {
 		return denied(request, "change is not pending approval")
@@ -281,12 +303,15 @@ func (s *Service) reject(peer peercred.Credential, request protocol.Request, now
 }
 
 func (s *Service) rollback(ctx context.Context, peer peercred.Credential, request protocol.Request, now time.Time) protocol.Response {
-	if peer.UID != s.ApproverUID {
-		return denied(request, "only the configured approver UID may roll back")
-	}
 	change, ok := s.Store.Change(request.ChangeID)
 	if !ok {
 		return denied(request, "change not found")
+	}
+	if err := s.authorizeApproval(peer, request, change, "rollback", now); err != nil {
+		return denied(request, err.Error())
+	}
+	if err := matchChangeScope(change, request); err != nil {
+		return denied(request, err.Error())
 	}
 	if change.State != StateCommitted && change.State != StateRecoveryRequired {
 		return denied(request, "change is not eligible for rollback")
@@ -354,8 +379,43 @@ func (s *Service) rollbackContext() (context.Context, context.CancelFunc) {
 func (s *Service) isAgentOrApprover(uid uint32) bool {
 	return uid == s.AgentUID || uid == s.ApproverUID
 }
+func (s *Service) authorizeApproval(peer peercred.Credential, request protocol.Request, change *Change, action string, now time.Time) error {
+	if peer.UID == s.ApproverUID && request.CallerRole == "" {
+		return nil
+	}
+	if s.Policy == nil || peer.UID != s.AgentUID || (request.CallerRole != "approver" && request.CallerRole != "admin") {
+		return errors.New("only the configured local approver or a signed remote approval may authorize this action")
+	}
+	if request.Approval == nil {
+		return errors.New("remote change action requires a signed approval grant")
+	}
+	if err := s.Approval.Verify(*request.Approval, action, change, now); err != nil {
+		return err
+	}
+	if err := s.Store.UseApprovalNonce(request.Approval.Nonce, change.ID); err != nil {
+		return err
+	}
+	return nil
+}
+func (s *Service) isAdmin(peer peercred.Credential, request protocol.Request) bool {
+	if peer.UID == s.ApproverUID && request.CallerRole == "" {
+		return true
+	}
+	return s.Policy != nil && peer.UID == s.AgentUID && request.CallerRole == "admin"
+}
+func matchChangeScope(change *Change, request protocol.Request) error {
+	if change.ServerID != request.ServerID || change.MachineID != request.MachineID || change.TargetID != request.TargetID || change.PolicyRevision != request.PolicyRevision {
+		return errors.New("change scope does not match server, machine, target, or policy revision")
+	}
+	return nil
+}
 func (s *Service) appendAudit(peer peercred.Credential, request protocol.Request, event interface{}) (string, error) {
-	return s.Audit.Append(map[string]interface{}{"peer": map[string]interface{}{"pid": peer.PID, "uid": peer.UID, "gid": peer.GID}, "requestId": request.RequestID, "method": request.Method, "event": event})
+	return s.Audit.Append(map[string]interface{}{
+		"peer":      map[string]interface{}{"pid": peer.PID, "uid": peer.UID, "gid": peer.GID},
+		"requestId": request.RequestID, "method": request.Method, "serverId": request.ServerID,
+		"machineId": request.MachineID, "targetId": request.TargetID, "policyRevision": request.PolicyRevision,
+		"callerRole": request.CallerRole, "event": event,
+	})
 }
 func denied(request protocol.Request, message string) protocol.Response {
 	return protocol.Response{Version: protocol.Version, RequestID: request.RequestID, Error: message}
