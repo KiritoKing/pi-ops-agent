@@ -7,14 +7,21 @@
 
 1. 中央非 root `agentd`：Pi Harness、固定工具、多 Machine/Target、多 Session、每
    Session 独占 workspace。
-2. 每机器一个非 root `agentd-server`：HTTPS + JSON + mTLS、能力发现、Target、严格
+2. 同机同 UID `agentd-guard`：只做语义心跳、固定进程身份校验和有界终止；由 systemd
+   负责重启，不拥有 root、通用 `systemctl` 或主机巡检能力。
+3. 每机器一个非 root `agentd-server`：HTTPS + JSON + mTLS、能力发现、Target、严格
    schema、限流、幂等和异步 change。
-3. 每机器一个 Unix-only root helper：类型化权限、备份、执行、验证、回滚和权威状态。
-4. 模型外审批：agent/approver/admin role credential 分离，授权绑定完整计划摘要。
-5. TUI 保底入口与 Adapter Plugin 抽象；BotMux 作为首个独立 `.opspkg`，由用户通过
+4. 每机器一个 Unix-only `agentd-root-broker`：root-owned policy、类型化权限、备份、
+   执行、验证、回滚和权威状态。
+5. 模型外审批：agent/approver/admin role credential 分离，授权绑定完整计划摘要。
+6. TUI 保底入口与 Adapter Plugin 抽象；BotMux 作为首个独立 `.opspkg`，由用户通过
    TUI 对话要求 Agent 准备安装，不属于 `init`。
-6. 原生 systemd 部署：GitHub Raw 最小 bootstrap、amd64/arm64 预构建 Release、`.deb`、
+7. 原生 systemd 部署：GitHub Raw 最小 bootstrap、amd64/arm64 预构建 Release、`.deb`、
    SBOM、manifest、checksums、artifact attestation、版本目录切换与回退。
+
+规范名称与当前 `v0.1.x` artifact 的映射由[架构文档](architecture.md)维护。现有
+`ops-systemd-helper` 是 guard 迁移兼容层；现有 `ops-root-helper` 是
+`agentd-root-broker` 的旧 artifact 名称，不应继续出现在新的逻辑 API 命名中。
 
 ## 明确排除
 
@@ -27,12 +34,14 @@
 ## 实施顺序
 
 1. 领域与严格协议：Machine、Target、Session、ChangeRef、Principal、Capability、Policy。
-2. Session 隔离与本地 client gateway；保留旧 Unix helper adapter 作为迁移层。
-3. Go server、mTLS role、root helper Target policy、异步 change 和幂等恢复。
-4. 注册、enrollment、机器池、capability/policy drift 与跨机器审批路由。
-5. TUI 事件、模型外审批、插件 catalog/prepare/status、BotMux Adapter Plugin 与模型外
+2. Session 隔离与本地 client gateway；保留旧 Unix direct-broker adapter 作为迁移层。
+3. 将 `ops-systemd-helper` 收缩/替换为同 UID `agentd-guard`，移除通用主机巡检与
+   `systemctl` 权限。
+4. Go `agentd-server`、mTLS role、`agentd-root-broker` Target policy、异步 change 和幂等恢复。
+5. 注册、enrollment、机器池、capability/policy drift 与跨机器审批路由。
+6. TUI 事件、模型外审批、插件 catalog/prepare/status、BotMux Adapter Plugin 与模型外
    `/botmux-setup`。
-6. Release/原生安装、升级回退、干净 PVE LXC 冒烟和 GitHub 首个 Release。
+7. Release/原生安装、升级回退、干净 PVE LXC 冒烟和 GitHub Release。
 
 ## MVP 验收
 
@@ -44,7 +53,7 @@
   内不具备中心化单次消费保证；
 - 两台机器、多个 Target 和多个 Session 不串 identity/workspace/change；
 - 恶意 capability 不能创建未知工具或扩权；
-- agent-role 不能 approve，旧审批不能跨 server/Target/policy revision 复用；
+- agent-role 不能 approve，旧审批不能跨 agentd-server/Target/policy revision 复用；
 - 断线/重复 request 不重复 mutation；
 - 文件写前有备份、fsync、验证和可核对终态；
 - PVE LXC 无 user namespace 时只禁用 `ops_bash`，不降低其他边界；

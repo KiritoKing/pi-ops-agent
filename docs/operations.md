@@ -12,11 +12,25 @@ ops-agent tui
 
 ```bash
 sudo /opt/pi-ops-agent/current/scripts/healthcheck.sh
-systemctl status ops-agent.target ops-agentd ops-root-helper --no-pager
-journalctl -u ops-agentd -u ops-root-helper -f
+systemctl status \
+  ops-agent.target \
+  ops-agentd.service \
+  ops-systemd-helper.service \
+  ops-agent-server.service \
+  ops-root-helper.service \
+  --no-pager
+journalctl \
+  -u ops-agentd.service \
+  -u ops-systemd-helper.service \
+  -u ops-agent-server.service \
+  -u ops-root-helper.service \
+  -f
 ```
 
-计划维护时停止整个 target，避免 systemd/guardian 重新拉起 agentd：
+这些是 `v0.1.x` artifact 名称，分别对应 `agentd`、兼容 `agentd-guard`、
+`agentd-server` 和 `agentd-root-broker`。规范名称与迁移状态见[架构文档](architecture.md)。
+
+计划维护时停止整个 target，避免 systemd/`agentd-guard` 重新拉起 `agentd`：
 
 ```bash
 sudo systemctl stop ops-agent.target
@@ -61,7 +75,7 @@ sudo systemctl restart ops-agentd.service
 ```
 
 模型、Adapter、agent-role、approver-role 和 admin-role credential 必须分开。轮换远端
-server 证书时先建立新证书的重叠有效期，验证 identity/policy digest 后再吊销旧证书；
+`agentd-server` 证书时先建立新证书的重叠有效期，验证 identity/policy digest 后再吊销旧证书；
 不能因 endpoint IP 不变而接受 identity 漂移。
 
 Enrollment bundle 是短期离线 bootstrap bearer，不是长期 credential。它绑定 controller
@@ -71,19 +85,19 @@ origin、endpoint identity、证书、policy 和期限，但 MVP 没有在线消
 
 ## Machine、Target 与策略漂移
 
-机器以稳定 `machineId/serverId` 标识，地址只是 locator。每次重连刷新 observed endpoint、
-capability digest、policy revision 和证书期限，但不能让 server 覆盖本地 trust pin 或 alias。
+机器以稳定 `machineId/serverId` 标识，地址只是 locator。每次 `agentd-server` 重连刷新 observed endpoint、
+capability digest、policy revision 和证书期限，但不能让 `agentd-server` 覆盖本地 trust pin 或 alias。
 
 以下变化必须 fail-closed 并要求管理员检查：
 
-- server identity、machineId 或证书 pin 变化；
+- `agentd-server` identity、machineId 或证书 pin 变化；
 - Target 对应 UID/GID/账号变化；
 - capability 新增写/root 能力；
 - policy revision 在 prepare 与 approve 之间变化；
 - 已审批计划的 precondition、backup 或 verification digest 变化。
 
 机器下线时先禁用新 Session 和 prepare，等待在途 change 到达权威终态，然后吊销证书并
-归档审计。删除注册表记录不能删除远端备份或 root helper 状态。
+归档审计。删除注册表记录不能删除远端备份或 `agentd-root-broker` 状态。
 
 ## Adapter 生命周期
 
@@ -108,7 +122,7 @@ BotMux 配置内的明文 Lark secret 由该管理员账户负责保护。回退
 
 ## 变更状态与恢复
 
-权威状态位于目标机器 root helper，不位于对话 Session：
+权威状态位于目标机器 `agentd-root-broker`，不位于对话 Session：
 
 ```text
 PREPARED -> APPROVED -> EXECUTING -> COMMITTED
@@ -124,7 +138,7 @@ PREPARED -> APPROVED -> EXECUTING -> COMMITTED
 恢复步骤：
 
 1. 冻结目标资源的新 mutation；必要时停止目标 endpoint；
-2. 读取 root-only change state 和审计，不相信模型总结；
+2. 读取 `agentd-root-broker` 的 root-only change state 和审计，不相信模型总结；
 3. `COMMITTED`：独立检查 verification；
 4. `ROLLED_BACK`：核对资源摘要和服务状态；
 5. `RECOVERY_REQUIRED`：按审计定位备份，由真实管理员显式 rollback 或人工恢复；
@@ -148,7 +162,9 @@ approver identity / approval nonce
 backup / verification / rollback evidence
 ```
 
-Agent、server 和 root helper 分别写审计，root 审计不能由 `ops-agent` 改写。Hash chain
+`agentd`、`agentd-server` 和 `agentd-root-broker` 分别写业务/安全审计；
+`agentd-guard` 只写心跳过期、身份校验和有界终止等可用性审计。root 审计不能由
+`ops-agent` 改写。Hash chain
 只能发现本地篡改，不能抵御已获得 root 的攻击者整体替换程序与日志；生产部署应把摘要
 只追加传送到独立系统。
 

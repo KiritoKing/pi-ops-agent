@@ -8,7 +8,7 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 
 1. 能完成通用只读诊断，并为受控的系统变更生成计划。
 2. 不可信 prompt、模型、日志或 bridge 被控制后，不能自行获得或授权 root。
-3. 每次高权限变更有审批、备份、验证、审计和恢复证据。
+3. 每次高权限变更经 `agentd-root-broker` 完成审批绑定、备份、验证、审计和恢复证据。
 4. Agent 核心与 BotMux、飞书及其他 IM bridge 实现解耦。
 
 开始工作前，至少阅读与改动相关的设计文档：
@@ -20,12 +20,13 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 
 ## 不可破坏的安全边界
 
-- `ops-agentd` 必须永久非特权运行。禁止调用 `sudo`、读取宿主 credential、直接写系统目录或执行 root 命令。
+- `agentd`（当前 unit：`ops-agentd.service`）必须永久非特权运行。禁止调用 `sudo`、读取宿主 credential、直接写系统目录或执行 root 命令。
 - 模型和 agentd UID 只能准备或查询变更，不能批准、拒绝或回滚。真实 client peer 的 UID 必须由 Unix `SO_PEERCRED` 校验。
-- 所有普通 root 变更必须通过 `root-helper` 的版本化 tagged union。禁止增加 raw root command、任意 argv、任意脚本或 shell callback RPC。
+- 所有普通 root 变更必须通过 `agentd-root-broker` 的版本化 tagged union。当前实现 artifact 为 `ops-root-helper`/`internal/roothelper`；禁止增加 raw root command、任意 argv、任意脚本或 shell callback RPC。
+- `agentd-guard` 的目标边界是与 `agentd` 同 UID，只能校验固定进程身份并有界终止卡死的 agentd；当前 `ops-systemd-helper` 是 root 兼容层，只允许收缩，禁止继续扩大主机巡检、journal、unit 或 `systemctl` 范围。
 - `/approve`、`/reject`、`/rollback`、`/status` 必须由 client 在模型上下文之外截获。不得把自然语言中的同名文本视为授权。
 - `breakglass.script` 默认关闭。扩展它时仍须绑定脚本摘要、显式备份、验证计划、网络声明和人工审批。
-- 写操作必须遵守 `PREPARED → APPROVED → EXECUTING → COMMITTED / ROLLED_BACK / RECOVERY_REQUIRED`。只有 helper 返回 `COMMITTED` 才能宣告成功。
+- 写操作必须遵守 `PREPARED → APPROVED → EXECUTING → COMMITTED / ROLLED_BACK / RECOVERY_REQUIRED`。只有 `agentd-root-broker` 返回 `COMMITTED` 才能宣告成功。
 - 不得为了让测试或部署通过而削弱 systemd hardening、bubblewrap namespace、路径 allowlist、peer UID 校验、速率限制或审计。
 - 禁止提交 API key、IM credential、SSH 材料、生成的 systemd credential、运行时状态、备份或审计日志。
 
@@ -36,8 +37,8 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 | `src/agentd/` | TypeScript | Pi 会话、模型路由、工具编排、sandbox 和 Agent 审计。模型可见逻辑放这里，但不得拥有 root 能力 |
 | `src/client/` | TypeScript | 交互、审批命令拦截、会话输出和通用完成事件。不得导入具体 IM SDK |
 | `src/shared/` | TypeScript | 配置、framing、schema guard、脱敏、路由与通用 RPC。保持 transport 与厂商无关 |
-| `cmd/` | Go | helper 的薄入口。只做参数解析、依赖装配和进程启动 |
-| `internal/` | Go | 特权协议、peer credential、RPC server、备份、验证、回滚和 watchdog；不对外形成通用 root API |
+| `cmd/` | Go | `agentd-server`、`agentd-root-broker` 和兼容 guard 的薄入口；只做参数解析、依赖装配和进程启动 |
+| `internal/` | Go | `agentd-server`、`agentd-root-broker`、兼容 guard、peer credential、备份、验证和回滚；不对外形成通用 root API |
 | `integrations/<bridge>/` | adapter 自选 | IM 或自动化桥接。包装 core client，消费版本化事件，并自行负责认证与投递 |
 | `config/` | JSON / env 示例 | 可移植默认配置与示例；不能包含主机专用值或秘密 |
 | `systemd/` | unit 文件 | 身份、目录、credential 和 hardening 边界 |
@@ -48,7 +49,7 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 ### 为什么这样分
 
 - TypeScript 与 Pi SDK 同栈，负责高变化、非特权的模型和会话层。
-- Go helper 是小型可信计算基，直接处理 Unix socket、文件权限和系统操作，并可交付独立二进制。
+- Go `agentd-root-broker` 是小型可信计算基，直接处理 Unix socket、文件权限和系统操作，并可交付独立二进制。
 - `cmd/` 与 `internal/` 分离，避免入口膨胀或把特权能力变成可复用的通用库。
 - bridge 位于 `integrations/`，确保核心只处理稳定事件协议，不接触 IM credential 或厂商会话语义。
 
@@ -56,7 +57,7 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 
 - TypeScript 与 Go 都必须对边界输入执行运行时校验；不能只依赖静态类型。
 - 协议必须版本化、默认拒绝未知字段、限制帧大小并设置 deadline。
-- 修改消息或操作类型时，同一变更中更新 `src/shared/`、`internal/protocol/`、相关 client/helper、测试和文档。
+- 修改消息或操作类型时，同一变更中更新 `src/shared/`、`internal/protocol/`、相关 client/server/broker/guard、测试和文档。
 - 不要用宽泛字符串、`Record<string, unknown>` 或 Go `map[string]any` 绕过 tagged union。边界数据先按 `unknown` 解码，再显式收窄。
 - 错误响应和审计正文不得泄漏 secret、完整 credential 路径或未经脱敏的不可信大文本。
 
@@ -71,7 +72,7 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 
 ### Go
 
-- helper 必须 fail-closed；所有操作先规范化、校验权限和状态，再产生副作用。
+- `agentd-root-broker` 必须 fail-closed；所有操作先规范化、校验权限和状态，再产生副作用。
 - 使用明确 struct 和枚举表达协议，JSON decoder 保持拒绝未知字段。
 - 新的特权操作必须同时提供：最小参数类型、路径/名称约束、备份计划、执行器、验证、回滚或明确的 `RECOVERY_REQUIRED` 语义，以及审计测试。
 - `cmd/` 保持薄；业务逻辑和测试放入对应 `internal/` 包。
@@ -89,7 +90,7 @@ Pi Ops Agent 是面向 Linux/systemd 的常驻运维 Agent。它必须同时满�
 1. 放在 `src/agentd/tools.ts` 或同层专用模块。
 2. 标明只读或变更准备语义；不得直接产生宿主 root 副作用。
 3. 添加输入校验、超时、输出裁剪/脱敏和单元测试。
-4. 若需要高权限，新增或复用类型化 helper 操作，不得调用 shell 逃逸。
+4. 若需要高权限，新增或复用类型化 `agentd-root-broker` 操作，不得调用 shell 逃逸。
 
 ### 新增特权操作
 

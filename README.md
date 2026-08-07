@@ -12,13 +12,15 @@
 </div>
 
 Pi Ops Agent 使用 Pi Agent Harness 提供自然语言诊断和受控变更能力。模型始终运行在
-非特权账户和无网络 bubblewrap 后面；跨机器访问经 mTLS server，root 能力只存在于
-目标机的本地类型化 helper，审批在模型上下文之外完成。
+非特权账户和无网络 bubblewrap 后面；跨机器访问经 mTLS `agentd-server`，root 能力只
+存在于目标机本地、Unix-only 的类型化 `agentd-root-broker`，审批在模型上下文之外完成。
 
 ## MVP 能力
 
 - 一个中央 `agentd` 管理多台 systemd Linux 机器。
+- 一个与 `agentd` 同 UID 的 `agentd-guard` 只做语义心跳和有界保活；systemd 负责拉起。
 - 每台机器一个非 root `agentd-server`，管理多个 Target/Unix 账号。
+- 每台机器一个 root `agentd-root-broker`，只执行 root-owned policy 允许的类型化操作。
 - 多 Session；一个 Session 首次访问时原子绑定一个 Machine + Target，同一机器可有多个
   Session，每个 Session 独占可写 scratch workspace。
 - 有界主机、进程、service、journal 和文件巡检。
@@ -39,18 +41,24 @@ flowchart LR
   I --> G
   G -->|"prompt"| A["agentd / Pi Harness\n非 root"]
   G -->|"模型外审批"| P["Approval Router"]
+  A -->|"语义心跳"| W["agentd-guard\n同 UID、无 root"]
+  W -.->|"有界终止卡死 agentd"| A
   A -->|"HTTPS + JSON + mTLS"| S["agentd-server\n每机器一个，非 root"]
   P -->|"独立 approver principal"| S
-  S -->|"Unix typed RPC"| R["root helper"]
+  S -->|"Unix typed RPC"| R["agentd-root-broker\n每机器一个，root"]
   R --> T1["Target: hermes-agent"]
   R --> T2["Target: 其他账号/资源"]
 ```
 
-`agentd-server` 的服务账户本身不需要拥有业务资源。Root helper 根据 root-owned policy
+`agentd-server` 的服务账户本身不需要拥有业务资源。`agentd-root-broker` 根据 root-owned policy
 把 Target 映射到 UID/GID、路径、unit 和固定 recipe；“允许 root 操作”不等于 server
 获得 root 或任意 shell。
 
-详见[架构](docs/architecture.md)和[安全模型](docs/security-model.md)。
+规范组件名是 `agentd / agentd-guard / agentd-server / agentd-root-broker`。`v0.1.x`
+仍保留 `ops-agentd`、`ops-systemd-helper`、`ops-agent-server`、`ops-root-helper` 等 artifact
+名称；部署命令继续使用真实 unit 名称。完整职责和迁移边界见[架构](docs/architecture.md)。
+
+安全边界详见[安全模型](docs/security-model.md)。
 
 ## 一条命令初始化
 
@@ -94,7 +102,7 @@ Lark secret 只进入 BotMux 的终端交互，不进入模型、Agent transcrip
 Harness 固定工具
 ∩ Principal/Session 权限
 ∩ 已知 capability schema
-∩ server capability
+∩ agentd-server capability
 ∩ root-owned policy
 ```
 
@@ -106,7 +114,7 @@ PREPARED -> APPROVED -> EXECUTING -> COMMITTED
      +-> REJECTED/EXPIRED     +-> ROLLED_BACK/RECOVERY_REQUIRED
 ```
 
-审批绑定 server、machine、Target、change、plan hash、policy/capability revision、前置条件、
+审批绑定 agentd-server、machine、Target、change、plan hash、policy/capability revision、前置条件、
 期限和 nonce。连接中断后只查询原 change，不能重放 mutation。
 
 ## 目录
@@ -114,7 +122,7 @@ PREPARED -> APPROVED -> EXECUTING -> COMMITTED
 ```text
 src/             TypeScript Harness、Session、Client Gateway 与共享协议
 cmd/             Go 命令薄入口
-internal/        server、root helper、策略、备份、审计与恢复
+internal/        agentd-server、agentd-root-broker、兼容 guard、策略、备份、审计与恢复
 plugins/         Adapter manifest；MVP 首个为 adapter-botmux
 integrations/    Adapter runtime
 systemd/         原生 systemd unit 与 tmpfiles

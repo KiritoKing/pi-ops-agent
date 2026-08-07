@@ -30,12 +30,17 @@ credential，启动服务并运行健康检查。需要先落盘、稍后再配�
 
 `init` 的边界是：
 
-- 安装 controller、Pi Harness、本机 endpoint、root helper、健康托管和 TUI；
+- 安装中央 `agentd`、同机 `agentd-guard`、本机 `agentd-server`、
+  `agentd-root-broker`、健康托管和 TUI；
 - 创建 `ops-agent` 非特权账户、运行目录、配置和 systemd unit；
 - 初始化空的机器与 Session 注册表；
 - 安装并启动核心服务，执行只读冒烟；
 - **不安装、不初始化、不配置 BotMux 或任何外部 Adapter**；
 - **不读取 Lark/BotMux credential，也不创建 BotMux 服务账户**。
+
+后续 `join` 机器只部署 `agentd-server + agentd-root-broker`，不会再运行一份模型、
+Session 或 `agentd-guard`。规范组件名与 `v0.1.x` unit/binary 兼容映射见
+[架构文档](architecture.md#v01x-artifact-兼容映射)。
 
 完成后重新登录，使 `ops-agent` supplementary group 生效，然后进入保底入口：
 
@@ -89,7 +94,7 @@ sudo ops-agent-bootstrap init --admin-user "$USER"
 
 ## 后续机器：`join`
 
-管理员在 controller 上运行 `ops-agent endpoint-token`（或底层
+管理员在 `agentd` controller 上运行 `ops-agent endpoint-token`（或当前 artifact
 `ops-agent-server issue-enrollment`），在模型外生成一个短期签名 enrollment bundle。
 Bundle 内只包含指定 controller origin、endpoint 身份、证书和初始 policy；把它保存为
 仅 owner 可读的文件后，在新机器执行：
@@ -110,7 +115,7 @@ ops-agent-server enroll --controller <url> --token-file <root-only-file>
 ```
 
 只有签名、期限、controller origin、证书、identity/policy 落盘和只读 smoke 全部成功，
-才启用 `ops-agent-server`。它是离线 bearer bundle：MVP 没有在线“消费一次”状态，所以在
+才启用 `agentd-server`（当前 unit 为 `ops-agent-server.service`）。它是离线 bearer bundle：MVP 没有在线“消费一次”状态，所以在
 有效期内复制件仍可重放。成功后必须立即安全删除 controller 和 endpoint 上的 bundle；
 怀疑泄露时等待其过期并轮换对应 endpoint credential。Issuer 会在发放时先写 controller
 注册表，endpoint 安装失败时管理员必须禁用或删除该待接入记录。
@@ -139,11 +144,11 @@ TUI 不实现独立的“插件管理业务页面”。用户直接与 Agent 对
 
 Agent 通过固定插件工具完成 catalog 查询、manifest/兼容性检查、安装计划准备和状态
 查询，并向用户解释 publisher、版本、digest 和 root 文件变更。插件包不包含 BotMux
-本体，也不会让 root helper 执行 npm 或联网脚本；先按
+本体，也不会让 `agentd-root-broker` 执行 npm 或联网脚本；先按
 [BotMux 官方安装说明](https://deepcoldy.github.io/botmux/)为当前管理员安装 `botmux`。
 
 Adapter 文件安装是一项高权限 change：Agent 只能 prepare，真实管理员必须在 TUI 中
-执行 `/approve <changeRef>`。root helper 只验证、解包固定 digest，并原子维护插件
+执行 `/approve <changeRef>`。`agentd-root-broker` 只验证、解包固定 digest，并原子维护插件
 `current` 与固定 launcher；不会执行 manifest 中的 installer、callback 或任意命令。
 
 提交成功后，在交互式 TUI 输入 `/botmux-setup`。这个精确 client 命令不发送给模型；它
@@ -165,10 +170,20 @@ credential，部署者必须接受并保护该账户。
 ## 部署验收
 
 ```bash
-systemctl status ops-agent.target ops-agentd ops-root-helper --no-pager
+systemctl status \
+  ops-agent.target \
+  ops-agentd.service \
+  ops-systemd-helper.service \
+  ops-agent-server.service \
+  ops-root-helper.service \
+  --no-pager
 sudo /opt/pi-ops-agent/current/scripts/healthcheck.sh
 ops-agent tui
 ```
+
+以上是 `v0.1.x` 的真实 unit 名称：依次对应规范的 `agentd`、兼容
+`agentd-guard`、`agentd-server` 和 `agentd-root-broker`。不要在代码完成迁移前把命令
+机械改成尚不存在的 unit。
 
 至少验证：
 

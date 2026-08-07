@@ -2,7 +2,7 @@
 
 ## 保护目标
 
-1. Prompt、模型、日志、远端 server 或 Adapter 被控制后，不能自行获得或批准 root。
+1. Prompt、模型、日志、远端 `agentd-server` 或 Adapter 被控制后，不能自行获得或批准 root。
 2. 一个 machine/session 被控制后，不能静默扩展到未注册机器、Target 或其他 workspace。
 3. 每个高权限变更可证明目标、计划、审批、备份、验证、终态和恢复证据。
 4. 断线、重试、进程崩溃和重复 webhook 不会重复业务 mutation。
@@ -18,10 +18,11 @@
 | Harness | 禁用 Pi 原生工具/skill/extension；固定类型化工具；不可信 capability 只能取交集 |
 | Session | 独占 workspace 和 writer lease；机器/Target 由 Harness 绑定 |
 | Sandbox | bubblewrap 无网络、系统只读、只挂当前 workspace；独立非 root UID |
+| Guard | `agentd-guard` 与 `agentd` 同 UID，只做固定心跳/进程身份检查和有界终止；不是权限边界 |
 | Registry | 稳定 serverId、证书 pin、管理员注册；IP 不是身份 |
 | Transport | HTTPS/mTLS、角色分离、严格 schema、deadline、限流、幂等、防重放 |
-| Server | 非 root 网络前端；root policy 和 credential 只读 |
-| Root helper | Unix-only、peer identity、tagged union、资源 allowlist、无 raw root API |
+| Server | `agentd-server` 是非 root 网络前端；root policy 和 credential 只读 |
+| Root broker | `agentd-root-broker` Unix-only、peer identity、tagged union、资源 allowlist、无 raw root API |
 | Approval | 模型外 principal；绑定不可变 plan 和短期 nonce；执行前重新校验 |
 | Recovery | 写前备份、fsync、验证、自动回滚或 `RECOVERY_REQUIRED` |
 
@@ -56,9 +57,9 @@ planHash, policyRevision, capabilityRevision,
 preconditions, issuedAt, expiresAt, nonce, approver identity
 ```
 
-Agent credential 不能生成 ApprovalGrant。Server 与 root helper 都必须重新校验，任何
-identity、plan、policy、capability 或 precondition 变化都会使旧审批失效。只有 root helper
-返回 `COMMITTED` 才能宣告成功。
+Agent credential 不能生成 ApprovalGrant。`agentd-server` 与 `agentd-root-broker` 都必须
+重新校验，任何 identity、plan、policy、capability 或 precondition 变化都会使旧审批
+失效。只有 `agentd-root-broker` 返回 `COMMITTED` 才能宣告成功。
 
 ## 插件与秘密
 
@@ -66,7 +67,7 @@ identity、plan、policy、capability 或 precondition 变化都会使旧审批�
 GitHub Release artifact attestation 是发布来源证明；没有执行 attestation 验证时只能声称
 验证了 HTTPS + checksum，不能声称独立签名已验证。
 
-插件不得携带 root shell installer。Agent 只能准备由 root helper 认识的类型化安装操作。
+插件不得携带 root shell installer。Agent 只能准备由 `agentd-root-broker` 认识的类型化安装操作。
 MVP 没有通用 secret broker，也不让模型发起 secret 请求。BotMux Adapter 文件提交后，
 只有交互式 TUI 的精确 `/botmux-setup` 能在模型外把终端交给 `botmux setup`；ops-agent
 不读取 secret，transcript、argv 和审计正文均不包含 secret。BotMux 当前把 Lark secret
@@ -90,7 +91,7 @@ Checksum 与 artifact 位于同一 GitHub Release，只能检测传输损坏或�
 
 ## 已知边界
 
-MVP 不抵御内核漏洞、root helper 自身漏洞、被控制的软件源、已获得 root 的攻击者或
+MVP 不抵御内核漏洞、`agentd-root-broker` 自身漏洞、被控制的软件源、已获得 root 的攻击者或
 systemd credential 主密钥泄漏。Controller HA、多方审批、外部审计锚定、自动低风险写入、
 远端任意脚本和记忆插件均不在 MVP。
 
