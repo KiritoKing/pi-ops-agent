@@ -46,6 +46,12 @@ if [[ -f "${REPOSITORY_ROOT}/config/botmux-systemd-dropin.conf" ]]; then
   package_files+=(botmux-systemd-dropin.conf)
 fi
 
-tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-  -czf "${OUTPUT_DIR}/adapter-botmux_${VERSION}.opspkg" -C "${work_dir}" \
-  "${package_files[@]}"
+if tar --version 2>&1 | grep -q 'GNU tar'; then
+  tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+    -czf "${OUTPUT_DIR}/adapter-botmux_${VERSION}.opspkg" -C "${work_dir}" \
+    "${package_files[@]}"
+else
+  COPYFILE_DISABLE=1 tar --format ustar -czf \
+    "${OUTPUT_DIR}/adapter-botmux_${VERSION}.opspkg" -C "${work_dir}" \
+    "${package_files[@]}"
+fi

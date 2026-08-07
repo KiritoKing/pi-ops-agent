@@ -71,7 +71,7 @@ func TestApproverRoleForwardsScopedAction(t *testing.T) {
 		t.Fatalf("approve code=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	forwarded := backend.requests[0]
-	if forwarded.Method != protocol.MethodChangeApprove || forwarded.CallerRole != "approver" || forwarded.TargetID != "target-hermes" || forwarded.PolicyRevision != "policy-12345678" {
+	if forwarded.Method != protocol.MethodChangeApprove || forwarded.CallerRole != "approver" || forwarded.TargetID != "target-service" || forwarded.PolicyRevision != "policy-12345678" {
 		t.Fatalf("unexpected forwarded request %#v", forwarded)
 	}
 	var response publicResponse
@@ -81,7 +81,7 @@ func TestApproverRoleForwardsScopedAction(t *testing.T) {
 }
 
 func actionBody(now time.Time) string {
-	grant := `"approval":{"version":1,"keyId":"approver-test-v1","action":"approve","serverId":"server-12345678","machineId":"machine-12345678","targetId":"target-hermes","changeId":"change-12345678","planHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","policyRevision":"policy-12345678","issuedAt":"2026-08-06T12:00:00Z","expiresAt":"2026-08-06T12:01:00Z","nonce":"nonce-agentserver-test-12345678","signature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`
+	grant := `"approval":{"version":1,"keyId":"approver-test-v1","action":"approve","serverId":"server-12345678","machineId":"machine-12345678","targetId":"target-service","changeId":"change-12345678","planHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","policyRevision":"policy-12345678","issuedAt":"2026-08-06T12:00:00Z","expiresAt":"2026-08-06T12:01:00Z","nonce":"nonce-agentserver-test-12345678","signature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`
 	return requestBody(now, grant)
 }
 
@@ -106,7 +106,7 @@ func TestStrictJSONScopeAndCertificateRole(t *testing.T) {
 	}
 }
 
-func TestCapabilitiesPublishOnlyImplementedPluginInstall(t *testing.T) {
+func TestCapabilitiesPublishOnlyImplementedArtifactOperations(t *testing.T) {
 	server, _ := testServer(t, time.Now())
 	handler, _ := server.Handler()
 	request := httptest.NewRequest(http.MethodGet, "/v1/capabilities", nil)
@@ -114,22 +114,48 @@ func TestCapabilitiesPublishOnlyImplementedPluginInstall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK || strings.Contains(body, "breakglass") || !strings.Contains(body, "plugin.install") || strings.Contains(body, "plugin.configure") || strings.Contains(body, "plugin.remove") {
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `"revision":"capability-remote-mvp-v2"`) || strings.Contains(body, "breakglass") || !strings.Contains(body, "plugin.install") || !strings.Contains(body, "workload.deploy") || strings.Contains(body, "plugin.configure") || strings.Contains(body, "plugin.remove") {
 		t.Fatalf("unsafe capability was published: %s", body)
+	}
+}
+
+func TestArtifactCatalogIsTargetScopedAndHidesHostDetails(t *testing.T) {
+	server, _ := testServer(t, time.Now())
+	handler, _ := server.Handler()
+	request := httptest.NewRequest(http.MethodGet, "/v1/artifacts?targetId=target-managed", nil)
+	request.TLS = tlsState(t, RoleAgent)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `"kind":"managed-workload"`) || !strings.Contains(body, `"publisher":"example/ops"`) || !strings.Contains(body, `"artifactRef":"builtin:sha256:`) {
+		t.Fatalf("unexpected artifact catalog: %s", body)
+	}
+	if strings.Contains(body, "credentialBundleDigest") || strings.Contains(body, "catalogPath") {
+		t.Fatalf("artifact catalog leaked host-only details: %s", body)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/artifacts", nil)
+	request.TLS = tlsState(t, RoleAgent)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("artifact catalog accepted missing targetId: %s", recorder.Body.String())
 	}
 }
 
 func testServer(t *testing.T, now time.Time) (*Server, *fakeBackend) {
 	t.Helper()
 	directory := t.TempDir()
-	policyPayload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-hermes","account":"hermes-agent","displayName":"Hermes","inspect":{"hostSnapshot":true,"processList":true,"units":["hermes.service"],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":["hermes.service"],"packages":["hermes"],"plugins":["adapter.botmux"]}}]}`, directory, directory)
+	digest := "sha256:" + strings.Repeat("a", 64)
+	credentialDigest := "sha256:" + strings.Repeat("b", 64)
+	policyPayload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-service","account":"service_agent","displayName":"Service","inspect":{"hostSnapshot":true,"processList":true,"units":["example.service"],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":["example.service"],"packages":["example"],"plugins":[{"id":"adapter.web","kind":"im-adapter","version":"1.0.0","publisher":"example/ops","digest":%q}]}},{"id":"target-managed","account":"managed_agent","displayName":"Managed workload","inspect":{"hostSnapshot":true,"processList":true,"units":[],"readPaths":[%q]},"changes":{"writePaths":[],"units":[],"packages":[],"plugins":[{"id":"workload.assistant","kind":"managed-workload","version":"1.0.0","publisher":"example/ops","digest":%q,"credentialBundleDigest":%q}]}}]}`, directory, directory, digest, directory, digest, credentialDigest)
 	policy, err := targetpolicy.Parse([]byte(policyPayload))
 	if err != nil {
 		t.Fatal(err)
 	}
 	backend := &fakeBackend{}
 	return &Server{
-		Identity: Identity{Version: 1, ServerID: "server-12345678", MachineID: "machine-12345678", MachineName: "Hermes host", Account: "ops-agent-server"},
+		Identity: Identity{Version: 1, ServerID: "server-12345678", MachineID: "machine-12345678", MachineName: "Managed host", Account: "ops-agent-server"},
 		Policy:   policy, Backend: backend, Now: func() time.Time { return now },
 	}, backend
 }
@@ -138,7 +164,7 @@ func requestBody(now time.Time, extra string) string {
 	if extra != "" {
 		extra = "," + extra
 	}
-	return fmt.Sprintf(`{"version":1,"requestId":"request-12345678","deadline":%q,"machineId":"machine-12345678","targetId":"target-hermes"%s}`, now.Add(time.Minute).Format(time.RFC3339Nano), extra)
+	return fmt.Sprintf(`{"version":1,"requestId":"request-12345678","deadline":%q,"machineId":"machine-12345678","targetId":"target-service"%s}`, now.Add(time.Minute).Format(time.RFC3339Nano), extra)
 }
 
 func tlsState(t *testing.T, roles ...Role) *tls.ConnectionState {

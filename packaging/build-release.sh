@@ -80,6 +80,14 @@ install -d -m 0755 \
 
 cp -a "${REPOSITORY_ROOT}/dist/." "${app_root}/dist/"
 cp -a "${REPOSITORY_ROOT}/node_modules/." "${app_root}/node_modules/"
+if [[ -d "${app_root}/node_modules/.vite" ]]; then
+  find "${app_root}/node_modules/.vite" -mindepth 1 -depth -delete
+  rmdir "${app_root}/node_modules/.vite"
+fi
+if find "${app_root}/node_modules" -path '*/.vite/*' -print -quit | grep -q .; then
+  printf 'Refusing to package generated Vite test caches.\n' >&2
+  exit 1
+fi
 for config_path in "${REPOSITORY_ROOT}"/config/*; do
   [[ -f "${config_path}" ]] || continue
   case "$(basename "${config_path}")" in
@@ -90,8 +98,13 @@ done
 cp -a "${REPOSITORY_ROOT}/docs/." "${app_root}/docs/"
 cp -a "${REPOSITORY_ROOT}/systemd/." "${app_root}/systemd/"
 "${REPOSITORY_ROOT}/packaging/build-botmux-plugin.sh" "${VERSION}" "${app_root}/catalog"
-for script_name in encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh uninstall.sh; do
+"${REPOSITORY_ROOT}/packaging/build-hermes-workload-plugin.sh" "${VERSION}" "${app_root}/catalog"
+"${REPOSITORY_ROOT}/packaging/create-catalog-index.sh" "${app_root}/catalog" "${app_root}/catalog/index.json"
+for script_name in configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh uninstall.sh; do
   install -m 0755 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
+done
+for script_name in configure-plugin-credentials.mjs initialize-target-policy.mjs; do
+  install -m 0644 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
 done
 cp -a "${BIN_DIR}"/ops-* "${app_root}/bin/"
 install -m 0755 "${NODE_RUNTIME_DIR}/bin/node" "${app_root}/runtime/node"
@@ -122,7 +135,7 @@ Package: ops-agent-all
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Pi Ops Agent maintainers
-Depends: bash, ca-certificates, systemd, bubblewrap, openssl
+Depends: bash, ca-certificates, systemd, bubblewrap, openssl, diffutils
 Section: admin
 Priority: optional
 Description: Least-privilege Pi operations agent native release payload

@@ -24,6 +24,7 @@ export const REMOTE_CAPABILITIES = [
   "change.prepare",
   "change.status",
   "plugin.install",
+  "workload.deploy",
 ] as const;
 
 export type RemoteCapability = (typeof REMOTE_CAPABILITIES)[number];
@@ -36,24 +37,28 @@ export interface ServerIdentity {
   protocolVersion: 1;
 }
 
+export type ArtifactKind = "im-adapter" | "managed-workload";
+
+export interface ArtifactDescriptor {
+  id: string;
+  kind: ArtifactKind;
+  version: string;
+  publisher: string;
+  digest: string;
+  artifactRef: string;
+}
+
 export interface TargetDescriptor {
   targetId: TargetId;
   account: string;
   displayName: string;
+  artifacts: ArtifactDescriptor[];
 }
 
 export interface CapabilityDescriptor {
   revision: string;
   policyRevision: string;
   operations: RemoteCapability[];
-}
-
-export interface PluginCatalogEntry {
-  id: string;
-  version: string;
-  digest: string;
-  catalogPath: string;
-  description: string;
 }
 
 export interface RemoteResponse {
@@ -150,7 +155,7 @@ export function parseTargetDescriptors(value: unknown): TargetDescriptor[] {
   const targetIds = new Set<string>();
   return value.map((item, index) => {
     const input = requireExactRecord(item, `server targets[${index}]`, [
-      "targetId", "account", "displayName",
+      "targetId", "account", "displayName", "artifacts",
     ]);
     const targetId = parseTargetId(input.targetId, `server targets[${index}].targetId`);
     if (targetIds.has(targetId)) throw new Error(`duplicate targetId: ${targetId}`);
@@ -161,6 +166,7 @@ export function parseTargetDescriptors(value: unknown): TargetDescriptor[] {
       displayName: requireString(input.displayName, `server targets[${index}].displayName`, {
         max: 256,
       }),
+      artifacts: parseArtifacts(input.artifacts, `server targets[${index}].artifacts`),
     };
   });
 }
@@ -184,33 +190,52 @@ export function parseCapabilityDescriptor(value: unknown): CapabilityDescriptor 
   };
 }
 
-export function parsePluginCatalog(value: unknown): PluginCatalogEntry[] {
+export function parseArtifactCatalog(value: unknown): ArtifactDescriptor[] {
+  return parseArtifacts(value, "artifact catalog");
+}
+
+function parseArtifacts(value: unknown, label: string): ArtifactDescriptor[] {
   if (!Array.isArray(value) || value.length > 128) {
-    throw new Error("plugin catalog must contain at most 128 entries");
+    throw new Error(`${label} must contain at most 128 entries`);
   }
+  const identities = new Set<string>();
   return value.map((item, index) => {
-    const input = requireExactRecord(item, `plugin catalog[${index}]`, [
-      "id", "version", "digest", "catalogPath", "description",
+    const itemLabel = `${label}[${index}]`;
+    const input = requireExactRecord(item, itemLabel, [
+      "id", "kind", "version", "publisher", "digest", "artifactRef",
     ]);
-    const catalogPath = requireString(input.catalogPath, `plugin catalog[${index}].catalogPath`, {
-      min: 2,
-      max: 4096,
+    const kind = requireString(input.kind, `${itemLabel}.kind`, { max: 32 });
+    if (kind !== "im-adapter" && kind !== "managed-workload") {
+      throw new Error(`${itemLabel}.kind is not supported`);
+    }
+    const digest = requireString(input.digest, `${itemLabel}.digest`, {
+      pattern: /^sha256:[a-f0-9]{64}$/u,
     });
-    if (!catalogPath.startsWith("/")) throw new Error("plugin catalog path must be absolute");
-    return {
-      id: requireString(input.id, `plugin catalog[${index}].id`, {
-        pattern: /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,71}$/u,
+    const artifactRef = requireString(input.artifactRef, `${itemLabel}.artifactRef`, {
+      pattern: /^builtin:sha256:[a-f0-9]{64}$/u,
+    });
+    if (artifactRef !== `builtin:${digest}`) {
+      throw new Error(`${itemLabel}.artifactRef does not match digest`);
+    }
+    const artifact: ArtifactDescriptor = {
+      id: requireString(input.id, `${itemLabel}.id`, {
+        pattern: /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u,
       }),
-      version: requireString(input.version, `plugin catalog[${index}].version`, { max: 96 }),
-      digest: requireString(input.digest, `plugin catalog[${index}].digest`, {
-        pattern: /^sha256:[a-f0-9]{64}$/u,
+      kind,
+      version: requireString(input.version, `${itemLabel}.version`, {
+        pattern: /^[a-zA-Z0-9][a-zA-Z0-9+.:~_-]{0,127}$/u,
       }),
-      catalogPath,
-      description: requireString(input.description, `plugin catalog[${index}].description`, {
-        min: 1,
-        max: 2048,
+      publisher: requireString(input.publisher, `${itemLabel}.publisher`, {
+        pattern: /^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$/u,
       }),
+      digest,
+      artifactRef,
     };
+    const identity = [artifact.kind, artifact.id, artifact.version, artifact.publisher, artifact.digest]
+      .join("\0");
+    if (identities.has(identity)) throw new Error(`${label} contains a duplicate artifact`);
+    identities.add(identity);
+    return artifact;
   });
 }
 

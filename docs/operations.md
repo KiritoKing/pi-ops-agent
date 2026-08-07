@@ -27,7 +27,7 @@ journalctl \
   -f
 ```
 
-这些是 `v0.1.x` artifact 名称，分别对应 `agentd`、兼容 `agentd-guard`、
+这些是当前 artifact 名称，分别对应 `agentd`、兼容 `agentd-guard`、
 `agentd-server` 和 `agentd-root-broker`。规范名称与迁移状态见[架构文档](architecture.md)。
 
 计划维护时停止整个 target，避免 systemd/`agentd-guard` 重新拉起 `agentd`：
@@ -54,6 +54,12 @@ sudo systemctl start ops-agent.target
 `/var/log`，不随程序目录切换。升级前必须先校验 Release checksum/attestation、协议
 兼容性和配置迁移计划，再安装新版本并原子切换 `current`。
 
+Release 安装器先把迁移后的 target policy 写入同目录候选文件，再备份现行
+`/etc/ops-agent/targets.json`，随后才激活 policy 和 `current`。激活后的启动或健康检查失败
+会恢复旧 policy、旧 `current` 并尝试重新拉起旧服务；成功升级会保留
+`/etc/ops-agent/targets.json.backup.<version>.*` 供人工审计。已有 policy 的迁移不会自动
+加入新 artifact、Docker package 或 unit 授权。
+
 若启动或冒烟失败，停止 target，将 `current` 原子指回旧版本，执行
 `systemctl daemon-reload` 后重新启动。程序回退不能自动回退数据 schema；存在不可逆迁移
 时，Release 必须在安装前拒绝并要求显式迁移计划。
@@ -73,6 +79,11 @@ diff -u /etc/ops-agent/models.json /etc/ops-agent/models.json.dist
 sudo /opt/pi-ops-agent/current/scripts/encrypt-credential.sh --force
 sudo systemctl restart ops-agentd.service
 ```
+
+managed-workload credential 只能在首次部署前配置；`--replace` 也只允许在受管数据根尚未
+创建时使用。`v0.2.0` 不支持已部署工作负载的在线轮换或 reconcile，脚本会 fail-closed
+拒绝替换。需要轮换时先按业务恢复手册停机、导出数据并移除旧部署，再以新 change 重新部署；
+不能只重启容器并宣称 credential 已更新。
 
 模型、Adapter、agent-role、approver-role 和 admin-role credential 必须分开。轮换远端
 `agentd-server` 证书时先建立新证书的重叠有效期，验证 identity/policy digest 后再吊销旧证书；
@@ -98,6 +109,10 @@ capability digest、policy revision 和证书期限，但不能让 `agentd-serve
 
 机器下线时先禁用新 Session 和 prepare，等待在途 change 到达权威终态，然后吊销证书并
 归档审计。删除注册表记录不能删除远端备份或 `agentd-root-broker` 状态。
+
+revision 漂移后，旧 change 不能再 approve；新的批准请求必须匹配当前 revision。为避免
+策略升级切断恢复路径，`status` 仍可按原 server/machine/target 查询历史 change，显式
+`reject`/`rollback` 仍使用绑定该 change 原 `planHash` 和原 `policyRevision` 的签名授权。
 
 ## Adapter 生命周期
 
@@ -147,6 +162,17 @@ PREPARED -> APPROVED -> EXECUTING -> COMMITTED
 文件原子替换可以提供强回滚；service action 和 package install 只有有限或 best-effort
 回滚语义，不能把 `rollbackAvailable=true` 描述成完整事务保证。
 
+v0.1 持久化的 `plugin.install/configure/remove` 仍可严格读取，不能作为新的 prepare，也
+不能在升级后重新 approve 执行。旧 `plugin.install` 的回滚只依赖已持久化的插件身份和
+rollback metadata，因此可以复用当前回滚器；旧 `plugin.configure/remove` 缺少当前协议
+所需语义，只能展示并转人工恢复，broker 不会猜测回滚动作。
+
+managed-workload 回滚只会处理带精确 change/artifact/image/workload label 的容器，并把
+受管数据移动到对应 change 的 root-only recovery 目录；不会原地递归删除。回滚只依赖持久化
+change metadata、容器 label 和受管 marker，不依赖当前 policy、catalog 或插件 `current`
+指针，因此 policy revision 或 Release 切换后仍可执行精确恢复。失败 change 的 recovery 证据可能
+包含 credential，只有在完成独立恢复确认后才能由管理员显式清理。
+
 ## 审计
 
 至少关联：
@@ -167,6 +193,10 @@ backup / verification / rollback evidence
 `ops-agent` 改写。Hash chain
 只能发现本地篡改，不能抵御已获得 root 的攻击者整体替换程序与日志；生产部署应把摘要
 只追加传送到独立系统。
+
+定时 healthcheck 使用 `--strict`：真实失败返回 1 并使 unit 失败；仅告警返回 2，unit 通过
+`SuccessExitStatus=2` 记录为成功，同时告警正文仍保留在 journal，避免 healthcheck 把自身
+递归计入 failed units。
 
 ## 卸载
 

@@ -1,63 +1,58 @@
 package agentserver
 
 import (
-	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 
-	"github.com/KiritoKing/pi-ops-agent/internal/pluginpkg"
+	"github.com/KiritoKing/pi-ops-agent/internal/targetpolicy"
 )
 
-type publicPlugin struct {
+type publicArtifact struct {
 	ID          string `json:"id"`
+	Kind        string `json:"kind"`
 	Version     string `json:"version"`
+	Publisher   string `json:"publisher"`
 	Digest      string `json:"digest"`
-	CatalogPath string `json:"catalogPath"`
-	Description string `json:"description"`
+	ArtifactRef string `json:"artifactRef"`
 }
 
-func (s *Server) handlePlugins(writer http.ResponseWriter, request *http.Request) {
+func (s *Server) handleArtifacts(writer http.ResponseWriter, request *http.Request) {
 	if _, ok := s.requireRole(writer, request, RoleAgent, RoleAdmin); !ok {
 		return
 	}
-	catalog := s.CatalogDir
-	if catalog == "" {
-		catalog = "/opt/pi-ops-agent/current/catalog"
-	}
-	entries, err := os.ReadDir(catalog)
-	if errors.Is(err, os.ErrNotExist) {
-		writeJSON(writer, http.StatusOK, []publicPlugin{})
+	query := request.URL.Query()
+	targetIDs, ok := query["targetId"]
+	if !ok || len(query) != 1 || len(targetIDs) != 1 || targetIDs[0] == "" {
+		writeError(writer, http.StatusBadRequest, "targetId is required and must be the only query parameter")
 		return
 	}
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "read trusted plugin catalog")
+	target, ok := s.Policy.Target(targetIDs[0])
+	if !ok {
+		writeError(writer, http.StatusNotFound, "unknown targetId")
 		return
 	}
-	plugins := make([]publicPlugin, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".opspkg") {
-			continue
-		}
-		packagePath := filepath.Join(catalog, entry.Name())
-		packageInfo, inspectErr := pluginpkg.Inspect(packagePath, catalog)
-		if inspectErr != nil {
-			writeError(writer, http.StatusInternalServerError, "trusted plugin catalog contains an invalid package")
-			return
-		}
-		plugins = append(plugins, publicPlugin{
-			ID: packageInfo.Manifest.ID, Version: packageInfo.Manifest.Version,
-			Digest: packageInfo.Digest, CatalogPath: packagePath,
-			Description: packageInfo.Manifest.Description,
+	writeJSON(writer, http.StatusOK, publicArtifacts(target.Changes.Plugins))
+}
+
+func publicArtifacts(artifacts []targetpolicy.ArtifactPolicy) []publicArtifact {
+	public := make([]publicArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		public = append(public, publicArtifact{
+			ID: artifact.ID, Kind: artifact.Kind, Version: artifact.Version,
+			Publisher: artifact.Publisher, Digest: artifact.Digest, ArtifactRef: "builtin:" + artifact.Digest,
 		})
 	}
-	sort.Slice(plugins, func(left, right int) bool {
-		if plugins[left].ID == plugins[right].ID {
-			return plugins[left].Version < plugins[right].Version
+	sort.Slice(public, func(left, right int) bool {
+		if public[left].Kind != public[right].Kind {
+			return public[left].Kind < public[right].Kind
 		}
-		return plugins[left].ID < plugins[right].ID
+		if public[left].ID != public[right].ID {
+			return public[left].ID < public[right].ID
+		}
+		if public[left].Version != public[right].Version {
+			return public[left].Version < public[right].Version
+		}
+		return public[left].Publisher < public[right].Publisher
 	})
-	writeJSON(writer, http.StatusOK, plugins)
+	return public
 }

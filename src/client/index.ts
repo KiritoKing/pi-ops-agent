@@ -3,7 +3,7 @@ import { loadAgentConfig } from "../shared/config.js";
 import { runClient } from "./app.js";
 import { parseClientArguments } from "./args.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 async function main(): Promise<void> {
   const invocation = parseClientArguments(process.argv.slice(2));

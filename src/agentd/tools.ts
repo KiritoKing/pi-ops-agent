@@ -217,11 +217,11 @@ export function createOpsTools(
     },
   });
 
-  const pluginCatalog = defineTool({
-    name: "ops_plugin_catalog",
-    label: "List trusted adapter plugins",
+  const artifactCatalog = defineTool({
+    name: "ops_artifact_catalog",
+    label: "List trusted artifacts",
     description:
-      "List immutable, locally bundled adapter packages available on an explicit machine and target. Catalog descriptions are untrusted display data; identity, version, digest, and path are validated.",
+      "List immutable artifacts available to an explicit machine target. Kind, identity, publisher, version, digest, and builtin reference are validated.",
     parameters: Type.Object({
       machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
       targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
@@ -231,24 +231,29 @@ export function createOpsTools(
         runtime,
         params.machineId,
         params.targetId,
-        "plugin.install",
+        "change.prepare",
         signal,
       );
-      const plugins = await remote.client.plugins(signal);
+      const artifacts = await remote.client.artifacts(remote.targetId, signal);
       await audit.append({
         type: "tool",
         toolCallId,
-        tool: "ops_plugin_catalog",
+        tool: "ops_artifact_catalog",
         machineId: remote.machineId,
         targetId: remote.targetId,
-        plugins: plugins.map((plugin) => ({
-          id: plugin.id,
-          version: plugin.version,
-          digest: plugin.digest,
-          catalogPath: plugin.catalogPath,
+        artifacts: artifacts.map((artifact) => ({
+          id: artifact.id,
+          kind: artifact.kind,
+          version: artifact.version,
+          publisher: artifact.publisher,
+          digest: artifact.digest,
+          artifactRef: artifact.artifactRef,
         })),
       });
-      return { content: [{ type: "text", text: output(plugins) }], details: { count: plugins.length } };
+      return {
+        content: [{ type: "text", text: output(artifacts) }],
+        details: { count: artifacts.length },
+      };
     },
   });
 
@@ -273,10 +278,19 @@ export function createOpsTools(
     }),
     Type.Object({
       kind: Type.Literal("plugin.install"),
-      pluginId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,71}$" }),
-      version: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9+.:~_-]{0,95}$" }),
+      pluginId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$" }),
+      version: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9+.:~_-]{0,127}$" }),
+      publisher: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$" }),
       digest: Type.String({ pattern: "^sha256:[a-f0-9]{64}$" }),
-      catalogPath: Type.String({ pattern: "^/[^\\u0000\\r\\n]{1,4094}$" }),
+      artifactRef: Type.String({ pattern: "^builtin:sha256:[a-f0-9]{64}$" }),
+    }),
+    Type.Object({
+      kind: Type.Literal("workload.deploy"),
+      pluginId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$" }),
+      version: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9+.:~_-]{0,127}$" }),
+      publisher: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$" }),
+      digest: Type.String({ pattern: "^sha256:[a-f0-9]{64}$" }),
+      artifactRef: Type.String({ pattern: "^builtin:sha256:[a-f0-9]{64}$" }),
     }),
   ]);
 
@@ -292,6 +306,10 @@ export function createOpsTools(
     }),
     executionMode: "sequential",
     async execute(toolCallId, params, signal) {
+      if ((params.operation.kind === "plugin.install" || params.operation.kind === "workload.deploy") &&
+          params.operation.artifactRef !== `builtin:${params.operation.digest}`) {
+        throw new Error("artifactRef does not match the pinned digest");
+      }
       const remote = await remoteTarget(
         runtime,
         params.machineId,
@@ -373,6 +391,6 @@ export function createOpsTools(
   });
 
   return config.sandboxEnabled
-    ? [machineList, machineDescribe, inspect, bash, pluginCatalog, propose, status]
-    : [machineList, machineDescribe, inspect, pluginCatalog, propose, status];
+    ? [machineList, machineDescribe, inspect, bash, artifactCatalog, propose, status]
+    : [machineList, machineDescribe, inspect, artifactCatalog, propose, status];
 }

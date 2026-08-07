@@ -57,7 +57,6 @@ func main() {
 	if err != nil {
 		fatal(err.Error())
 	}
-	executor := &roothelper.OSExecutor{StateDir: *stateDir, AllowedRoots: roots, AllowBreakglass: *allowBreakglass, Runner: roothelper.ExecRunner{}}
 	var policy *targetpolicy.Policy
 	if *targetPolicyFile != "" {
 		policy, err = targetpolicy.Load(*targetPolicyFile, true)
@@ -65,6 +64,7 @@ func main() {
 			fatal("load target policy: " + err.Error())
 		}
 	}
+	executor := &roothelper.OSExecutor{StateDir: *stateDir, AllowedRoots: roots, AllowBreakglass: *allowBreakglass, Runner: roothelper.ExecRunner{}, Policy: policy}
 	var approval *roothelper.ApprovalVerifier
 	if *approvalPublicKey != "" {
 		approval, err = roothelper.LoadApprovalVerifier(*approvalKeyID, *approvalPublicKey, true)

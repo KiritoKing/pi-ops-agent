@@ -32,9 +32,13 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           package_version="$(node -p 'require("./package.json").version')"
-          plugin_version="$(node -p 'require("./plugins/adapter-botmux/manifest.json").version')"
           test "${version}" = "${package_version}"
-          test "${version}" = "${plugin_version}"
+          client_version="$(sed -n 's/^const VERSION = "\([^"]*\)";$/\1/p' src/client/index.ts)"
+          test "${version}" = "${client_version}"
+          for manifest in plugins/*/manifest.json; do
+            plugin_version="$(node -p 'require("./'"${manifest}"'").version')"
+            test "${version}" = "${plugin_version}"
+          done
       - run: npm run check
       - run: npm run build
       - run: go vet ./cmd/... ./internal/...
@@ -104,6 +108,7 @@ jobs:
             --output-dir release
           mkdir -p sbom-root
           tar -xzf "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" -C sbom-root
+          node-runtime/bin/node --check sbom-root/payload/app/dist/agentd/index.js
       - name: Generate installed-payload SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -136,11 +141,12 @@ jobs:
           pattern: native-*
           path: release
           merge-multiple: true
-      - name: Build the optional BotMux adapter plugin
+      - name: Build optional first-party plugins
         shell: bash
         run: |
           set -euo pipefail
           packaging/build-botmux-plugin.sh "${GITHUB_REF_NAME#v}" release
+          packaging/build-hermes-workload-plugin.sh "${GITHUB_REF_NAME#v}" release
       - name: Generate release manifest and checksums
         shell: bash
         run: |
@@ -167,8 +173,8 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" release/* \
-              --verify-tag --generate-notes --title "Pi Ops Agent ${GITHUB_REF_NAME}"
+            printf 'Release %s already exists; published assets are immutable.\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
           fi
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --verify-tag --generate-notes --title "Pi Ops Agent ${GITHUB_REF_NAME}"

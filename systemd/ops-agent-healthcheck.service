@@ -8,6 +8,7 @@ Type=oneshot
 User=root
 Group=root
 ExecStart=/opt/pi-ops-agent/current/scripts/healthcheck.sh --strict
+SuccessExitStatus=2
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

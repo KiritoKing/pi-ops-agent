@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "adapter.botmux",
   "kind": "im-adapter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "KiritoKing/pi-ops-agent",
   "coreProtocol": 1,
   "entrypoint": "adapter.mjs",

@@ -33,6 +33,10 @@ jobs:
           set -euo pipefail
           sh -n scripts/install.sh
           bash -n scripts/*.sh packaging/*.sh
+          node --check plugins/workload-hermes/prepare-credentials.mjs
+          node --check scripts/configure-plugin-credentials.mjs
+          node --check scripts/initialize-target-policy.mjs
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("plugins/workload-hermes/ops-healthcheck.py").read_text())'
       - run: go vet ./cmd/... ./internal/...
       - run: go test -race ./internal/...
       - run: go build ./cmd/...

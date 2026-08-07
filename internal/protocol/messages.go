@@ -24,13 +24,20 @@ var (
 	identityPattern      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,159}$`)
 	pluginIDPattern      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 	digestPattern        = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	settingPattern       = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]{0,127}$`)
+	publisherPattern     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$`)
+	artifactRefPattern   = regexp.MustCompile(`^builtin:sha256:[a-f0-9]{64}$`)
+	legacySettingPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]{0,127}$`)
 	approvalKeyIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:-]{7,159}$`)
 	noncePattern         = regexp.MustCompile(`^[a-zA-Z0-9_-]{20,160}$`)
 )
 
-func ValidUnit(value string) bool    { return unitPattern.MatchString(value) }
-func ValidPackage(value string) bool { return packagePattern.MatchString(value) }
+func ValidUnit(value string) bool            { return unitPattern.MatchString(value) }
+func ValidPackage(value string) bool         { return packagePattern.MatchString(value) }
+func ValidDigest(value string) bool          { return digestPattern.MatchString(value) }
+func ValidArtifactID(value string) bool      { return pluginIDPattern.MatchString(value) }
+func ValidArtifactVersion(value string) bool { return versionPattern.MatchString(value) }
+func ValidPublisher(value string) bool       { return publisherPattern.MatchString(value) }
+func ValidArtifactRef(value string) bool     { return artifactRefPattern.MatchString(value) }
 
 type Method string
 
@@ -203,78 +210,112 @@ type PluginInstall struct {
 	OperationKind string `json:"kind"`
 	PluginID      string `json:"pluginId"`
 	Version       string `json:"version"`
+	Publisher     string `json:"publisher"`
 	Digest        string `json:"digest"`
-	CatalogPath   string `json:"catalogPath"`
+	ArtifactRef   string `json:"artifactRef"`
+	storedLegacy  bool
 }
 
-func (o PluginInstall) Kind() string { return "plugin.install" }
-func (o PluginInstall) Summary() string {
-	return "install catalog plugin " + o.PluginID + " version " + o.Version
-}
-func (o PluginInstall) Validate() error {
-	if o.OperationKind != o.Kind() || !pluginIDPattern.MatchString(o.PluginID) || !versionPattern.MatchString(o.Version) || !digestPattern.MatchString(o.Digest) {
-		return errors.New("invalid plugin.install operation")
-	}
-	if !validCatalogPath(o.CatalogPath) {
-		return errors.New("plugin.install must bind a local catalog path")
-	}
-	return nil
-}
-
-type PluginSetting struct {
+// legacyPluginConfigure and legacyPluginRemove are read-only representations
+// of operations persisted by v0.1. They deliberately remain outside the live
+// request tagged union and cannot be marshaled into a new change.
+type legacyPluginSetting struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
-type PluginConfigure struct {
-	OperationKind string          `json:"kind"`
-	PluginID      string          `json:"pluginId"`
-	Version       string          `json:"version"`
-	Digest        string          `json:"digest"`
-	Settings      []PluginSetting `json:"settings,omitempty"`
+type legacyPluginConfigure struct {
+	OperationKind string                `json:"kind"`
+	PluginID      string                `json:"pluginId"`
+	Version       string                `json:"version"`
+	Digest        string                `json:"digest"`
+	Settings      []legacyPluginSetting `json:"settings,omitempty"`
 }
 
-func (o PluginConfigure) Kind() string { return "plugin.configure" }
-func (o PluginConfigure) Summary() string {
-	return "configure plugin " + o.PluginID + " version " + o.Version
+func (o legacyPluginConfigure) Kind() string { return "plugin.configure" }
+func (o legacyPluginConfigure) Summary() string {
+	return "configure legacy plugin " + o.PluginID + " version " + o.Version
 }
-func (o PluginConfigure) Validate() error {
+func (o legacyPluginConfigure) Validate() error {
 	if o.OperationKind != o.Kind() || !pluginIDPattern.MatchString(o.PluginID) || !versionPattern.MatchString(o.Version) || !digestPattern.MatchString(o.Digest) || len(o.Settings) > 128 {
-		return errors.New("invalid plugin.configure operation")
+		return errors.New("invalid legacy plugin.configure operation")
 	}
 	seen := make(map[string]struct{}, len(o.Settings))
 	for _, setting := range o.Settings {
-		if !settingPattern.MatchString(setting.Name) || len(setting.Value) > 4096 || strings.ContainsRune(setting.Value, '\x00') {
-			return errors.New("invalid plugin setting")
+		if !legacySettingPattern.MatchString(setting.Name) || len(setting.Value) > 4096 || strings.ContainsRune(setting.Value, '\x00') {
+			return errors.New("invalid legacy plugin setting")
 		}
 		if _, ok := seen[setting.Name]; ok {
-			return errors.New("duplicate plugin setting")
+			return errors.New("duplicate legacy plugin setting")
 		}
 		seen[setting.Name] = struct{}{}
 	}
 	return nil
 }
+func (legacyPluginConfigure) storedOnly() bool              { return true }
+func (legacyPluginConfigure) storedRollbackSupported() bool { return false }
 
-type PluginRemove struct {
+type legacyPluginRemove struct {
 	OperationKind string `json:"kind"`
 	PluginID      string `json:"pluginId"`
 	Version       string `json:"version"`
 	Digest        string `json:"digest"`
 }
 
-func (o PluginRemove) Kind() string { return "plugin.remove" }
-func (o PluginRemove) Summary() string {
-	return "remove plugin " + o.PluginID + " version " + o.Version
+func (o legacyPluginRemove) Kind() string { return "plugin.remove" }
+func (o legacyPluginRemove) Summary() string {
+	return "remove legacy plugin " + o.PluginID + " version " + o.Version
 }
-func (o PluginRemove) Validate() error {
+func (o legacyPluginRemove) Validate() error {
 	if o.OperationKind != o.Kind() || !pluginIDPattern.MatchString(o.PluginID) || !versionPattern.MatchString(o.Version) || !digestPattern.MatchString(o.Digest) {
-		return errors.New("invalid plugin.remove operation")
+		return errors.New("invalid legacy plugin.remove operation")
+	}
+	return nil
+}
+func (legacyPluginRemove) storedOnly() bool              { return true }
+func (legacyPluginRemove) storedRollbackSupported() bool { return false }
+
+type WorkloadDeploy struct {
+	OperationKind string `json:"kind"`
+	PluginID      string `json:"pluginId"`
+	Version       string `json:"version"`
+	Publisher     string `json:"publisher"`
+	Digest        string `json:"digest"`
+	ArtifactRef   string `json:"artifactRef"`
+}
+
+func (o WorkloadDeploy) Kind() string { return "workload.deploy" }
+func (o WorkloadDeploy) Summary() string {
+	return "deploy managed workload " + o.PluginID + " version " + o.Version
+}
+func (o WorkloadDeploy) Validate() error {
+	if o.OperationKind != o.Kind() || !validArtifactIdentity(o.PluginID, o.Version, o.Publisher, o.Digest, o.ArtifactRef) {
+		return errors.New("invalid workload.deploy operation")
 	}
 	return nil
 }
 
-func validCatalogPath(path string) bool {
-	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != "/" && len(path) <= 4096 && !strings.ContainsAny(path, "\x00\n\r")
+func (o PluginInstall) Kind() string { return "plugin.install" }
+func (o PluginInstall) Summary() string {
+	return "install artifact " + o.PluginID + " version " + o.Version
+}
+func (o PluginInstall) Validate() error {
+	if o.OperationKind != o.Kind() || !validArtifactIdentity(o.PluginID, o.Version, o.Publisher, o.Digest, o.ArtifactRef) {
+		return errors.New("invalid plugin.install operation")
+	}
+	return nil
+}
+
+func (o PluginInstall) storedOnly() bool              { return o.storedLegacy }
+func (o PluginInstall) storedRollbackSupported() bool { return o.storedLegacy }
+
+func validArtifactIdentity(id, version, publisher, digest, artifactRef string) bool {
+	return pluginIDPattern.MatchString(id) &&
+		versionPattern.MatchString(version) &&
+		publisherPattern.MatchString(publisher) &&
+		digestPattern.MatchString(digest) &&
+		artifactRefPattern.MatchString(artifactRef) &&
+		artifactRef == "builtin:"+digest
 }
 
 func (o FileWrite) Kind() string { return "file.write" }
@@ -493,17 +534,92 @@ func validateWireIdentity(header wireBase) error {
 }
 
 func ParseStoredOperation(payload []byte) (Operation, error) {
-	return parseOperation(payload)
+	operation, currentErr := parseOperation(payload)
+	if currentErr == nil {
+		return operation, nil
+	}
+	var header struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(payload, &header); err != nil {
+		return nil, fmt.Errorf("decode stored operation header: %w", err)
+	}
+	switch header.Kind {
+	case "plugin.install":
+		var legacy struct {
+			OperationKind string `json:"kind"`
+			PluginID      string `json:"pluginId"`
+			Version       string `json:"version"`
+			Digest        string `json:"digest"`
+			CatalogPath   string `json:"catalogPath"`
+		}
+		if err := strictDecode(payload, &legacy); err != nil {
+			return nil, fmt.Errorf("decode legacy stored plugin.install: %w", err)
+		}
+		if legacy.OperationKind != "plugin.install" || !pluginIDPattern.MatchString(legacy.PluginID) || !versionPattern.MatchString(legacy.Version) || !digestPattern.MatchString(legacy.Digest) || !validLegacyCatalogPath(legacy.CatalogPath) {
+			return nil, errors.New("invalid legacy stored plugin.install operation")
+		}
+		return &PluginInstall{
+			OperationKind: legacy.OperationKind,
+			PluginID:      legacy.PluginID,
+			Version:       legacy.Version,
+			Publisher:     "legacy/v0.1",
+			Digest:        legacy.Digest,
+			ArtifactRef:   "builtin:" + legacy.Digest,
+			storedLegacy:  true,
+		}, nil
+	case "plugin.configure":
+		operation = &legacyPluginConfigure{}
+	case "plugin.remove":
+		operation = &legacyPluginRemove{}
+	default:
+		return nil, currentErr
+	}
+	if err := strictDecode(payload, operation); err != nil {
+		return nil, fmt.Errorf("decode legacy stored %s: %w", header.Kind, err)
+	}
+	if err := operation.Validate(); err != nil {
+		return nil, err
+	}
+	return operation, nil
 }
 
 func MarshalOperation(operation Operation) ([]byte, error) {
 	if operation == nil {
 		return nil, errors.New("operation is required")
 	}
+	if IsStoredOnlyOperation(operation) {
+		return nil, errors.New("legacy stored operation cannot be prepared as a new change")
+	}
 	if err := operation.Validate(); err != nil {
 		return nil, err
 	}
 	return json.Marshal(operation)
+}
+
+type storedOperationCompatibility interface {
+	storedOnly() bool
+	storedRollbackSupported() bool
+}
+
+// IsStoredOnlyOperation identifies operations accepted solely for reading a
+// v0.1 persisted state. Such operations must never cross the new-prepare or
+// approval execution path.
+func IsStoredOnlyOperation(operation Operation) bool {
+	compatibility, ok := operation.(storedOperationCompatibility)
+	return ok && compatibility.storedOnly()
+}
+
+// StoredRollbackSupported reports whether a stored-only operation can safely
+// reuse the current rollback executor. v0.1 plugin.install can; its configure
+// and remove shapes lack enough current rollback semantics.
+func StoredRollbackSupported(operation Operation) bool {
+	compatibility, ok := operation.(storedOperationCompatibility)
+	return !ok || !compatibility.storedOnly() || compatibility.storedRollbackSupported()
+}
+
+func validLegacyCatalogPath(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != "/" && len(path) <= 4096 && !strings.ContainsAny(path, "\x00\n\r")
 }
 
 func parseOperation(payload []byte) (Operation, error) {
@@ -523,10 +639,8 @@ func parseOperation(payload []byte) (Operation, error) {
 		operation = &FileWrite{}
 	case "plugin.install":
 		operation = &PluginInstall{}
-	case "plugin.configure":
-		operation = &PluginConfigure{}
-	case "plugin.remove":
-		operation = &PluginRemove{}
+	case "workload.deploy":
+		operation = &WorkloadDeploy{}
 	case "breakglass.script":
 		operation = &BreakglassScript{}
 	default:

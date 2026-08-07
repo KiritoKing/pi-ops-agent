@@ -3,7 +3,7 @@
 ## 规范名称
 
 本文统一使用以下四个组件名。名称描述的是长期稳定的安全职责，不等同于当前
-`v0.1.x` 的二进制、systemd unit 或磁盘路径名称。
+当前二进制、systemd unit 或磁盘路径名称。
 
 | 组件 | 拓扑与身份 | 核心职责 | 明确不负责 |
 |---|---|---|---|
@@ -16,7 +16,7 @@
 `agentd` 的同 UID 攻击。安全兜底来自 Harness 收口、bubblewrap、非特权账号、
 `agentd-server` 的身份/策略校验以及 `agentd-root-broker` 的类型化 root API。
 
-### `v0.1.x` artifact 兼容映射
+### artifact 兼容映射
 
 部署和排障命令必须使用真实存在的 artifact 名称；架构叙述使用上表的规范名称：
 
@@ -27,7 +27,7 @@
 | `agentd-server` | `ops-agent-server` | `ops-agent-server.service` | 已对应，artifact 暂保留 `ops-` 前缀 |
 | `agentd-root-broker` | `ops-root-helper` | `ops-root-helper.service`、`/run/ops-agent/helper/root-helper.sock` | 职责已对应；二进制、unit、socket 和状态目录仍保留旧 `root-helper` 名称 |
 
-`v0.1.x` 还保留本机 direct-helper adapter。新能力不得继续接入该兼容路径；规范数据面中，
+当前版本还保留本机 direct-helper adapter。新能力不得继续接入该兼容路径；规范数据面中，
 `agentd` 无论管理本机还是远端机器，都先访问对应 `agentd-server`，再由 server 调用本机
 `agentd-root-broker`。代码完成迁移前，文档中的 unit/path 示例不会假装已经重命名。
 
@@ -45,7 +45,7 @@ IM Conversation/Thread -> SessionBinding -> AgentSession
 
 - `machineId/serverId` 是稳定身份；IP、端口和主机名只是可变 locator。
 - 一个 `agentd-server` 对应一台机器，以专用非 root 账号运行。
-- `hermes-agent`、`www-data` 等本机账号是 Target，由 root-owned policy 定义。
+- `root`、`www-data` 等本机账号或资源集合可以成为 Target，由 root-owned policy 定义。
 - 一台机器只有一个本地 `agentd-root-broker`；它按 Target 映射 UID/GID 和资源权限。
 - 一个 Session 第一次使用 Target 级工具时原子绑定唯一 Machine + Target；管理另一机器或
   账号应创建另一个 Session。同一中央 agentd 仍可通过多个 Session 管理整个机器池。
@@ -72,7 +72,7 @@ flowchart LR
   P -->|"独立 mTLS principal"| E2
   E1 -->|"Unix socket + typed RPC"| H1["agentd-root-broker\n机器 A、root"]
   E2 -->|"Unix socket + typed RPC"| H2["agentd-root-broker\n机器 B、root"]
-  H1 --> TA["Target: hermes-agent"]
+  H1 --> TA["Target: 本机系统/受管资源"]
 ```
 
 ### `agentd`
@@ -112,8 +112,18 @@ root 运行但只监听本机 Unix socket，不开放网络。它是变更、备
 权威；所有普通变更使用版本化 tagged union，禁止 raw root command、任意 argv 和任意
 shell callback。规范数据面只接受经 `SO_PEERCRED` 验证的本机 `agentd-server`；审批身份
 由签名 `ApprovalGrant` 传递，并由 broker 再次校验 planHash、policy revision、期限和
-nonce。`v0.1.x` 的本机 approver UID direct adapter 仅是迁移兼容路径。broker 不能接受
+nonce。当前版本的本机 approver UID direct adapter 仅是迁移兼容路径。broker 不能接受
 模型文本或把 Target 账号变成可填写的 `runAs`。
+
+业务扩展复用插件包的受信 catalog、严格 schema、完整 identity/digest 绑定、原子
+`current` 切换和回滚。`im-adapter` 只产生固定 launcher；`managed-workload` 只声明镜像
+repository/digest、容器内命令与探针、静态文件、credential slot 和有界资源。它不能声明
+宿主可执行文件、root callback、设备、socket mount、host namespace 或原始 Docker argv。
+
+`workload.deploy` 是通用 tagged union。broker 从已经安装且被 Target policy 精确 pin 的
+插件读取声明，再套用固定的 loopback、单一派生数据 mount、bridge、cap-drop、资源、日志、
+验证和保守回滚模板。Docker socket 只对 broker 可见，`agentd` 的 mount namespace 显式
+屏蔽该 socket。Hermes 只是首个第一方插件，不进入核心协议或执行器分支。
 
 ### 健康托管
 
@@ -138,7 +148,7 @@ root、通用 `systemctl` 或主机 journal 权限。现有 `ops-systemd-helper`
 ├── sessions/<sessionId>/   # transcript
 ├── workspaces/<sessionId>/ # 每 Session 唯一可写 sandbox 目录
 ├── pi/                     # Pi 运行状态
-└── root-helper/            # v0.1 兼容路径：agentd-root-broker 的 root-only change/backup metadata
+└── root-helper/            # agentd-root-broker 的 root-only change/backup/workload metadata
 ```
 
 MachineContext 可以被同一机器的多个 Session 复用，但不能整体以可写目录挂给模型。远端日志和文件
@@ -177,6 +187,8 @@ Harness 固定目录
 MVP 工具分为机器/Target 发现、有界只读巡检、本地离线分析、`change_prepare/status` 和
 插件 catalog/prepare/status。远端命令必须建模为固定 executable、typed args、runAs、
 timeout、输出上限、备份、验证和回滚的 recipe，禁止 `sudo -u <user> <shell>`。
+工作负载部署复用固定的 OCI 安全模板；插件只能提供已审阅、摘要绑定的容器内声明，不形成
+通用 Docker 管理能力。
 
 ## 网络与重连
 
@@ -186,6 +198,9 @@ Change 是异步资源：prepare 返回全局不透明 `changeRef`，客户端�
 每个请求绑定 version、requestId、sessionId、turnId、serverId、machineId、targetId、
 deadline、idempotency key 和 policy revision。断线后只能以原 ID 查询；已经越过 mutation
 barrier 的操作由目标机独立完成验证/回滚，controller 不得重放 mutation。
+长时变更的 HTTPS、endpoint 到 broker Unix socket 和 broker 执行都必须沿用同一有界
+协议 deadline；客户端不能再用短于该 deadline 的固定 30 秒 transport timeout 提前断言失败。
+当前审批 deadline 为 9 分钟，各 transport 硬上限为 10 分钟。
 
 `agent-role` 只能 discover/read/prepare/status；`approver-role` 才能提交绑定 planHash 的
 授权；`admin-role` 用于 enrollment、Target/policy 和插件管理。三类 credential 不能被

@@ -58,8 +58,17 @@ export type RootOperation =
       kind: "plugin.install";
       pluginId: string;
       version: string;
+      publisher: string;
       digest: string;
-      catalogPath: string;
+      artifactRef: string;
+    }
+  | {
+      kind: "workload.deploy";
+      pluginId: string;
+      version: string;
+      publisher: string;
+      digest: string;
+      artifactRef: string;
     }
   | {
       kind: "breakglass.script";

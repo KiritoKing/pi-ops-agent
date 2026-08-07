@@ -27,7 +27,9 @@ for path in "${directory}"/*; do
   case "${name}" in
     *.deb) kind=debian-package ;;
     *.tar.gz) kind=native-archive ;;
-    *.opspkg) kind=adapter-plugin ;;
+    workload-*.opspkg) kind=managed-workload-plugin ;;
+    adapter-*.opspkg) kind=adapter-plugin ;;
+    *.opspkg) kind=plugin ;;
     *.spdx.json) kind=sbom ;;
     *) kind=artifact ;;
   esac

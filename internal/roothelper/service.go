@@ -85,7 +85,7 @@ func (s *Service) Handle(ctx context.Context, peer peercred.Credential, request 
 		response.Error = "request deadline expired"
 		return response
 	}
-	if s.Policy != nil {
+	if s.Policy != nil && requiresCurrentPolicy(request.Method) {
 		if err := s.Policy.Authorize(request); err != nil {
 			response.Error = err.Error()
 			return response
@@ -150,7 +150,8 @@ func (s *Service) prepare(peer peercred.Credential, request protocol.Request, no
 		return denied(request, "peer may not prepare changes")
 	}
 	if validator, ok := s.Executor.(OperationValidator); ok {
-		if err := validator.ValidateOperation(request.Operation); err != nil {
+		scope := ExecutionScope{TargetID: request.TargetID, PolicyRevision: request.PolicyRevision, CapabilityRevision: request.CapabilityRevision}
+		if err := validator.ValidateOperation(scope, request.Operation); err != nil {
 			return denied(request, err.Error())
 		}
 	}
@@ -183,7 +184,7 @@ func (s *Service) status(peer peercred.Credential, request protocol.Request) pro
 	if !ok {
 		return denied(request, "change not found")
 	}
-	if err := matchChangeScope(change, request); err != nil {
+	if err := matchChangeIdentity(change, request); err != nil {
 		return denied(request, err.Error())
 	}
 	auditID, err := s.appendAudit(peer, request, map[string]interface{}{"type": "change_status", "changeId": change.ID, "state": change.State})
@@ -202,14 +203,21 @@ func (s *Service) approve(ctx context.Context, peer peercred.Credential, request
 	if !ok {
 		return denied(request, "change not found")
 	}
-	if err := s.authorizeApproval(peer, request, change, "approve", now); err != nil {
-		return denied(request, err.Error())
-	}
 	if err := matchChangeScope(change, request); err != nil {
 		return denied(request, err.Error())
 	}
 	if change.State != StatePendingApproval {
 		return denied(request, "change is not pending approval")
+	}
+	operation, err := protocol.ParseStoredOperation(change.Operation)
+	if err != nil {
+		return failed(request, err)
+	}
+	if protocol.IsStoredOnlyOperation(operation) {
+		return denied(request, "legacy persisted operations are recovery-only and cannot be approved or executed")
+	}
+	if err := s.authorizeApproval(peer, request, change, "approve", now); err != nil {
+		return denied(request, err.Error())
 	}
 	uid := peer.UID
 	change.ApprovedByUID = &uid
@@ -221,11 +229,8 @@ func (s *Service) approve(ctx context.Context, peer peercred.Credential, request
 	if _, err := s.appendAudit(peer, request, map[string]interface{}{"type": "change_approved", "changeId": change.ID, "planHash": change.PlanHash}); err != nil {
 		return failed(request, err)
 	}
-	operation, err := protocol.ParseStoredOperation(change.Operation)
-	if err != nil {
-		return failed(request, err)
-	}
-	result, prepareErr := s.Executor.Prepare(ctx, change.ID, operation)
+	scope := executionScope(change)
+	result, prepareErr := s.Executor.Prepare(ctx, scope, operation)
 	if prepareErr != nil {
 		change.State = StateRecoveryRequired
 		change.LastError = "backup preparation failed before mutation: " + prepareErr.Error()
@@ -250,7 +255,7 @@ func (s *Service) approve(ctx context.Context, peer peercred.Credential, request
 	}); err != nil {
 		return failed(request, err)
 	}
-	executionErr := s.Executor.Execute(ctx, change.ID, operation, result)
+	executionErr := s.Executor.Execute(ctx, scope, operation, result)
 	if executionErr != nil {
 		return s.handleFailure(peer, request, change, operation, result, "execution failed: "+executionErr.Error(), now)
 	}
@@ -258,7 +263,7 @@ func (s *Service) approve(ctx context.Context, peer peercred.Credential, request
 	if err := s.Store.PutChange(change); err != nil {
 		return failed(request, err)
 	}
-	verification, verifyErr := s.Executor.Verify(ctx, change.ID, operation, result)
+	verification, verifyErr := s.Executor.Verify(ctx, scope, operation, result)
 	if result.Verification != "" && verification == "" {
 		verification = result.Verification
 	}
@@ -282,14 +287,14 @@ func (s *Service) reject(peer peercred.Credential, request protocol.Request, now
 	if !ok {
 		return denied(request, "change not found")
 	}
-	if err := s.authorizeApproval(peer, request, change, "reject", now); err != nil {
-		return denied(request, err.Error())
-	}
-	if err := matchChangeScope(change, request); err != nil {
+	if err := matchChangeIdentity(change, request); err != nil {
 		return denied(request, err.Error())
 	}
 	if change.State != StatePendingApproval {
 		return denied(request, "change is not pending approval")
+	}
+	if err := s.authorizeApproval(peer, request, change, "reject", now); err != nil {
+		return denied(request, err.Error())
 	}
 	change.State, change.UpdatedAt = StateRejected, timestamp(now)
 	if err := s.Store.PutChange(change); err != nil {
@@ -307,10 +312,7 @@ func (s *Service) rollback(ctx context.Context, peer peercred.Credential, reques
 	if !ok {
 		return denied(request, "change not found")
 	}
-	if err := s.authorizeApproval(peer, request, change, "rollback", now); err != nil {
-		return denied(request, err.Error())
-	}
-	if err := matchChangeScope(change, request); err != nil {
+	if err := matchChangeIdentity(change, request); err != nil {
 		return denied(request, err.Error())
 	}
 	if change.State != StateCommitted && change.State != StateRecoveryRequired {
@@ -323,6 +325,12 @@ func (s *Service) rollback(ctx context.Context, peer peercred.Credential, reques
 	if err != nil {
 		return failed(request, err)
 	}
+	if !protocol.StoredRollbackSupported(operation) {
+		return denied(request, "automated rollback is unavailable for this legacy persisted operation")
+	}
+	if err := s.authorizeApproval(peer, request, change, "rollback", now); err != nil {
+		return denied(request, err.Error())
+	}
 	change.State, change.UpdatedAt = StateRollingBack, timestamp(now)
 	if err := s.Store.PutChange(change); err != nil {
 		return failed(request, err)
@@ -330,7 +338,7 @@ func (s *Service) rollback(ctx context.Context, peer peercred.Credential, reques
 	result := ExecutionResult{BackupRefs: change.BackupRefs, RollbackData: change.RollbackData, RollbackAvailable: change.RollbackAvailable, Verification: change.Verification}
 	rollbackCtx, cancel := s.rollbackContext()
 	defer cancel()
-	if err := s.Executor.Rollback(rollbackCtx, change.ID, operation, result); err != nil {
+	if err := s.Executor.Rollback(rollbackCtx, executionScope(change), operation, result); err != nil {
 		change.State = StateRecoveryRequired
 		change.LastError = "rollback failed: " + err.Error()
 		change.UpdatedAt = timestamp(now)
@@ -354,7 +362,7 @@ func (s *Service) handleFailure(peer peercred.Credential, request protocol.Reque
 		change.State = StateRollingBack
 		_ = s.Store.PutChange(change)
 		rollbackCtx, cancel := s.rollbackContext()
-		err := s.Executor.Rollback(rollbackCtx, change.ID, operation, result)
+		err := s.Executor.Rollback(rollbackCtx, executionScope(change), operation, result)
 		cancel()
 		if err == nil {
 			change.State = StateRolledBack
@@ -374,6 +382,13 @@ func (s *Service) rollbackContext() (context.Context, context.CancelFunc) {
 		timeout = 2 * time.Minute
 	}
 	return context.WithTimeout(context.Background(), timeout)
+}
+
+func executionScope(change *Change) ExecutionScope {
+	return ExecutionScope{
+		ChangeID: change.ID, TargetID: change.TargetID,
+		PolicyRevision: change.PolicyRevision, CapabilityRevision: change.CapabilityRevision,
+	}
 }
 
 func (s *Service) isAgentOrApprover(uid uint32) bool {
@@ -404,10 +419,29 @@ func (s *Service) isAdmin(peer peercred.Credential, request protocol.Request) bo
 	return s.Policy != nil && peer.UID == s.AgentUID && request.CallerRole == "admin"
 }
 func matchChangeScope(change *Change, request protocol.Request) error {
-	if change.ServerID != request.ServerID || change.MachineID != request.MachineID || change.TargetID != request.TargetID || change.PolicyRevision != request.PolicyRevision {
+	if err := matchChangeIdentity(change, request); err != nil {
+		return err
+	}
+	if change.PolicyRevision != request.PolicyRevision {
 		return errors.New("change scope does not match server, machine, target, or policy revision")
 	}
 	return nil
+}
+
+func matchChangeIdentity(change *Change, request protocol.Request) error {
+	if change.ServerID != request.ServerID || change.MachineID != request.MachineID || change.TargetID != request.TargetID {
+		return errors.New("change scope does not match server, machine, or target")
+	}
+	return nil
+}
+
+func requiresCurrentPolicy(method protocol.Method) bool {
+	switch method {
+	case protocol.MethodChangeStatus, protocol.MethodChangeReject, protocol.MethodChangeRollback:
+		return false
+	default:
+		return true
+	}
 }
 func (s *Service) appendAudit(peer peercred.Credential, request protocol.Request, event interface{}) (string, error) {
 	return s.Audit.Append(map[string]interface{}{

@@ -91,7 +91,7 @@ func runServer() {
 	clientCA := flag.String("client-ca", "/etc/ops-agent/tls/client-ca.crt", "client certificate authority bundle")
 	rootSocket := flag.String("root-helper-socket", "/run/ops-agent/helper/root-helper.sock", "root-helper Unix socket")
 	pluginCatalog := flag.String("plugin-catalog", "/opt/pi-ops-agent/current/catalog", "root-owned local plugin catalog")
-	requestTimeout := flag.Duration("request-timeout", 2*time.Minute, "maximum root broker round trip")
+	requestTimeout := flag.Duration("request-timeout", 10*time.Minute, "maximum root broker round trip")
 	flag.Parse()
 	if *requestTimeout <= 0 || *requestTimeout > 10*time.Minute {
 		fatal("request-timeout must be positive and no greater than ten minutes")
@@ -119,7 +119,7 @@ func runServer() {
 	server := &http.Server{
 		Addr: *listen, Handler: handler, TLSConfig: tlsConfig,
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
-		WriteTimeout: 3 * time.Minute, IdleTimeout: 90 * time.Second,
+		WriteTimeout: 10 * time.Minute, IdleTimeout: 90 * time.Second,
 		MaxHeaderBytes: 32 * 1024,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

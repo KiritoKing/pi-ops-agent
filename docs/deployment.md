@@ -1,7 +1,8 @@
 # 原生部署与接入
 
-Pi Ops Agent 只支持以 systemd 为 PID 1 的 Linux。MVP 不提供 Docker、OCI、
-Compose 或非 systemd 部署；PVE LXC 直接使用原生安装。
+Pi Ops Agent 只支持以 systemd 为 PID 1 的 Linux。Ops Agent 自身不提供 Compose 或非
+systemd 部署；PVE LXC 直接使用原生安装。摘要绑定的 `managed-workload` 插件可以通过固定
+OCI 安全模板部署，但这不形成通用容器管理接口。
 
 目标机不需要 Git、Go、Node.js 或 npm，也不会运行源码构建和 npm lifecycle。
 GitHub Release 已包含编译后的 TypeScript、production dependencies、固定 Node runtime
@@ -39,8 +40,8 @@ credential，启动服务并运行健康检查。需要先落盘、稍后再配�
 - **不读取 Lark/BotMux credential，也不创建 BotMux 服务账户**。
 
 后续 `join` 机器只部署 `agentd-server + agentd-root-broker`，不会再运行一份模型、
-Session 或 `agentd-guard`。规范组件名与 `v0.1.x` unit/binary 兼容映射见
-[架构文档](architecture.md#v01x-artifact-兼容映射)。
+Session 或 `agentd-guard`。规范组件名与当前 unit/binary 兼容映射见
+[架构文档](architecture.md#artifact-兼容映射)。
 
 完成后重新登录，使 `ops-agent` supplementary group 生效，然后进入保底入口：
 
@@ -53,8 +54,8 @@ ops-agent tui
 默认安装 GitHub `latest` Release。生产安装应同时把 Raw 脚本和 Release 固定到同一 Tag：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/v0.1.0/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=v0.1.0 sh -s -- init
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/v0.2.0/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=v0.2.0 sh -s -- init
 ```
 
 Bootstrap 只接受 HTTPS，下载 `checksums.txt` 和与本机架构对应的 archive，并在解包
@@ -81,6 +82,7 @@ ops-agent-all_<version>_arm64.deb
 ops-agent-linux-amd64.spdx.json
 ops-agent-linux-arm64.spdx.json
 adapter-botmux_<version>.opspkg
+workload-hermes_<version>.opspkg
 manifest.json
 checksums.txt
 ```
@@ -88,7 +90,7 @@ checksums.txt
 `.deb` 只安装已验证的 Release payload，不自动初始化服务。手工安装后执行：
 
 ```bash
-sudo dpkg -i ops-agent-all_0.1.0_amd64.deb
+sudo dpkg -i ops-agent-all_0.2.0_amd64.deb
 sudo ops-agent-bootstrap init --admin-user "$USER"
 ```
 
@@ -133,6 +135,32 @@ bwrap --unshare-all --die-with-parent \
 如果 LXC 禁止 user namespace，不得关闭 sandbox 或扩大 systemd 权限。核心、TUI、
 注册表和远端类型化工具仍可运行，但 Harness 不注册 `ops_bash`；健康检查应把这一状态
 报告为受限能力而不是静默降级。
+
+## 通过 Agent 部署 managed-workload
+
+`init` 把 Release 内第一方插件的完整 identity/digest 写入本机 Target policy，但不会解包
+插件、安装 Docker、下载业务镜像或创建业务 credential。模型先查询 artifact catalog，
+准备 `plugin.install` 并等待模型外审批。安装后的业务专用 `prepare-credentials.mjs` 只在
+管理员上下文中读取显式 FD，输出通用 bundle；root 侧统一脚本再校验 manifest slot、绑定
+bundle digest 与 policy revision，并重启读取 policy 的 endpoint 服务：
+
+```text
+prepare-credentials.mjs --input-fd N
+  -> configure-plugin-credentials.sh --plugin-id workload.NAME \
+       --target-id target-local-system --credential-fd N
+```
+
+随后模型只能准备绑定同一 artifact 的 `workload.deploy`，仍须独立审批。broker 从插件声明
+生成固定安全模板，不接受模型提供镜像、端口、mount、宿主路径或 Docker argv。只有全部
+声明式进程身份检查和容器内 digest-bound checks 通过且 broker 返回 `COMMITTED` 才算成功。
+需要容器内 root 初始化的镜像还必须精确声明允许的 supervisor 进程及非 root 稳态进程；
+这是通用插件契约，不是业务镜像特例。Hermes 的具体输入、
+WebUI/TUI/CLI 与重启验收见[第一方 Hermes 工作负载指南](workloads/hermes.md)。
+
+上述自动授权只适用于首次生成 policy。升级已有安装时，安装器只把 v0.1 的字符串插件项
+收窄成 catalog 中同 ID 的完整 identity；不会因为新 Release 增加了 artifact、managed
+workload、`docker.io` 或 `docker.service` 就扩大已有 allowlist。新增授权必须由管理员显式
+修改并复核 policy。
 
 ## 通过 Agent 安装 Adapter
 
@@ -181,7 +209,7 @@ sudo /opt/pi-ops-agent/current/scripts/healthcheck.sh
 ops-agent tui
 ```
 
-以上是 `v0.1.x` 的真实 unit 名称：依次对应规范的 `agentd`、兼容
+以上是当前真实 unit 名称：依次对应规范的 `agentd`、兼容
 `agentd-guard`、`agentd-server` 和 `agentd-root-broker`。不要在代码完成迁移前把命令
 机械改成尚不存在的 unit。
 
@@ -195,3 +223,5 @@ ops-agent tui
 6. LXC 无 user namespace 时只禁用 `ops_bash`，类型化工具继续工作；
 7. 重复 request/change 查询不会重放 mutation。
 8. 安装 Adapter 后，`/botmux-setup` 不进入 transcript，BotMux 配置为 `0600` 且输出不含 secret。
+9. managed-workload 仅监听 loopback，image/artifact/credential digest 与 policy 一致，容器无 privileged/device/socket mount。
+10. `ops-agent` UID 不能连接 Docker socket或读取 workload credential，受管工作负载在重启后恢复。

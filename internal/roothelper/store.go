@@ -84,8 +84,12 @@ func OpenStore(dir string) (*Store, error) {
 		if change == nil || change.ID != id {
 			return nil, fmt.Errorf("invalid persisted change %q", id)
 		}
-		if _, err := protocol.ParseStoredOperation(change.Operation); err != nil {
+		operation, err := protocol.ParseStoredOperation(change.Operation)
+		if err != nil {
 			return nil, fmt.Errorf("invalid persisted operation for %q: %w", id, err)
+		}
+		if operation.Kind() != change.Kind {
+			return nil, fmt.Errorf("persisted operation kind for %q does not match change kind", id)
 		}
 	}
 	return store, nil

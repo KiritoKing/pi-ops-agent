@@ -1,6 +1,6 @@
 {
   "name": "pi-ops-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A least-privilege, auditable Linux operations agent built on Pi.",
   "type": "module",
@@ -16,7 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && node --check integrations/botmux/adapter.mjs && npm run test && go test ./...",
+    "check": "npm run typecheck && npm run lint && node --check integrations/botmux/adapter.mjs && node --check plugins/workload-hermes/prepare-credentials.mjs && node --check scripts/configure-plugin-credentials.mjs && node --check scripts/initialize-target-policy.mjs && npm run test && go test ./...",
     "start:agentd": "node dist/agentd/index.js"
   },
   "dependencies": {

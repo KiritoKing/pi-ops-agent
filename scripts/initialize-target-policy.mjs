@@ -1,0 +1,162 @@
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+const options = new Map();
+const supportedOptions = new Set(["--catalog-index", "--policy", "--output"]);
+for (let index = 0; index < args.length; index += 2) {
+  const key = args[index];
+  const value = args[index + 1];
+  if (!key?.startsWith("--") || !supportedOptions.has(key) || value === undefined || options.has(key)) fail("Invalid target policy initializer arguments.");
+  options.set(key, value);
+}
+const catalogPath = options.get("--catalog-index");
+const policyPath = options.get("--policy");
+const outputPath = options.get("--output") ?? policyPath;
+if (!catalogPath || !policyPath || !outputPath || resolve(catalogPath) !== catalogPath || resolve(policyPath) !== policyPath || resolve(outputPath) !== outputPath) {
+  fail("Usage: initialize-target-policy.mjs --catalog-index ABSOLUTE_PATH --policy ABSOLUTE_PATH [--output ABSOLUTE_PATH]");
+}
+
+function parseObject(path, label) {
+  let value;
+  try {
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    fail(`${label} is not valid JSON: ${path}`);
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail(`${label} must be a JSON object.`);
+  return value;
+}
+
+const catalog = parseObject(catalogPath, "Artifact catalog index");
+if (catalog.schemaVersion !== 1 || !Array.isArray(catalog.artifacts) || catalog.artifacts.length > 256) {
+  fail("Artifact catalog index has an unsupported schema.");
+}
+const artifactById = new Map();
+for (const artifact of catalog.artifacts) {
+  if (artifact === null || typeof artifact !== "object" || Array.isArray(artifact) || typeof artifact.id !== "string") {
+    fail("Artifact catalog contains an invalid entry.");
+  }
+  const existing = artifactById.get(artifact.id);
+  if (existing) fail(`Artifact catalog has multiple versions of ${artifact.id}; automatic policy initialization is ambiguous.`);
+  artifactById.set(artifact.id, artifact);
+}
+
+const zeroDigest = `sha256:${"0".repeat(64)}`;
+function policyArtifact(artifact, credentialBundleDigest) {
+  const result = {
+    id: artifact.id,
+    kind: artifact.kind,
+    version: artifact.version,
+    publisher: artifact.publisher,
+    digest: artifact.digest,
+  };
+  if (artifact.kind === "managed-workload") result.credentialBundleDigest = credentialBundleDigest ?? zeroDigest;
+  return result;
+}
+
+function freshPolicy() {
+  const artifacts = catalog.artifacts.map((artifact) => policyArtifact(artifact));
+  const hasDockerWorkload = catalog.artifacts.some((artifact) => artifact.kind === "managed-workload");
+  return {
+    version: 1,
+    revision: "policy-initializing-v2",
+    targets: [{
+      id: "target-local-system",
+      account: "root",
+      displayName: "Local system",
+      inspect: {
+        hostSnapshot: true,
+        processList: true,
+        units: hasDockerWorkload ? ["docker.service", "ops-agent-server.service", "ops-agentd.service"] : ["ops-agent-server.service", "ops-agentd.service"],
+        readPaths: ["/etc", "/proc", "/var/log"],
+      },
+      changes: {
+        writePaths: ["/etc/ops-agent"],
+        units: hasDockerWorkload ? ["docker.service"] : [],
+        packages: hasDockerWorkload ? ["docker.io"] : [],
+        plugins: artifacts,
+      },
+    }],
+  };
+}
+
+function migratePolicy(policy) {
+  if (policy.version !== 1 || !Array.isArray(policy.targets) || policy.targets.length === 0) fail("Existing target policy has an unsupported schema.");
+  for (const target of policy.targets) {
+    if (target === null || typeof target !== "object" || Array.isArray(target) || target.changes === null || typeof target.changes !== "object" || Array.isArray(target.changes)) {
+      fail("Existing target policy contains an invalid target.");
+    }
+    const changeKeys = Object.keys(target.changes).sort();
+    const supportedChangeKeys = ["packages", "plugins", "units", "writePaths"];
+    if (changeKeys.some((key) => !supportedChangeKeys.includes(key))) {
+      fail(`Existing target ${target.id ?? "unknown"} contains an unsupported legacy change policy; migrate it explicitly before upgrading.`);
+    }
+    const migrated = [];
+    const plugins = Array.isArray(target.changes.plugins) ? target.changes.plugins : [];
+    for (const plugin of plugins) {
+      if (typeof plugin === "string") {
+        const artifact = artifactById.get(plugin);
+        if (!artifact) fail(`Legacy plugin ${plugin} is not present in the trusted catalog.`);
+        migrated.push(policyArtifact(artifact));
+      } else if (plugin !== null && typeof plugin === "object" && !Array.isArray(plugin)) {
+        migrated.push(plugin);
+      } else {
+        fail("Existing target policy contains an invalid plugin allowlist entry.");
+      }
+    }
+    target.changes.plugins = migrated;
+  }
+  return policy;
+}
+
+const policy = existsSync(policyPath) ? migratePolicy(parseObject(policyPath, "Existing target policy")) : freshPolicy();
+for (const target of policy.targets) {
+  target.changes.plugins.sort((left, right) => `${left.kind}\0${left.id}`.localeCompare(`${right.kind}\0${right.id}`, "en"));
+  for (const key of ["units", "packages", "writePaths"]) {
+    if (Array.isArray(target.changes[key])) target.changes[key].sort();
+  }
+  for (const key of ["units", "readPaths"]) {
+    if (Array.isArray(target.inspect?.[key])) target.inspect[key].sort();
+  }
+}
+policy.revision = "policy-pending-revision";
+const revisionDigest = createHash("sha256").update(JSON.stringify(policy)).digest("hex").slice(0, 24);
+policy.revision = `policy-local-${revisionDigest}`;
+const payload = `${JSON.stringify(policy)}\n`;
+const temporary = `${outputPath}.new.${process.pid}`;
+try {
+  writeFileSync(temporary, payload, { flag: "wx", mode: 0o640 });
+  chmodSync(temporary, 0o640);
+  const file = openSync(temporary, "r");
+  fsyncSync(file);
+  closeSync(file);
+  renameSync(temporary, outputPath);
+  const directory = openSync(dirname(outputPath), "r");
+  fsyncSync(directory);
+  closeSync(directory);
+} catch (error) {
+  try {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  } catch {
+    // Preserve the original atomic-write failure as the actionable error.
+  }
+  fail(`Cannot atomically initialize target policy: ${error instanceof Error ? error.message : "unknown error"}`);
+}
+process.stdout.write(`${policy.revision}\n`);

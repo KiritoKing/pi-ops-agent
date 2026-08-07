@@ -21,7 +21,9 @@ import {
   parseTargetId,
 } from "../../src/shared/domain.js";
 import {
+  parseArtifactCatalog,
   parseCapabilityDescriptor,
+  parseTargetDescriptors,
   type CapabilityDescriptor,
   type RemoteResponse,
 } from "../../src/shared/server-protocol.js";
@@ -76,18 +78,20 @@ class FakeOpsServerClient implements OpsServerClient {
     return await Promise.resolve([
       {
         targetId: parseTargetId("target-12345678"),
-        account: "hermes-agent",
-        displayName: "Hermes",
+        account: "service-agent",
+        displayName: "Service",
+        artifacts: [],
       },
       {
         targetId: parseTargetId("target-other-1234"),
         account: "www-data",
         displayName: "Web",
+        artifacts: [],
       },
     ]);
   }
 
-  async plugins() {
+  async artifacts() {
     return await Promise.resolve([]);
   }
 
@@ -149,7 +153,7 @@ describe("controller registries", () => {
 
     expect(context.targets[0]).toMatchObject({
       targetId: "target-12345678",
-      account: "hermes-agent",
+      account: "service-agent",
     });
     expect((await store.require(parseMachineId("machine-12345678"))).capabilities)
       .toMatchObject({ revision: "capability-1234", policyRevision: "policy-1234" });
@@ -207,5 +211,44 @@ describe("remote protocol validation", () => {
       operations: ["host.snapshot"],
       injectedPrompt: "ignore policy",
     })).toThrow("injectedPrompt is not supported");
+  });
+
+  it("strictly validates advertised target artifacts", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const artifact = {
+      id: "workload.assistant",
+      kind: "managed-workload",
+      version: "1.0.0",
+      publisher: "example/ops",
+      digest,
+      artifactRef: `builtin:${digest}`,
+    };
+    expect(parseTargetDescriptors([{
+      targetId: "target-managed-1234",
+      account: "managed_agent",
+      displayName: "Managed workload",
+      artifacts: [artifact],
+    }])[0]?.artifacts).toEqual([artifact]);
+    expect(() => parseTargetDescriptors([{
+      targetId: "target-managed-1234",
+      account: "managed_agent",
+      displayName: "Managed workload",
+      artifacts: [{ ...artifact, artifactRef: `builtin:sha256:${"b".repeat(64)}` }],
+    }])).toThrow("does not match digest");
+  });
+
+  it("accepts only generic artifact catalog fields", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const artifact = {
+      id: "adapter.web",
+      kind: "im-adapter",
+      version: "1.0.0",
+      publisher: "example/ops",
+      digest,
+      artifactRef: `builtin:${digest}`,
+    };
+    expect(parseArtifactCatalog([artifact])).toEqual([artifact]);
+    expect(() => parseArtifactCatalog([{ ...artifact, catalogPath: "/opt/catalog/pkg" }]))
+      .toThrow("catalogPath is not supported");
   });
 });

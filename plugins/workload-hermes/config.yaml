@@ -1,0 +1,30 @@
+model:
+  provider: deepseek
+  default: deepseek-v4-pro
+  base_url: https://api.deepseek.com/v1
+
+terminal:
+  backend: local
+  cwd: /opt/data/workspace
+
+display:
+  interface: tui
+
+approvals:
+  mode: smart
+  cron_mode: deny
+
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+
+browser:
+  allow_private_urls: false
+
+security:
+  allow_private_urls: false
+  redact_secrets: true

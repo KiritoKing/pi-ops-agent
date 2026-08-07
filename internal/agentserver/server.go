@@ -100,7 +100,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.HandleFunc("GET /v1/identity", s.handleIdentity)
 	mux.HandleFunc("GET /v1/capabilities", s.handleCapabilities)
 	mux.HandleFunc("GET /v1/targets", s.handleTargets)
-	mux.HandleFunc("GET /v1/plugins", s.handlePlugins)
+	mux.HandleFunc("GET /v1/artifacts", s.handleArtifacts)
 	mux.HandleFunc("POST /v1/inspect", s.handleInspect)
 	mux.HandleFunc("POST /v1/changes", s.handleChangePrepare)
 	mux.HandleFunc("GET /v1/changes/{changeRef}", s.handleChangeStatus)
@@ -138,8 +138,8 @@ func (s *Server) handleCapabilities(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
-		"revision": "capability-remote-mvp-v1", "policyRevision": s.Policy.Revision,
-		"operations": []string{"host.snapshot", "systemd.unit", "journal.tail", "change.prepare", "change.status", "plugin.install"},
+		"revision": "capability-remote-mvp-v2", "policyRevision": s.Policy.Revision,
+		"operations": []string{"host.snapshot", "systemd.unit", "journal.tail", "change.prepare", "change.status", "plugin.install", "workload.deploy"},
 	})
 }
 
@@ -148,9 +148,18 @@ func (s *Server) handleTargets(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	targets := s.Policy.PublicTargets()
-	public := make([]map[string]string, 0, len(targets))
+	type publicTarget struct {
+		TargetID    string           `json:"targetId"`
+		Account     string           `json:"account"`
+		DisplayName string           `json:"displayName"`
+		Artifacts   []publicArtifact `json:"artifacts"`
+	}
+	public := make([]publicTarget, 0, len(targets))
 	for _, target := range targets {
-		public = append(public, map[string]string{"targetId": target.ID, "account": target.Account, "displayName": target.DisplayName})
+		public = append(public, publicTarget{
+			TargetID: target.ID, Account: target.Account, DisplayName: target.DisplayName,
+			Artifacts: publicArtifacts(target.Changes.Plugins),
+		})
 	}
 	writeJSON(writer, http.StatusOK, public)
 }

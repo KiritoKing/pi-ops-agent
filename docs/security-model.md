@@ -39,6 +39,25 @@ allowlist，输出、deadline、并发和资源大小有硬上限。
 文件、服务、包、root 及插件安装全部需要人工审批；远端任意脚本和 breakglass 不发布为
 capability。
 
+### 声明式工作负载边界
+
+`managed-workload` 不是通用容器 API。模型只能提交 catalog 已公开、Target policy 已精确
+允许的 `pluginId/version/publisher/digest/artifactRef`。严格 manifest 可以声明固定镜像摘要、
+容器内 command/health check、端口、数据文件、credential slot 与有界资源；不能声明宿主
+命令、root 脚本、Docker socket、设备、额外 mount、host namespace、privileged 或原始
+Docker argv。root broker 强制 `127.0.0.1`、bridge、单一派生数据 mount、cap-drop ALL、
+`no-new-privileges`、资源限制、日志上限和精确运行后验证。默认从固定非 root UID/GID
+启动；确需 root 初始化的上游镜像必须在 manifest 中显式固定 `expectedUser=root`，并同时
+声明非 root 稳态 UID/GID、允许的 root supervisor 命令、允许/必需的非 root 进程命令。
+broker 使用固定 `docker top` 参数核对每个进程，拒绝未声明 root 进程、混合 root 身份、
+其他 UID/GID 或缺失的稳态进程。这只允许 digest-bound 镜像完成受约束初始化，不提供宿主 root。
+
+credential bundle 由管理员在模型外通过文件描述符写入 root-only `0600` 文件，并以
+SHA-256 绑定 policy revision。部署时 bundle 被转换为受管数据目录内的 `0600 .env`，Docker
+也会把值保存在容器配置环境中；它不是 systemd encrypted credential，不能宣称宿主静态
+加密。`agentd` 通过 systemd `InaccessiblePaths` 与 Unix 权限隔离整个工作负载 credential
+目录、root-helper 受管数据和 Docker socket。
+
 ## 审批与状态机
 
 ```text
@@ -68,6 +87,8 @@ GitHub Release artifact attestation 是发布来源证明；没有执行 attesta
 验证了 HTTPS + checksum，不能声称独立签名已验证。
 
 插件不得携带 root shell installer。Agent 只能准备由 `agentd-root-broker` 认识的类型化安装操作。
+schema v1 `im-adapter` 复用固定 Node launcher；schema v2 `managed-workload` 复用固定 OCI
+执行器。插件包本身永远不会作为 root 代码执行。
 MVP 没有通用 secret broker，也不让模型发起 secret 请求。BotMux Adapter 文件提交后，
 只有交互式 TUI 的精确 `/botmux-setup` 能在模型外把终端交给 `botmux setup`；ops-agent
 不读取 secret，transcript、argv 和审计正文均不包含 secret。BotMux 当前把 Lark secret

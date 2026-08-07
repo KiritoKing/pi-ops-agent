@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func TestPolicyStrictlyScopesReadsWritesAndBreakglass(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := parseTestPolicy(t, readRoot, writeRoot)
-	base := protocol.Request{TargetID: "target-hermes", PolicyRevision: policy.Revision}
+	base := protocol.Request{TargetID: "target-managed", PolicyRevision: policy.Revision}
 	read := base
 	read.Method, read.Path = protocol.MethodFileRead, readFile
 	if err := policy.Authorize(read); err != nil {
@@ -69,21 +70,85 @@ func TestPolicyRejectsUnknownFieldsAndSymlinkEscape(t *testing.T) {
 	}
 	policy := parseTestPolicy(t, readRoot, readRoot)
 	request := protocol.Request{
-		Method: protocol.MethodFileRead, TargetID: "target-hermes", PolicyRevision: policy.Revision,
+		Method: protocol.MethodFileRead, TargetID: "target-managed", PolicyRevision: policy.Revision,
 		Path: filepath.Join(readRoot, "link", "secret"), Deadline: time.Now().Add(time.Minute),
 	}
 	if err := policy.Authorize(request); err == nil {
 		t.Fatal("symlink escape was allowed")
 	}
-	payload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","unexpected":true,"targets":[{"id":"target-hermes","account":"hermes-agent","displayName":"Hermes","inspect":{"hostSnapshot":true,"processList":true,"units":[],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":[],"packages":[],"plugins":[]}}]}`, readRoot, readRoot)
+	payload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","unexpected":true,"targets":[{"id":"target-managed","account":"managed_agent","displayName":"Managed workload","inspect":{"hostSnapshot":true,"processList":true,"units":[],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":[],"packages":[],"plugins":[]}}]}`, readRoot, readRoot)
 	if _, err := Parse([]byte(payload)); err == nil {
 		t.Fatal("unknown policy field was accepted")
 	}
 }
 
+func TestPolicyAuthorizesOnlyExactPinnedArtifactForItsTarget(t *testing.T) {
+	directory := t.TempDir()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	credentialDigest := "sha256:" + strings.Repeat("b", 64)
+	adapterDigest := "sha256:" + strings.Repeat("c", 64)
+	payload := fmt.Sprintf(`{"version":1,"revision":"policy-managed-1234","targets":[{"id":"target-managed","account":"managed_agent","displayName":"Managed workload","inspect":{"hostSnapshot":true,"processList":true,"units":[],"readPaths":[%q]},"changes":{"writePaths":[],"units":[],"packages":["docker.io"],"plugins":[{"id":"workload.assistant","kind":"managed-workload","version":"1.0.0","publisher":"example/ops","digest":%q,"credentialBundleDigest":%q},{"id":"adapter.web","kind":"im-adapter","version":"2.0.0","publisher":"example/ops","digest":%q}]}}]}`, directory, digest, credentialDigest, adapterDigest)
+	policy, err := Parse([]byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{
+		Method: protocol.MethodChangePrepare, TargetID: "target-managed", PolicyRevision: policy.Revision,
+		Operation: &protocol.WorkloadDeploy{
+			OperationKind: "workload.deploy", PluginID: "workload.assistant", Version: "1.0.0",
+			Publisher: "example/ops", Digest: digest, ArtifactRef: "builtin:" + digest,
+		},
+	}
+	if err := policy.Authorize(request); err != nil {
+		t.Fatalf("pinned workload artifact was denied: %v", err)
+	}
+	request.Operation = &protocol.PluginInstall{
+		OperationKind: "plugin.install", PluginID: "workload.assistant", Version: "1.0.0",
+		Publisher: "example/ops", Digest: digest, ArtifactRef: "builtin:" + digest,
+	}
+	if err := policy.Authorize(request); err != nil {
+		t.Fatalf("installing a pinned managed-workload package was denied: %v", err)
+	}
+	request.Operation = &protocol.PluginInstall{
+		OperationKind: "plugin.install", PluginID: "adapter.web", Version: "2.0.0",
+		Publisher: "example/ops", Digest: adapterDigest, ArtifactRef: "builtin:" + adapterDigest,
+	}
+	if err := policy.Authorize(request); err != nil {
+		t.Fatalf("installing a pinned im-adapter package was denied: %v", err)
+	}
+	request.Operation = &protocol.WorkloadDeploy{
+		OperationKind: "workload.deploy", PluginID: "workload.assistant", Version: "1.0.0",
+		Publisher: "other/publisher", Digest: digest, ArtifactRef: "builtin:" + digest,
+	}
+	if err := policy.Authorize(request); err == nil {
+		t.Fatal("workload artifact with an unapproved publisher was allowed")
+	}
+	artifact, ok := policy.Artifact("target-managed", "managed-workload", "workload.assistant", "1.0.0", "example/ops", digest)
+	if !ok || artifact.CredentialBundleDigest != credentialDigest {
+		t.Fatalf("could not resolve pinned workload artifact: %#v", artifact)
+	}
+}
+
+func TestPolicyEnforcesCredentialBundleByArtifactKind(t *testing.T) {
+	directory := t.TempDir()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	credentialDigest := "sha256:" + strings.Repeat("b", 64)
+	base := fmt.Sprintf(`{"version":1,"revision":"policy-artifacts-1234","targets":[{"id":"target-managed","account":"managed_agent","displayName":"Managed workload","inspect":{"hostSnapshot":true,"processList":true,"units":[],"readPaths":[%q]},"changes":{"writePaths":[],"units":[],"packages":[],"plugins":[ARTIFACT]}}]}`, directory)
+	for _, artifact := range []string{
+		fmt.Sprintf(`{"id":"workload.assistant","kind":"managed-workload","version":"1.0.0","publisher":"example/ops","digest":%q}`, digest),
+		fmt.Sprintf(`{"id":"adapter.web","kind":"im-adapter","version":"1.0.0","publisher":"example/ops","digest":%q,"credentialBundleDigest":%q}`, digest, credentialDigest),
+		fmt.Sprintf(`{"id":"workload.assistant","kind":"container","version":"1.0.0","publisher":"example/ops","digest":%q}`, digest),
+	} {
+		if _, err := Parse([]byte(strings.Replace(base, "ARTIFACT", artifact, 1))); err == nil {
+			t.Fatalf("invalid artifact policy was accepted: %s", artifact)
+		}
+	}
+}
+
 func parseTestPolicy(t *testing.T, readRoot, writeRoot string) *Policy {
 	t.Helper()
-	payload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-hermes","account":"hermes-agent","displayName":"Hermes","inspect":{"hostSnapshot":true,"processList":true,"units":["hermes.service"],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":["hermes.service"],"packages":["hermes"],"plugins":["adapter.botmux"]}}]}`, readRoot, writeRoot)
+	digest := "sha256:" + strings.Repeat("c", 64)
+	payload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-managed","account":"managed_agent","displayName":"Managed workload","inspect":{"hostSnapshot":true,"processList":true,"units":["managed.service"],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":["managed.service"],"packages":["managed"],"plugins":[{"id":"adapter.web","kind":"im-adapter","version":"1.0.0","publisher":"example/ops","digest":%q}]}}]}`, readRoot, writeRoot, digest)
 	policy, err := Parse([]byte(payload))
 	if err != nil {
 		t.Fatal(err)

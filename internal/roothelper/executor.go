@@ -17,6 +17,7 @@ import (
 
 	"github.com/KiritoKing/pi-ops-agent/internal/pluginpkg"
 	"github.com/KiritoKing/pi-ops-agent/internal/protocol"
+	"github.com/KiritoKing/pi-ops-agent/internal/targetpolicy"
 )
 
 const maxCommandOutput = 64 * 1024
@@ -28,15 +29,22 @@ type ExecutionResult struct {
 	Verification      string
 }
 
+type ExecutionScope struct {
+	ChangeID           string
+	TargetID           string
+	PolicyRevision     string
+	CapabilityRevision string
+}
+
 type Executor interface {
-	Prepare(context.Context, string, protocol.Operation) (ExecutionResult, error)
-	Execute(context.Context, string, protocol.Operation, ExecutionResult) error
-	Verify(context.Context, string, protocol.Operation, ExecutionResult) (string, error)
-	Rollback(context.Context, string, protocol.Operation, ExecutionResult) error
+	Prepare(context.Context, ExecutionScope, protocol.Operation) (ExecutionResult, error)
+	Execute(context.Context, ExecutionScope, protocol.Operation, ExecutionResult) error
+	Verify(context.Context, ExecutionScope, protocol.Operation, ExecutionResult) (string, error)
+	Rollback(context.Context, ExecutionScope, protocol.Operation, ExecutionResult) error
 }
 
 type OperationValidator interface {
-	ValidateOperation(protocol.Operation) error
+	ValidateOperation(ExecutionScope, protocol.Operation) error
 }
 
 type CommandRunner interface {
@@ -58,20 +66,22 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) (string,
 }
 
 type OSExecutor struct {
-	StateDir        string
-	AllowedRoots    []string
-	AllowBreakglass bool
-	Runner          CommandRunner
-	PluginRoot      string
-	PluginCatalog   string
-	PluginBinRoot   string
+	StateDir             string
+	AllowedRoots         []string
+	AllowBreakglass      bool
+	Runner               CommandRunner
+	PluginRoot           string
+	PluginCatalog        string
+	PluginBinRoot        string
+	Policy               *targetpolicy.Policy
+	PluginCredentialRoot string
 }
 
-func (e *OSExecutor) Prepare(ctx context.Context, changeID string, operation protocol.Operation) (ExecutionResult, error) {
+func (e *OSExecutor) Prepare(ctx context.Context, scope ExecutionScope, operation protocol.Operation) (ExecutionResult, error) {
 	if e.Runner == nil {
 		e.Runner = ExecRunner{}
 	}
-	if err := e.ValidateOperation(operation); err != nil {
+	if err := e.ValidateOperation(scope, operation); err != nil {
 		return ExecutionResult{}, err
 	}
 	switch value := operation.(type) {
@@ -80,21 +90,23 @@ func (e *OSExecutor) Prepare(ctx context.Context, changeID string, operation pro
 	case *protocol.ServiceAction:
 		return e.prepareService(ctx, value)
 	case *protocol.FileWrite:
-		return e.prepareFile(changeID, value)
+		return e.prepareFile(scope.ChangeID, value)
 	case *protocol.PluginInstall:
-		return e.preparePluginInstall(changeID, value)
+		return e.preparePluginInstall(scope.ChangeID, value)
+	case *protocol.WorkloadDeploy:
+		return e.prepareWorkload(ctx, scope, value)
 	case *protocol.BreakglassScript:
-		return e.prepareBreakglass(ctx, changeID, value)
+		return e.prepareBreakglass(ctx, scope.ChangeID, value)
 	default:
 		return ExecutionResult{}, errors.New("executor received an unsupported operation")
 	}
 }
 
-func (e *OSExecutor) Execute(ctx context.Context, changeID string, operation protocol.Operation, result ExecutionResult) error {
+func (e *OSExecutor) Execute(ctx context.Context, scope ExecutionScope, operation protocol.Operation, result ExecutionResult) error {
 	if e.Runner == nil {
 		e.Runner = ExecRunner{}
 	}
-	if err := e.ValidateOperation(operation); err != nil {
+	if err := e.ValidateOperation(scope, operation); err != nil {
 		return err
 	}
 	switch value := operation.(type) {
@@ -106,17 +118,19 @@ func (e *OSExecutor) Execute(ctx context.Context, changeID string, operation pro
 	case *protocol.FileWrite:
 		return e.executeFile(value, result)
 	case *protocol.PluginInstall:
-		return e.executePluginInstall(changeID, value)
+		return e.executePluginInstall(scope.ChangeID, value)
+	case *protocol.WorkloadDeploy:
+		return e.executeWorkload(ctx, scope, value, result)
 	case *protocol.BreakglassScript:
-		scriptPath := filepath.Join(e.StateDir, "changes", changeID, "script.sh")
-		_, err := e.runCapsule(ctx, changeID, scriptPath, value.BackupPaths)
+		scriptPath := filepath.Join(e.StateDir, "changes", scope.ChangeID, "script.sh")
+		_, err := e.runCapsule(ctx, scope.ChangeID, scriptPath, value.BackupPaths)
 		return err
 	default:
 		return errors.New("executor received an unsupported operation")
 	}
 }
 
-func (e *OSExecutor) ValidateOperation(operation protocol.Operation) error {
+func (e *OSExecutor) ValidateOperation(scope ExecutionScope, operation protocol.Operation) error {
 	switch value := operation.(type) {
 	case *protocol.PackageInstall:
 		return nil
@@ -128,14 +142,19 @@ func (e *OSExecutor) ValidateOperation(operation protocol.Operation) error {
 	case *protocol.FileWrite:
 		return e.ensureAllowedPath(value.Path)
 	case *protocol.PluginInstall:
-		if value.PluginID != "adapter.botmux" {
-			return errors.New("this release only implements the adapter.botmux installer")
-		}
-		catalog := e.pluginCatalog()
-		if _, err := pluginpkg.Inspect(value.CatalogPath, catalog); err != nil {
+		packageInfo, err := e.inspectArtifact(value.ArtifactRef, value.PluginID, value.Version, value.Publisher, value.Digest)
+		if err != nil {
 			return err
 		}
+		if e.Policy != nil {
+			if _, ok := e.Policy.Artifact(scope.TargetID, packageInfo.Manifest.Kind, value.PluginID, value.Version, value.Publisher, value.Digest); !ok {
+				return errors.New("plugin artifact is not pinned by the target policy")
+			}
+		}
 		return nil
+	case *protocol.WorkloadDeploy:
+		_, _, err := e.authorizedWorkload(scope, value)
+		return err
 	case *protocol.BreakglassScript:
 		if !e.AllowBreakglass {
 			return errors.New("break-glass execution is disabled")
@@ -154,7 +173,7 @@ func (e *OSExecutor) ValidateOperation(operation protocol.Operation) error {
 	}
 }
 
-func (e *OSExecutor) Verify(ctx context.Context, _ string, operation protocol.Operation, result ExecutionResult) (string, error) {
+func (e *OSExecutor) Verify(ctx context.Context, scope ExecutionScope, operation protocol.Operation, result ExecutionResult) (string, error) {
 	switch value := operation.(type) {
 	case *protocol.PackageInstall:
 		version, installed, err := e.packageVersion(ctx, value.Package)
@@ -189,19 +208,31 @@ func (e *OSExecutor) Verify(ctx context.Context, _ string, operation protocol.Op
 		}
 		return "sha256:" + hex.EncodeToString(actual[:]), nil
 	case *protocol.PluginInstall:
-		packageInfo, err := pluginpkg.Inspect(value.CatalogPath, e.pluginCatalog())
+		packageInfo, err := e.inspectArtifact(value.ArtifactRef, value.PluginID, value.Version, value.Publisher, value.Digest)
 		if err != nil {
 			return "", err
 		}
-		if err := packageInfo.ValidateExpected(value.PluginID, value.Version, value.Digest); err != nil {
+		destination := filepath.Join(e.pluginRoot(), value.PluginID, value.Version)
+		if err := verifyInstalledArtifact(destination, packageInfo); err != nil {
 			return "", err
 		}
-		destination := filepath.Join(e.pluginRoot(), value.PluginID, value.Version)
-		entrypoint := filepath.Join(destination, filepath.FromSlash(packageInfo.Manifest.Entrypoint))
-		if info, statErr := os.Stat(entrypoint); statErr != nil || !info.Mode().IsRegular() {
-			return "", errors.New("installed plugin entrypoint is missing or not a regular file")
+		current, err := os.Readlink(filepath.Join(e.pluginRoot(), value.PluginID, "current"))
+		if err != nil || current != value.Version {
+			return "", errors.New("installed plugin current pointer does not match the approved version")
+		}
+		if packageInfo.Manifest.Kind == "im-adapter" {
+			entrypoint := filepath.Join(destination, filepath.FromSlash(packageInfo.Manifest.Entrypoint))
+			if info, statErr := os.Stat(entrypoint); statErr != nil || !info.Mode().IsRegular() {
+				return "", errors.New("installed adapter entrypoint is missing or not a regular file")
+			}
+			launcher := filepath.Join(e.pluginBinRoot(), adapterLauncherName(value.PluginID))
+			if info, statErr := os.Stat(launcher); statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+				return "", errors.New("installed adapter launcher is missing or has unsafe permissions")
+			}
 		}
 		return "installed " + value.PluginID + " " + value.Version + " " + value.Digest, nil
+	case *protocol.WorkloadDeploy:
+		return e.verifyWorkload(ctx, scope, value, result)
 	case *protocol.BreakglassScript:
 		if value.VerifyScript == "" {
 			return "script completed; no verification script supplied", nil
@@ -220,7 +251,7 @@ func (e *OSExecutor) Verify(ctx context.Context, _ string, operation protocol.Op
 	}
 }
 
-func (e *OSExecutor) Rollback(ctx context.Context, _ string, operation protocol.Operation, result ExecutionResult) error {
+func (e *OSExecutor) Rollback(ctx context.Context, scope ExecutionScope, operation protocol.Operation, result ExecutionResult) error {
 	if !result.RollbackAvailable {
 		return errors.New("rollback is unavailable")
 	}
@@ -260,6 +291,8 @@ func (e *OSExecutor) Rollback(ctx context.Context, _ string, operation protocol.
 		return atomicReplace(value.Path, payload, os.FileMode(rollback.Mode), rollback.UID, rollback.GID)
 	case *protocol.PluginInstall:
 		return e.rollbackPluginInstall(value, result)
+	case *protocol.WorkloadDeploy:
+		return e.rollbackWorkload(ctx, scope, value, result)
 	case *protocol.BreakglassScript:
 		var rollback breakglassRollback
 		if err := json.Unmarshal(result.RollbackData, &rollback); err != nil {
@@ -315,7 +348,7 @@ func (e *OSExecutor) installSpecificPackage(ctx context.Context, packageName, ve
 		if version != "" {
 			target += "=" + version
 		}
-		_, err = e.Runner.Run(ctx, path, "install", "-y", "--no-install-recommends", "--", target)
+		_, err = e.runPackageManager(ctx, packageName, path, "install", "-y", "--no-install-recommends", "--", target)
 		return err
 	}
 	for _, manager := range []string{"dnf", "yum", "zypper"} {
@@ -328,7 +361,7 @@ func (e *OSExecutor) installSpecificPackage(ctx context.Context, packageName, ve
 			if manager == "zypper" {
 				args = []string{"--non-interactive", "install", "--", target}
 			}
-			_, err = e.Runner.Run(ctx, path, args...)
+			_, err = e.runPackageManager(ctx, packageName, path, args...)
 			return err
 		}
 	}
@@ -337,7 +370,7 @@ func (e *OSExecutor) installSpecificPackage(ctx context.Context, packageName, ve
 
 func (e *OSExecutor) removePackage(ctx context.Context, packageName string) error {
 	if path, err := exec.LookPath("apt-get"); err == nil {
-		_, err = e.Runner.Run(ctx, path, "remove", "-y", "--", packageName)
+		_, err = e.runPackageManager(ctx, packageName, path, "remove", "-y", "--", packageName)
 		return err
 	}
 	for _, manager := range []string{"dnf", "yum", "zypper"} {
@@ -346,11 +379,32 @@ func (e *OSExecutor) removePackage(ctx context.Context, packageName string) erro
 			if manager == "zypper" {
 				args = []string{"--non-interactive", "remove", "--", packageName}
 			}
-			_, err = e.Runner.Run(ctx, path, args...)
+			_, err = e.runPackageManager(ctx, packageName, path, args...)
 			return err
 		}
 	}
 	return errors.New("no supported package manager found")
+}
+
+func (e *OSExecutor) runPackageManager(ctx context.Context, packageName, manager string, managerArgs ...string) (string, error) {
+	systemdRun, err := exec.LookPath("systemd-run")
+	if err != nil {
+		return "", errors.New("systemd-run is required for networked package changes")
+	}
+	unit := "ops-agent-package-" + safeUnitFragment(packageName)
+	args := []string{
+		"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec", "--unit=" + unit,
+		"--property=PrivateNetwork=no", "--property=PrivateTmp=yes", "--property=PrivateDevices=yes",
+		"--property=ProtectHome=read-only", "--property=NoNewPrivileges=yes",
+		"--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes",
+		"--property=ProtectKernelLogs=yes", "--property=ProtectControlGroups=yes",
+		"--property=RestrictRealtime=yes", "--property=RestrictSUIDSGID=yes",
+		"--property=LockPersonality=yes", "--property=SystemCallArchitectures=native",
+		"--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+		"--", manager,
+	}
+	args = append(args, managerArgs...)
+	return e.Runner.Run(ctx, systemdRun, args...)
 }
 
 func (e *OSExecutor) packageVersion(ctx context.Context, packageName string) (string, bool, error) {
@@ -443,11 +497,8 @@ func (e *OSExecutor) executeFile(operation *protocol.FileWrite, result Execution
 }
 
 func (e *OSExecutor) preparePluginInstall(changeID string, operation *protocol.PluginInstall) (ExecutionResult, error) {
-	packageInfo, err := pluginpkg.Inspect(operation.CatalogPath, e.pluginCatalog())
+	packageInfo, err := e.inspectArtifact(operation.ArtifactRef, operation.PluginID, operation.Version, operation.Publisher, operation.Digest)
 	if err != nil {
-		return ExecutionResult{}, err
-	}
-	if err := packageInfo.ValidateExpected(operation.PluginID, operation.Version, operation.Digest); err != nil {
 		return ExecutionResult{}, err
 	}
 	destination := filepath.Join(e.pluginRoot(), operation.PluginID, operation.Version)
@@ -469,14 +520,14 @@ func (e *OSExecutor) preparePluginInstall(changeID string, operation *protocol.P
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ExecutionResult{}, errors.New("plugin current pointer is not a symbolic link")
 	}
-	if operation.PluginID == "adapter.botmux" {
-		rollback.WrapperPath = filepath.Join(e.pluginBinRoot(), "ops-agent-botmux")
+	if packageInfo.Manifest.Kind == "im-adapter" {
+		rollback.WrapperPath = filepath.Join(e.pluginBinRoot(), adapterLauncherName(operation.PluginID))
 		if info, err := os.Lstat(rollback.WrapperPath); err == nil {
 			if !info.Mode().IsRegular() {
-				return ExecutionResult{}, errors.New("existing BotMux launcher is not a regular file")
+				return ExecutionResult{}, errors.New("existing adapter launcher is not a regular file")
 			}
 			rollback.WrapperExisted = true
-			rollback.WrapperBackup = filepath.Join(changeDir, "ops-agent-botmux.backup")
+			rollback.WrapperBackup = filepath.Join(changeDir, "adapter-launcher.backup")
 			if err := copyFile(rollback.WrapperPath, rollback.WrapperBackup, 0o600); err != nil {
 				return ExecutionResult{}, err
 			}
@@ -493,11 +544,8 @@ func (e *OSExecutor) preparePluginInstall(changeID string, operation *protocol.P
 }
 
 func (e *OSExecutor) executePluginInstall(changeID string, operation *protocol.PluginInstall) error {
-	packageInfo, err := pluginpkg.Inspect(operation.CatalogPath, e.pluginCatalog())
+	packageInfo, err := e.inspectArtifact(operation.ArtifactRef, operation.PluginID, operation.Version, operation.Publisher, operation.Digest)
 	if err != nil {
-		return err
-	}
-	if err := packageInfo.ValidateExpected(operation.PluginID, operation.Version, operation.Digest); err != nil {
 		return err
 	}
 	pluginDirectory := filepath.Join(e.pluginRoot(), operation.PluginID)
@@ -518,6 +566,10 @@ func (e *OSExecutor) executePluginInstall(changeID string, operation *protocol.P
 		_ = os.RemoveAll(staging)
 		return err
 	}
+	if err := atomicReplace(filepath.Join(staging, ".artifact-digest"), []byte(operation.Digest+"\n"), 0o644, -1, -1); err != nil {
+		_ = os.RemoveAll(staging)
+		return err
+	}
 	destination := filepath.Join(pluginDirectory, operation.Version)
 	if err := os.Rename(staging, destination); err != nil {
 		_ = os.RemoveAll(staging)
@@ -531,19 +583,59 @@ func (e *OSExecutor) executePluginInstall(changeID string, operation *protocol.P
 	if err := os.Rename(temporaryLink, filepath.Join(pluginDirectory, "current")); err != nil {
 		return err
 	}
-	if operation.PluginID == "adapter.botmux" {
+	if packageInfo.Manifest.Kind == "im-adapter" {
 		if err := os.MkdirAll(e.pluginBinRoot(), 0o755); err != nil {
 			return err
 		}
 		if err := os.Chmod(e.pluginBinRoot(), 0o755); err != nil {
 			return err
 		}
-		launcher := "#!/bin/sh\nset -eu\nexport OPS_AGENT_CORE_ROOT=/opt/pi-ops-agent/current\nexec /opt/pi-ops-agent/current/runtime/node /opt/pi-ops-agent/plugins/adapter.botmux/current/adapter.mjs \"$@\"\n"
-		if err := atomicReplace(filepath.Join(e.pluginBinRoot(), "ops-agent-botmux"), []byte(launcher), 0o755, -1, -1); err != nil {
+		entrypoint := filepath.Join(e.pluginRoot(), operation.PluginID, "current", filepath.FromSlash(packageInfo.Manifest.Entrypoint))
+		launcher := "#!/bin/sh\nset -eu\nexport OPS_AGENT_CORE_ROOT=/opt/pi-ops-agent/current\nexec /opt/pi-ops-agent/current/runtime/node " + shellSingleQuote(entrypoint) + " \"$@\"\n"
+		if err := atomicReplace(filepath.Join(e.pluginBinRoot(), adapterLauncherName(operation.PluginID)), []byte(launcher), 0o755, -1, -1); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (e *OSExecutor) inspectArtifact(reference, id, version, publisher, digest string) (*pluginpkg.Package, error) {
+	packageInfo, err := pluginpkg.InspectArtifactRef(e.pluginCatalog(), reference)
+	if err != nil {
+		return nil, err
+	}
+	if err := packageInfo.ValidateExpected(id, version, digest); err != nil {
+		return nil, err
+	}
+	if packageInfo.Manifest.Publisher != publisher {
+		return nil, errors.New("plugin package publisher does not match the prepared operation")
+	}
+	return packageInfo, nil
+}
+
+func verifyInstalledArtifact(destination string, packageInfo *pluginpkg.Package) error {
+	info, err := os.Lstat(destination)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("installed plugin version directory is missing or invalid")
+	}
+	digest, err := os.ReadFile(filepath.Join(destination, ".artifact-digest"))
+	if err != nil || strings.TrimSpace(string(digest)) != packageInfo.Digest {
+		return errors.New("installed plugin artifact digest marker does not match the catalog package")
+	}
+	manifest, err := os.Lstat(filepath.Join(destination, "manifest.json"))
+	if err != nil || !manifest.Mode().IsRegular() || manifest.Mode().Perm()&0o022 != 0 {
+		return errors.New("installed plugin manifest is missing")
+	}
+	return nil
+}
+
+func adapterLauncherName(pluginID string) string {
+	suffix := strings.TrimPrefix(pluginID, "adapter.")
+	return "ops-agent-" + strings.ReplaceAll(suffix, ".", "-")
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func (e *OSExecutor) rollbackPluginInstall(operation *protocol.PluginInstall, result ExecutionResult) error {

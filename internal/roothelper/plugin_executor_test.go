@@ -28,38 +28,40 @@ func TestPluginInstallCommitVerifyAndRollback(t *testing.T) {
 	operation := &protocol.PluginInstall{
 		OperationKind: "plugin.install",
 		PluginID:      "adapter.botmux",
-		Version:       "0.1.0",
+		Version:       "0.2.0",
+		Publisher:     "KiritoKing/pi-ops-agent",
 		Digest:        "sha256:" + hex.EncodeToString(digest[:]),
-		CatalogPath:   packagePath,
+		ArtifactRef:   "builtin:sha256:" + hex.EncodeToString(digest[:]),
 	}
 	executor := &OSExecutor{
 		StateDir: stateRoot, PluginRoot: pluginRoot,
 		PluginCatalog: catalog, PluginBinRoot: binRoot,
 	}
-	prepared, err := executor.Prepare(context.Background(), "change-plugin-0001", operation)
+	scope := ExecutionScope{ChangeID: "change-plugin-0001", TargetID: "target-local-system"}
+	prepared, err := executor.Prepare(context.Background(), scope, operation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !prepared.RollbackAvailable {
 		t.Fatal("plugin installation must be rollback-capable")
 	}
-	if err := executor.Execute(context.Background(), "change-plugin-0001", operation, prepared); err != nil {
+	if err := executor.Execute(context.Background(), scope, operation, prepared); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := executor.Verify(context.Background(), "change-plugin-0001", operation, prepared); err != nil {
+	if _, err := executor.Verify(context.Background(), scope, operation, prepared); err != nil {
 		t.Fatal(err)
 	}
 	current, err := os.Readlink(filepath.Join(pluginRoot, "adapter.botmux", "current"))
-	if err != nil || current != "0.1.0" {
+	if err != nil || current != "0.2.0" {
 		t.Fatalf("unexpected current plugin pointer %q: %v", current, err)
 	}
 	if _, err := os.Stat(filepath.Join(binRoot, "ops-agent-botmux")); err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.Rollback(context.Background(), "change-plugin-0001", operation, prepared); err != nil {
+	if err := executor.Rollback(context.Background(), scope, operation, prepared); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(pluginRoot, "adapter.botmux", "0.1.0")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(pluginRoot, "adapter.botmux", "0.2.0")); !os.IsNotExist(err) {
 		t.Fatalf("plugin version survived rollback: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(binRoot, "ops-agent-botmux")); !os.IsNotExist(err) {
@@ -76,7 +78,7 @@ func writeExecutorPluginPackage(t *testing.T, output string) []byte {
 	gzipWriter := gzip.NewWriter(file)
 	archive := tar.NewWriter(gzipWriter)
 	files := map[string]string{
-		"manifest.json": `{"schemaVersion":1,"id":"adapter.botmux","kind":"im-adapter","version":"0.1.0","publisher":"KiritoKing/pi-ops-agent","coreProtocol":1,"entrypoint":"adapter.mjs","description":"BotMux adapter","capabilities":{"inboundText":true,"verifiedSender":true,"privateConversation":true,"proactiveDelivery":true,"approvalIntent":true,"streaming":false},"secrets":[],"setupOperations":[]}`,
+		"manifest.json": `{"schemaVersion":1,"id":"adapter.botmux","kind":"im-adapter","version":"0.2.0","publisher":"KiritoKing/pi-ops-agent","coreProtocol":1,"entrypoint":"adapter.mjs","description":"BotMux adapter","capabilities":{"inboundText":true,"verifiedSender":true,"privateConversation":true,"proactiveDelivery":true,"approvalIntent":true,"streaming":false},"secrets":[],"setupOperations":[]}`,
 		"adapter.mjs":   "export const ready = true;\n",
 	}
 	for name, payload := range files {

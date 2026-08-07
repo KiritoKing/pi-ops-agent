@@ -32,6 +32,15 @@ type Policy struct {
 	byID map[string]Target
 }
 
+type ArtifactPolicy struct {
+	ID                     string `json:"id"`
+	Kind                   string `json:"kind"`
+	Version                string `json:"version"`
+	Publisher              string `json:"publisher"`
+	Digest                 string `json:"digest"`
+	CredentialBundleDigest string `json:"credentialBundleDigest,omitempty"`
+}
+
 type Target struct {
 	ID          string           `json:"id"`
 	Account     string           `json:"account"`
@@ -48,10 +57,10 @@ type InspectionPolicy struct {
 }
 
 type ChangePolicy struct {
-	WritePaths []string `json:"writePaths"`
-	Units      []string `json:"units"`
-	Packages   []string `json:"packages"`
-	Plugins    []string `json:"plugins"`
+	WritePaths []string         `json:"writePaths"`
+	Units      []string         `json:"units"`
+	Packages   []string         `json:"packages"`
+	Plugins    []ArtifactPolicy `json:"plugins"`
 }
 
 func Load(path string, requireRootOwner bool) (*Policy, error) {
@@ -128,7 +137,7 @@ func (p *Policy) validate() error {
 		if err := validateValues(target.Changes.Packages, protocol.ValidPackage, "package"); err != nil {
 			return fmt.Errorf("target %q: %w", target.ID, err)
 		}
-		if err := validateValues(target.Changes.Plugins, idPattern.MatchString, "plugin"); err != nil {
+		if err := validateArtifacts(target.Changes.Plugins); err != nil {
 			return fmt.Errorf("target %q: %w", target.ID, err)
 		}
 		sort.Strings(target.Inspect.Units)
@@ -136,10 +145,49 @@ func (p *Policy) validate() error {
 		sort.Strings(target.Changes.Units)
 		sort.Strings(target.Changes.WritePaths)
 		sort.Strings(target.Changes.Packages)
-		sort.Strings(target.Changes.Plugins)
+		sort.Slice(target.Changes.Plugins, func(i, j int) bool {
+			return artifactKey(target.Changes.Plugins[i]) < artifactKey(target.Changes.Plugins[j])
+		})
 		p.byID[target.ID] = *target
 	}
 	return nil
+}
+
+func validateArtifacts(artifacts []ArtifactPolicy) error {
+	if len(artifacts) > 128 {
+		return errors.New("artifact allowlist is too large")
+	}
+	seen := make(map[string]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		if !protocol.ValidArtifactID(artifact.ID) ||
+			!protocol.ValidArtifactVersion(artifact.Version) ||
+			!protocol.ValidPublisher(artifact.Publisher) ||
+			!protocol.ValidDigest(artifact.Digest) {
+			return fmt.Errorf("invalid artifact policy %q", artifact.ID)
+		}
+		switch artifact.Kind {
+		case "im-adapter":
+			if artifact.CredentialBundleDigest != "" {
+				return fmt.Errorf("im-adapter artifact %q must omit credentialBundleDigest", artifact.ID)
+			}
+		case "managed-workload":
+			if !protocol.ValidDigest(artifact.CredentialBundleDigest) {
+				return fmt.Errorf("managed-workload artifact %q requires a valid credentialBundleDigest", artifact.ID)
+			}
+		default:
+			return fmt.Errorf("artifact %q has unsupported kind %q", artifact.ID, artifact.Kind)
+		}
+		key := artifactKey(artifact)
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("duplicate artifact policy %q", artifact.ID)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func artifactKey(artifact ArtifactPolicy) string {
+	return strings.Join([]string{artifact.Kind, artifact.ID, artifact.Version, artifact.Publisher, artifact.Digest}, "\x00")
 }
 
 func (p *Policy) Target(id string) (Target, bool) {
@@ -148,6 +196,22 @@ func (p *Policy) Target(id string) (Target, bool) {
 	}
 	target, ok := p.byID[id]
 	return target, ok
+}
+
+func (p *Policy) Artifact(targetID, kind, id, version, publisher, digest string) (ArtifactPolicy, bool) {
+	if p == nil {
+		return ArtifactPolicy{}, false
+	}
+	target, ok := p.Target(targetID)
+	if !ok {
+		return ArtifactPolicy{}, false
+	}
+	for _, artifact := range target.Changes.Plugins {
+		if artifact.Kind == kind && artifact.ID == id && artifact.Version == version && artifact.Publisher == publisher && artifact.Digest == digest {
+			return artifact, true
+		}
+	}
+	return ArtifactPolicy{}, false
 }
 
 func (p *Policy) PublicTargets() []Target {
@@ -212,16 +276,12 @@ func authorizeOperation(target Target, operation protocol.Operation) error {
 			return errors.New("package change is outside target policy")
 		}
 	case *protocol.PluginInstall:
-		if !contains(target.Changes.Plugins, value.PluginID) {
+		if !artifactOperationAuthorized(target.Changes.Plugins, "", value.PluginID, value.Version, value.Publisher, value.Digest, value.ArtifactRef) {
 			return errors.New("plugin install is outside target policy")
 		}
-	case *protocol.PluginConfigure:
-		if !contains(target.Changes.Plugins, value.PluginID) {
-			return errors.New("plugin configuration is outside target policy")
-		}
-	case *protocol.PluginRemove:
-		if !contains(target.Changes.Plugins, value.PluginID) {
-			return errors.New("plugin removal is outside target policy")
+	case *protocol.WorkloadDeploy:
+		if !artifactOperationAuthorized(target.Changes.Plugins, "managed-workload", value.PluginID, value.Version, value.Publisher, value.Digest, value.ArtifactRef) {
+			return errors.New("workload deployment is outside target policy")
 		}
 	case *protocol.BreakglassScript:
 		return errors.New("breakglass.script is never authorized by remote target policy")
@@ -229,6 +289,18 @@ func authorizeOperation(target Target, operation protocol.Operation) error {
 		return errors.New("operation is not authorized by target policy")
 	}
 	return nil
+}
+
+func artifactOperationAuthorized(artifacts []ArtifactPolicy, kind, id, version, publisher, digest, artifactRef string) bool {
+	if artifactRef != "builtin:"+digest {
+		return false
+	}
+	for _, artifact := range artifacts {
+		if (kind == "" || artifact.Kind == kind) && artifact.ID == id && artifact.Version == version && artifact.Publisher == publisher && artifact.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePaths(values []string, label string) error {

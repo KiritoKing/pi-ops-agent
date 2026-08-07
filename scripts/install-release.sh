@@ -18,6 +18,8 @@ ADMIN_USER="${SUDO_USER:-}"
 ENROLLMENT_FILE=""
 CONTROLLER_URL=""
 START_NOW=true
+POLICY_CANDIDATE=""
+POLICY_BACKUP=""
 
 usage() {
   cat <<'EOF'
@@ -98,26 +100,26 @@ fi
 install_native_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap openssl ca-certificates
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap openssl ca-certificates diffutils
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y bubblewrap openssl ca-certificates
+    dnf install -y bubblewrap openssl ca-certificates diffutils
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y bubblewrap openssl ca-certificates
+    yum install -y bubblewrap openssl ca-certificates diffutils
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install bubblewrap openssl ca-certificates
+    zypper --non-interactive install bubblewrap openssl ca-certificates diffutils
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --needed --noconfirm bubblewrap openssl ca-certificates
+    pacman -Sy --needed --noconfirm bubblewrap openssl ca-certificates diffutils
   else
-    printf 'Install bubblewrap, OpenSSL and CA certificates, then retry.\n' >&2
+    printf 'Install bubblewrap, OpenSSL, CA certificates and diffutils, then retry.\n' >&2
     return 1
   fi
 }
 
-if ! command -v bwrap >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+if ! command -v bwrap >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v diff >/dev/null 2>&1; then
   install_native_dependencies
 fi
 
-for required_command in systemctl systemd-tmpfiles getent groupadd useradd usermod install cp mv ln mktemp stat wc openssl bwrap sha256sum hostname sed tr cut runuser; do
+for required_command in systemctl systemd-tmpfiles getent groupadd useradd usermod install cp mv ln readlink mktemp stat wc openssl bwrap sha256sum hostname sed tr cut runuser sleep diff; do
   command -v "${required_command}" >/dev/null 2>&1 || {
     printf 'Missing installation dependency: %s\n' "${required_command}" >&2
     exit 1
@@ -181,7 +183,16 @@ fi
 
 install -d -o root -g root -m 0755 "${APP_ROOT}" "${RELEASE_ROOT}"
 release_dir="${RELEASE_ROOT}/${release_version}"
-if [[ ! -d "${release_dir}" ]]; then
+if [[ -e "${release_dir}" ]] || [[ -L "${release_dir}" ]]; then
+  if [[ ! -d "${release_dir}" ]] || [[ -L "${release_dir}" ]]; then
+    printf 'Existing release path is not a real directory: %s\n' "${release_dir}" >&2
+    exit 1
+  fi
+  if ! diff --brief --recursive --no-dereference "${PAYLOAD_DIR}/app" "${release_dir}" >/dev/null; then
+    printf 'Existing release %s does not match the verified payload; refusing same-version reuse.\n' "${release_version}" >&2
+    exit 1
+  fi
+else
   release_staging="${RELEASE_ROOT}/.${release_version}.new.$$"
   install -d -o root -g root -m 0755 "${release_staging}"
   cleanup_release_staging() {
@@ -335,13 +346,17 @@ EOF
     chown root:"${SERVER_GROUP}" "${CONFIG_ROOT}/server-identity.json"
     chmod 0640 "${CONFIG_ROOT}/server-identity.json"
   fi
-  if [[ ! -f "${CONFIG_ROOT}/targets.json" ]]; then
-    cat >"${CONFIG_ROOT}/targets.json" <<EOF
-{"version":1,"revision":"policy-local-v1","targets":[{"id":"target-local-system","account":"root","displayName":"Local system","inspect":{"hostSnapshot":true,"processList":true,"units":["ops-agentd.service","ops-agent-server.service"],"readPaths":["/etc","/proc","/var/log"]},"changes":{"writePaths":["/etc/ops-agent"],"units":[],"packages":[],"plugins":["adapter.botmux"]}}]}
-EOF
-    chown root:"${SERVER_GROUP}" "${CONFIG_ROOT}/targets.json"
-    chmod 0640 "${CONFIG_ROOT}/targets.json"
-  fi
+  POLICY_CANDIDATE="${CONFIG_ROOT}/.targets.json.candidate.${release_version}.$$"
+  [[ ! -e "${POLICY_CANDIDATE}" ]] || {
+    printf 'Refusing to overwrite an existing policy candidate: %s\n' "${POLICY_CANDIDATE}" >&2
+    return 1
+  }
+  "${release_dir}/runtime/node" "${release_dir}/scripts/initialize-target-policy.mjs" \
+    --catalog-index "${release_dir}/catalog/index.json" \
+    --policy "${CONFIG_ROOT}/targets.json" \
+    --output "${POLICY_CANDIDATE}" >/dev/null
+  chown root:"${SERVER_GROUP}" "${POLICY_CANDIDATE}"
+  chmod 0640 "${POLICY_CANDIDATE}"
   if [[ ! -f "${CONFIG_ROOT}/servers.json" ]]; then
     cat >"${CONFIG_ROOT}/servers.json" <<EOF
 {"version":1,"servers":[{"serverId":"${server_id}","machineId":"${machine_id}","baseUrl":"https://127.0.0.1:7443","caPath":"${tls_root}/ca.crt","certPath":"${tls_root}/agent.crt","keyPath":"${tls_root}/agent.key","approverCertPath":"${approver_root}/approver.crt","approverKeyPath":"${approver_root}/approver.key","approvalSigningKeyPath":"${approver_root}/approval.key.pem","approvalKeyId":"local-approver-v1","serverName":"localhost","enabled":true}]}
@@ -351,19 +366,112 @@ EOF
   fi
 }
 
+cleanup_policy_candidate() {
+  if [[ -n "${POLICY_CANDIDATE:-}" ]] && [[ -f "${POLICY_CANDIDATE}" ]]; then
+    rm -f -- "${POLICY_CANDIDATE}"
+  fi
+}
+
 if [[ "${MODE}" == init ]]; then
   initialize_local_endpoint
+  trap cleanup_policy_candidate EXIT HUP INT TERM
 fi
 
 for unit in "${release_dir}"/systemd/*.service "${release_dir}"/systemd/*.timer "${release_dir}"/systemd/*.target; do
   [[ -f "${unit}" ]] || continue
   install -o root -g root -m 0644 "${unit}" "${UNIT_ROOT}/$(basename "${unit}")"
 done
+for existing_dropin in "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf; do
+  [[ -f "${existing_dropin}" ]] || continue
+  dropin_directory="$(basename "$(dirname "${existing_dropin}")")"
+  dropin_name="$(basename "${existing_dropin}")"
+  if [[ "${dropin_directory}/${dropin_name}" == "ops-agentd.service.d/zzzz-ops-agent-credential.conf" ]]; then
+    continue
+  fi
+  if [[ ! -f "${release_dir}/systemd/${dropin_directory}/${dropin_name}" ]]; then
+    rm -f -- "${existing_dropin}"
+  fi
+done
+for dropin_dir in "${release_dir}"/systemd/*.service.d; do
+  [[ -d "${dropin_dir}" ]] || continue
+  destination_dropin="${UNIT_ROOT}/$(basename "${dropin_dir}")"
+  install -d -o root -g root -m 0755 "${destination_dropin}"
+  for dropin in "${dropin_dir}"/*.conf; do
+    [[ -f "${dropin}" ]] || continue
+    install -o root -g root -m 0644 "${dropin}" "${destination_dropin}/$(basename "${dropin}")"
+  done
+done
+install -d -o root -g root -m 0755 "${UNIT_ROOT}/ops-agentd.service.d"
+cat >"${UNIT_ROOT}/ops-agentd.service.d/zzzz-ops-agent-credential.conf" <<'EOF'
+[Service]
+LoadCredentialEncrypted=deepseek_api_key:/etc/ops-agent/credentials/deepseek_api_key.cred
+EOF
+chown root:root "${UNIT_ROOT}/ops-agentd.service.d/zzzz-ops-agent-credential.conf"
+chmod 0644 "${UNIT_ROOT}/ops-agentd.service.d/zzzz-ops-agent-credential.conf"
 if [[ -f "${release_dir}/systemd/ops-agent.tmpfiles.conf" ]]; then
   install -o root -g root -m 0644 "${release_dir}/systemd/ops-agent.tmpfiles.conf" \
     "${TMPFILES_ROOT}/ops-agent.conf"
 fi
 
+previous_current_present=false
+previous_current_target=""
+if [[ -L "${CURRENT_LINK}" ]]; then
+  previous_current_present=true
+  previous_current_target="$(readlink "${CURRENT_LINK}")"
+elif [[ -e "${CURRENT_LINK}" ]]; then
+  printf 'Refusing to replace non-symlink current path: %s\n' "${CURRENT_LINK}" >&2
+  exit 1
+fi
+
+policy_was_present=false
+if [[ "${MODE}" == init ]] && [[ -f "${CONFIG_ROOT}/targets.json" ]]; then
+  policy_was_present=true
+  POLICY_BACKUP="$(mktemp "${CONFIG_ROOT}/targets.json.backup.${release_version}.XXXXXX")"
+  install -o root -g "${SERVER_GROUP}" -m 0640 "${CONFIG_ROOT}/targets.json" "${POLICY_BACKUP}"
+fi
+
+rollback_activation() {
+  local activation_status=$?
+  local restore_tmp=""
+  ((activation_status != 0)) || activation_status=1
+  trap - ERR EXIT HUP INT TERM
+  set +e
+  if [[ "${previous_current_present}" == true ]]; then
+    current_tmp="${APP_ROOT}/.current.rollback.${release_version}.$$"
+    rm -f -- "${current_tmp}"
+    ln -s "${previous_current_target}" "${current_tmp}"
+    mv -Tf -- "${current_tmp}" "${CURRENT_LINK}"
+  elif [[ -L "${CURRENT_LINK}" ]] && [[ "$(readlink "${CURRENT_LINK}")" == "releases/${release_version}" ]]; then
+    rm -f -- "${CURRENT_LINK}"
+  fi
+  if [[ "${MODE}" == init ]]; then
+    if [[ "${policy_was_present}" == true ]] && [[ -f "${POLICY_BACKUP}" ]]; then
+      restore_tmp="${CONFIG_ROOT}/.targets.json.restore.${release_version}.$$"
+      install -o root -g "${SERVER_GROUP}" -m 0640 "${POLICY_BACKUP}" "${restore_tmp}"
+      mv -f -- "${restore_tmp}" "${CONFIG_ROOT}/targets.json"
+    elif [[ "${policy_was_present}" == false ]]; then
+      rm -f -- "${CONFIG_ROOT}/targets.json"
+    fi
+  fi
+  cleanup_policy_candidate
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${START_NOW}" == true ]] && [[ "${previous_current_present}" == true ]]; then
+    if [[ "${MODE}" == init ]]; then
+      systemctl try-restart ops-agent.target ops-agent-healthcheck.timer >/dev/null 2>&1 || true
+    else
+      systemctl try-restart ops-root-helper.service ops-agent-server.service >/dev/null 2>&1 || true
+    fi
+  fi
+  printf 'Release activation failed; restored the previous current link and target policy. Policy backup: %s\n' "${POLICY_BACKUP:-none}" >&2
+  exit "${activation_status}"
+}
+
+trap - EXIT HUP INT TERM
+trap rollback_activation ERR EXIT HUP INT TERM
+if [[ "${MODE}" == init ]]; then
+  mv -f -- "${POLICY_CANDIDATE}" "${CONFIG_ROOT}/targets.json"
+  POLICY_CANDIDATE=""
+fi
 current_tmp="${APP_ROOT}/.current.${release_version}.$$"
 ln -s "releases/${release_version}" "${current_tmp}"
 mv -Tf -- "${current_tmp}" "${CURRENT_LINK}"
@@ -398,6 +506,7 @@ if [[ "${MODE}" == join ]]; then
   if [[ "${START_NOW}" == true ]]; then
     systemctl restart ops-root-helper.service ops-agent-server.service
   fi
+  trap - ERR EXIT HUP INT TERM
   printf 'Pi Ops Agent endpoint %s installed and enrolled.\n' "${release_version}"
   exit 0
 fi
@@ -413,14 +522,34 @@ if [[ ! -f "${credential_path}" ]] && [[ "${START_NOW}" == true ]]; then
 fi
 if [[ "${START_NOW}" == true ]]; then
   systemctl restart ops-agent.target ops-agent-healthcheck.timer
+  for required_socket in \
+    /run/ops-agent/helper/root-helper.sock \
+    /run/ops-agent/helper/systemd-helper.sock \
+    /run/ops-agent/agentd/agentd.sock; do
+    socket_attempt=0
+    while [[ ! -S "${required_socket}" ]] && ((socket_attempt < 100)); do
+      sleep 0.1
+      socket_attempt=$((socket_attempt + 1))
+    done
+    if [[ ! -S "${required_socket}" ]]; then
+      printf 'Timed out waiting for runtime socket: %s\n' "${required_socket}" >&2
+      exit 1
+    fi
+  done
   "${CURRENT_LINK}/scripts/healthcheck.sh"
 fi
+
+trap - ERR EXIT HUP INT TERM
 
 printf '%s\n' \
   "Pi Ops Agent ${release_version} initialized without external IM adapters." \
   "Re-login as ${ADMIN_USER} to refresh group membership, then run: ops-agent tui" \
+  "Managed workload plugins require model-external credential provisioning with configure-plugin-credentials.sh before deployment." \
   "Install an adapter later by asking the Agent from TUI; BotMux itself remains an external dependency."
 if [[ ! -f "${credential_path}" ]]; then
   printf 'Before starting, create the model credential with: sudo %s/scripts/encrypt-credential.sh\n' \
     "${CURRENT_LINK}"
+fi
+if [[ -n "${POLICY_BACKUP}" ]]; then
+  printf 'Previous target policy backup retained at: %s\n' "${POLICY_BACKUP}"
 fi

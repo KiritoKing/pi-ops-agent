@@ -3,7 +3,7 @@ import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import {
   parseCapabilityDescriptor,
   parseRemoteResponse,
-  parsePluginCatalog,
+  parseArtifactCatalog,
   parseServerIdentity,
   parseTargetDescriptors,
   type CapabilityDescriptor,
@@ -11,20 +11,33 @@ import {
   type ChangeStatusRequest,
   type InspectionRequest,
   type PrepareChangeRequest,
-  type PluginCatalogEntry,
+  type ArtifactDescriptor,
   type RemoteResponse,
   type ServerIdentity,
   type TargetDescriptor,
 } from "../shared/server-protocol.js";
+import type { TargetId } from "../shared/domain.js";
 import type { ServerRegistration } from "./server-registry.js";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const DEFAULT_TRANSPORT_TIMEOUT_MS = 30_000;
+const MAX_TRANSPORT_TIMEOUT_MS = 10 * 60_000;
+const TRANSPORT_DEADLINE_GRACE_MS = 5_000;
+
+export function transportTimeoutForDeadline(deadline: string, now = Date.now()): number {
+  const deadlineMs = Date.parse(deadline);
+  if (!Number.isFinite(deadlineMs)) return DEFAULT_TRANSPORT_TIMEOUT_MS;
+  return Math.min(
+    MAX_TRANSPORT_TIMEOUT_MS,
+    Math.max(DEFAULT_TRANSPORT_TIMEOUT_MS, deadlineMs - now + TRANSPORT_DEADLINE_GRACE_MS),
+  );
+}
 
 export interface OpsServerClient {
   identity(signal?: AbortSignal): Promise<ServerIdentity>;
   capabilities(signal?: AbortSignal): Promise<CapabilityDescriptor>;
   targets(signal?: AbortSignal): Promise<TargetDescriptor[]>;
-  plugins(signal?: AbortSignal): Promise<PluginCatalogEntry[]>;
+  artifacts(targetId: TargetId, signal?: AbortSignal): Promise<ArtifactDescriptor[]>;
   inspect(request: InspectionRequest, signal?: AbortSignal): Promise<RemoteResponse>;
   prepareChange(request: PrepareChangeRequest, signal?: AbortSignal): Promise<RemoteResponse>;
   changeStatus(request: ChangeStatusRequest, signal?: AbortSignal): Promise<RemoteResponse>;
@@ -50,7 +63,7 @@ export class HttpsOpsServerClient implements OpsServerClient {
       keepAliveMsecs: 15_000,
       maxSockets: 8,
       maxFreeSockets: 2,
-      timeout: 90_000,
+      timeout: MAX_TRANSPORT_TIMEOUT_MS,
     });
   }
 
@@ -77,16 +90,33 @@ export class HttpsOpsServerClient implements OpsServerClient {
     return parseTargetDescriptors(await this.#request("GET", "/v1/targets", undefined, signal));
   }
 
-  async plugins(signal?: AbortSignal): Promise<PluginCatalogEntry[]> {
-    return parsePluginCatalog(await this.#request("GET", "/v1/plugins", undefined, signal));
+  async artifacts(targetId: TargetId, signal?: AbortSignal): Promise<ArtifactDescriptor[]> {
+    return parseArtifactCatalog(await this.#request(
+      "GET",
+      `/v1/artifacts?targetId=${encodeURIComponent(targetId)}`,
+      undefined,
+      signal,
+    ));
   }
 
   async inspect(request: InspectionRequest, signal?: AbortSignal): Promise<RemoteResponse> {
-    return parseRemoteResponse(await this.#request("POST", "/v1/inspect", request, signal));
+    return parseRemoteResponse(await this.#request(
+      "POST",
+      "/v1/inspect",
+      request,
+      signal,
+      transportTimeoutForDeadline(request.deadline),
+    ));
   }
 
   async prepareChange(request: PrepareChangeRequest, signal?: AbortSignal): Promise<RemoteResponse> {
-    return parseRemoteResponse(await this.#request("POST", "/v1/changes", request, signal));
+    return parseRemoteResponse(await this.#request(
+      "POST",
+      "/v1/changes",
+      request,
+      signal,
+      transportTimeoutForDeadline(request.deadline),
+    ));
   }
 
   async changeStatus(request: ChangeStatusRequest, signal?: AbortSignal): Promise<RemoteResponse> {
@@ -95,6 +125,7 @@ export class HttpsOpsServerClient implements OpsServerClient {
       `/v1/changes/${encodeURIComponent(request.changeId)}?requestId=${encodeURIComponent(request.requestId)}&deadline=${encodeURIComponent(request.deadline)}&machineId=${encodeURIComponent(request.machineId)}&targetId=${encodeURIComponent(request.targetId)}`,
       undefined,
       signal,
+      transportTimeoutForDeadline(request.deadline),
     ));
   }
 
@@ -112,6 +143,7 @@ export class HttpsOpsServerClient implements OpsServerClient {
       `/v1/changes/${encodeURIComponent(request.changeId)}/${request.action}`,
       body,
       signal,
+      transportTimeoutForDeadline(request.deadline),
     ));
   }
 
@@ -124,6 +156,7 @@ export class HttpsOpsServerClient implements OpsServerClient {
     path: string,
     body: unknown,
     signal: AbortSignal | undefined,
+    timeoutMs = DEFAULT_TRANSPORT_TIMEOUT_MS,
   ): Promise<unknown> {
     const url = new URL(path, this.#registration.baseUrl);
     const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
@@ -174,7 +207,7 @@ export class HttpsOpsServerClient implements OpsServerClient {
           }
         });
       });
-      request.setTimeout(30_000, () => request.destroy(new Error("server request timed out")));
+      request.setTimeout(timeoutMs, () => request.destroy(new Error("server request timed out")));
       request.once("error", reject);
       if (encoded !== undefined) request.end(encoded);
       else request.end();

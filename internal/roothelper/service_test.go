@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,22 +34,22 @@ type fakeExecutor struct {
 	rollbacks     int
 }
 
-func (f *fakeExecutor) Prepare(context.Context, string, protocol.Operation) (ExecutionResult, error) {
+func (f *fakeExecutor) Prepare(context.Context, ExecutionScope, protocol.Operation) (ExecutionResult, error) {
 	f.preparations++
 	return f.result, f.prepareErr
 }
-func (f *fakeExecutor) Execute(_ context.Context, changeID string, _ protocol.Operation, result ExecutionResult) error {
+func (f *fakeExecutor) Execute(_ context.Context, scope ExecutionScope, _ protocol.Operation, result ExecutionResult) error {
 	f.executions++
 	if f.executeHook != nil {
-		f.executeHook(changeID, result)
+		f.executeHook(scope.ChangeID, result)
 	}
 	return f.executeErr
 }
-func (f *fakeExecutor) Verify(context.Context, string, protocol.Operation, ExecutionResult) (string, error) {
+func (f *fakeExecutor) Verify(context.Context, ExecutionScope, protocol.Operation, ExecutionResult) (string, error) {
 	f.verifications++
 	return "verified", f.verifyErr
 }
-func (f *fakeExecutor) Rollback(ctx context.Context, _ string, _ protocol.Operation, _ ExecutionResult) error {
+func (f *fakeExecutor) Rollback(ctx context.Context, _ ExecutionScope, _ protocol.Operation, _ ExecutionResult) error {
 	f.rollbacks++
 	if f.rollbackHook != nil {
 		f.rollbackHook(ctx)
@@ -193,7 +195,7 @@ func TestCriticalPathsAndServicesAreDenied(t *testing.T) {
 func TestRemoteApprovalRoleAndChangeScopeAreEnforced(t *testing.T) {
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	directory := t.TempDir()
-	policyPayload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-hermes","account":"hermes-agent","displayName":"Hermes","inspect":{"hostSnapshot":true,"processList":false,"units":[],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":[],"packages":["hermes"],"plugins":[]}}]}`, directory, directory)
+	policyPayload := fmt.Sprintf(`{"version":1,"revision":"policy-12345678","targets":[{"id":"target-service","account":"service_agent","displayName":"Service","inspect":{"hostSnapshot":true,"processList":false,"units":[],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":[],"packages":["example"],"plugins":[]}}]}`, directory, directory)
 	policy, err := targetpolicy.Parse([]byte(policyPayload))
 	if err != nil {
 		t.Fatal(err)
@@ -207,7 +209,7 @@ func TestRemoteApprovalRoleAndChangeScopeAreEnforced(t *testing.T) {
 	}
 	service.Approval = &ApprovalVerifier{KeyID: "approver-test-v1", PublicKey: publicKey}
 	serverPeer := peercred.Credential{UID: service.AgentUID}
-	prepared := service.Handle(context.Background(), serverPeer, parseRemoteRequest(t, now, "prepare-remote-0001", "agent", `"method":"change.prepare","operation":{"kind":"package.install","package":"hermes"}`))
+	prepared := service.Handle(context.Background(), serverPeer, parseRemoteRequest(t, now, "prepare-remote-0001", "agent", `"method":"change.prepare","operation":{"kind":"package.install","package":"example"}`))
 	if !prepared.OK {
 		t.Fatalf("remote prepare failed: %#v", prepared)
 	}
@@ -238,6 +240,117 @@ func TestRemoteApprovalRoleAndChangeScopeAreEnforced(t *testing.T) {
 	}
 }
 
+func TestHistoricalChangeActionsSurvivePolicyRevisionDrift(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	directory := t.TempDir()
+	policyV1 := testTargetPolicy(t, directory, "policy-history-v1")
+	policyV2 := testTargetPolicy(t, directory, "policy-history-v2")
+	executor := &fakeExecutor{result: ExecutionResult{RollbackAvailable: true, RollbackData: json.RawMessage(`{}`)}}
+	service := testService(t, now, executor)
+	service.Policy = policyV1
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Approval = &ApprovalVerifier{KeyID: "approver-test-v1", PublicKey: publicKey}
+	serverPeer := peercred.Credential{UID: service.AgentUID}
+
+	pending := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "prepare-history-pending", "agent", policyV1.Revision, `"method":"change.prepare","operation":{"kind":"package.install","package":"example"}`))
+	committed := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "prepare-history-commit", "agent", policyV1.Revision, `"method":"change.prepare","operation":{"kind":"package.install","package":"example"}`))
+	if !pending.OK || !committed.OK {
+		t.Fatalf("prepare historical changes: pending=%#v committed=%#v", pending, committed)
+	}
+	committedChange, _ := service.Store.Change(committed.ChangeID)
+	approveGrant := signedGrant(t, privateKey, now, "approve", committedChange)
+	approveJSON, err := json.Marshal(approveGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "approve-history-commit", "approver", policyV1.Revision, fmt.Sprintf(`"method":"change.approve","changeId":%q,"approval":%s`, committed.ChangeID, approveJSON)))
+	if !approved.OK || approved.State != StateCommitted {
+		t.Fatalf("commit before policy drift: %#v", approved)
+	}
+
+	service.Policy = policyV2
+	status := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "status-history-current", "agent", policyV2.Revision, fmt.Sprintf(`"method":"change.status","changeId":%q`, pending.ChangeID)))
+	if !status.OK {
+		t.Fatalf("historical status failed after policy drift: %#v", status)
+	}
+	data, ok := status.Data.(map[string]interface{})
+	if !ok || data["policyRevision"] != policyV1.Revision {
+		t.Fatalf("historical status lost original policy revision: %#v", status.Data)
+	}
+
+	pendingChange, _ := service.Store.Change(pending.ChangeID)
+	staleApproveGrant := signedGrant(t, privateKey, now, "approve", pendingChange)
+	staleApproveJSON, err := json.Marshal(staleApproveGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleApprove := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "approve-history-stale", "approver", policyV2.Revision, fmt.Sprintf(`"method":"change.approve","changeId":%q,"approval":%s`, pending.ChangeID, staleApproveJSON)))
+	if staleApprove.OK || executor.executions != 1 {
+		t.Fatalf("old-revision change was approved under current policy: %#v", staleApprove)
+	}
+
+	rejectGrant := signedGrant(t, privateKey, now, "reject", pendingChange)
+	rejectJSON, err := json.Marshal(rejectGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "reject-history-current", "approver", policyV2.Revision, fmt.Sprintf(`"method":"change.reject","changeId":%q,"approval":%s`, pending.ChangeID, rejectJSON)))
+	if !rejected.OK || rejected.State != StateRejected {
+		t.Fatalf("historical reject failed after policy drift: %#v", rejected)
+	}
+
+	rollbackGrant := signedGrant(t, privateKey, now, "rollback", committedChange)
+	rollbackJSON, err := json.Marshal(rollbackGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolledBack := service.Handle(context.Background(), serverPeer, parseRemoteRequestWithPolicy(t, now, "rollback-history-current", "approver", policyV2.Revision, fmt.Sprintf(`"method":"change.rollback","changeId":%q,"approval":%s`, committed.ChangeID, rollbackJSON)))
+	if !rolledBack.OK || rolledBack.State != StateRolledBack || executor.rollbacks != 1 {
+		t.Fatalf("historical rollback failed after policy drift: response=%#v rollbacks=%d", rolledBack, executor.rollbacks)
+	}
+}
+
+func TestV01PersistedPluginOperationsOpenButCannotExecute(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	directory := t.TempDir()
+	stateDirectory := filepath.Join(directory, "state")
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	statePayload := fmt.Sprintf(`{"changes":{"legacy-install":{"id":"legacy-install","planHash":%q,"kind":"plugin.install","summary":"legacy install","operation":{"kind":"plugin.install","pluginId":"adapter.botmux","version":"0.1.0","digest":%q,"catalogPath":"/opt/pi-ops-agent/current/catalog/adapter.botmux.json"},"state":"COMMITTED","preparedAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","rollbackData":{},"rollbackAvailable":true},"legacy-configure":{"id":"legacy-configure","planHash":%q,"kind":"plugin.configure","summary":"legacy configure","operation":{"kind":"plugin.configure","pluginId":"adapter.botmux","version":"0.1.0","digest":%q,"settings":[{"name":"TOKEN_FILE","value":"/run/token"}]},"state":"COMMITTED","preparedAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","rollbackData":{},"rollbackAvailable":true},"legacy-pending":{"id":"legacy-pending","planHash":%q,"kind":"plugin.install","summary":"legacy pending","operation":{"kind":"plugin.install","pluginId":"adapter.botmux","version":"0.1.0","digest":%q,"catalogPath":"/opt/pi-ops-agent/current/catalog/adapter.botmux.json"},"state":"PENDING_APPROVAL","preparedAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","rollbackAvailable":false}},"requests":{}}`, digest, digest, digest, digest, digest, digest)
+	if err := os.WriteFile(filepath.Join(stateDirectory, "state.json"), []byte(statePayload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(stateDirectory)
+	if err != nil {
+		t.Fatalf("open v0.1 store: %v", err)
+	}
+	log, err := audit.Open(filepath.Join(directory, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &fakeExecutor{}
+	service := &Service{AgentUID: 1001, ApproverUID: 0, Store: store, Audit: log, Executor: executor, Now: func() time.Time { return now }}
+	approver := peercred.Credential{UID: 0}
+
+	rolledBack := service.Handle(context.Background(), approver, parseRequest(t, now, "rollback-legacy-install", `"method":"change.rollback","changeId":"legacy-install"`))
+	if !rolledBack.OK || executor.rollbacks != 1 {
+		t.Fatalf("safe legacy install rollback was not reused: response=%#v rollbacks=%d", rolledBack, executor.rollbacks)
+	}
+	unsupported := service.Handle(context.Background(), approver, parseRequest(t, now, "rollback-legacy-config", `"method":"change.rollback","changeId":"legacy-configure"`))
+	if unsupported.OK || executor.rollbacks != 1 || !strings.Contains(unsupported.Error, "legacy") {
+		t.Fatalf("unsafe legacy configure rollback was attempted: %#v", unsupported)
+	}
+	approve := service.Handle(context.Background(), approver, parseRequest(t, now, "approve-legacy-pending", `"method":"change.approve","changeId":"legacy-pending"`))
+	if approve.OK || executor.preparations != 0 || executor.executions != 0 || !strings.Contains(approve.Error, "legacy") {
+		t.Fatalf("legacy pending operation executed after upgrade: %#v", approve)
+	}
+}
+
 func signedGrant(t *testing.T, privateKey ed25519.PrivateKey, now time.Time, action string, change *Change) protocol.ApprovalGrant {
 	t.Helper()
 	grant := protocol.ApprovalGrant{
@@ -245,7 +358,7 @@ func signedGrant(t *testing.T, privateKey ed25519.PrivateKey, now time.Time, act
 		ServerID: change.ServerID, MachineID: change.MachineID, TargetID: change.TargetID,
 		ChangeID: change.ID, PlanHash: change.PlanHash, PolicyRevision: change.PolicyRevision,
 		IssuedAt: now.UTC().Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).UTC().Format(time.RFC3339Nano),
-		Nonce: "nonce-remote-approval-12345678",
+		Nonce: "nonce-" + action + "-" + change.ID,
 	}
 	payload, err := grant.ApprovalPayload()
 	if err != nil {
@@ -253,6 +366,16 @@ func signedGrant(t *testing.T, privateKey ed25519.PrivateKey, now time.Time, act
 	}
 	grant.Signature = base64.RawStdEncoding.EncodeToString(ed25519.Sign(privateKey, payload))
 	return grant
+}
+
+func testTargetPolicy(t *testing.T, directory, revision string) *targetpolicy.Policy {
+	t.Helper()
+	payload := fmt.Sprintf(`{"version":1,"revision":%q,"targets":[{"id":"target-service","account":"service_agent","displayName":"Service","inspect":{"hostSnapshot":true,"processList":false,"units":[],"readPaths":[%q]},"changes":{"writePaths":[%q],"units":[],"packages":["example"],"plugins":[]}}]}`, revision, directory, directory)
+	policy, err := targetpolicy.Parse([]byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
 }
 
 func testService(t *testing.T, now time.Time, executor Executor) *Service {
@@ -280,8 +403,12 @@ func parseRequest(t *testing.T, now time.Time, id, fields string) protocol.Reque
 }
 
 func parseRemoteRequest(t *testing.T, now time.Time, id, role, fields string) protocol.Request {
+	return parseRemoteRequestWithPolicy(t, now, id, role, "policy-12345678", fields)
+}
+
+func parseRemoteRequestWithPolicy(t *testing.T, now time.Time, id, role, policyRevision, fields string) protocol.Request {
 	t.Helper()
-	payload := fmt.Sprintf(`{"version":1,"requestId":%q,"deadline":%q,"serverId":"server-12345678","machineId":"machine-12345678","targetId":"target-hermes","policyRevision":"policy-12345678","callerRole":%q,%s}`, id, now.Add(time.Minute).Format(time.RFC3339Nano), role, fields)
+	payload := fmt.Sprintf(`{"version":1,"requestId":%q,"deadline":%q,"serverId":"server-12345678","machineId":"machine-12345678","targetId":"target-service","policyRevision":%q,"callerRole":%q,%s}`, id, now.Add(time.Minute).Format(time.RFC3339Nano), policyRevision, role, fields)
 	request, err := protocol.ParseRequest([]byte(payload), now)
 	if err != nil {
 		t.Fatal(err)

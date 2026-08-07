@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 2,
+  "id": "workload.hermes",
+  "kind": "managed-workload",
+  "version": "0.2.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "coreProtocol": 1,
+  "description": "Pinned Hermes Agent workload with loopback-only WebUI, durable data, bounded resources, external credential slots, and container-local verification.",
+  "workload": {
+    "runtime": "docker",
+    "imageRepository": "nousresearch/hermes-agent",
+    "imageDigest": "sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e",
+    "containerName": "ops-agent-hermes",
+    "containerCommand": [
+      "gateway",
+      "run"
+    ],
+    "expectedEntrypoint": [
+      "/opt/hermes/docker/entrypoint-dispatch.sh"
+    ],
+    "expectedUser": "root",
+    "processPolicy": {
+      "runtimeUser": "10000:10000",
+      "allowedRuntimeCommands": [
+        "hermes",
+        "s6-log",
+        "sleep"
+      ],
+      "requiredRuntimeCommands": [
+        "hermes"
+      ],
+      "allowedRootCommands": [
+        "s6-svscan",
+        "rc.init",
+        "s6-supervise",
+        "s6-linux-init-s",
+        "s6-ipcserverd",
+        "sleep"
+      ]
+    },
+    "containerPort": 9119,
+    "hostPort": 9119,
+    "dataMountTarget": "/opt/data",
+    "uid": 10000,
+    "gid": 10000,
+    "resources": {
+      "memoryBytes": 4294967296,
+      "nanoCpus": 2000000000,
+      "pidsLimit": 512,
+      "shmBytes": 1073741824
+    },
+    "capAdd": [
+      "CHOWN",
+      "DAC_OVERRIDE",
+      "FOWNER",
+      "KILL",
+      "SETGID",
+      "SETUID"
+    ],
+    "literalEnvironment": {
+      "HERMES_UID": "10000",
+      "HERMES_GID": "10000",
+      "HERMES_DASHBOARD": "1"
+    },
+    "credentialEnvironment": {
+      "deepseekApiKey": "DEEPSEEK_API_KEY",
+      "dashboardUsername": "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+      "dashboardPasswordHash": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+      "dashboardSessionSecret": "HERMES_DASHBOARD_BASIC_AUTH_SECRET"
+    },
+    "directories": [
+      {
+        "path": "/opt/data/workspace",
+        "mode": "0750"
+      }
+    ],
+    "files": [
+      {
+        "source": "config.yaml",
+        "path": "/opt/data/config.yaml",
+        "mode": "0644"
+      },
+      {
+        "source": "ops-healthcheck.py",
+        "path": "/opt/data/ops-healthcheck.py",
+        "mode": "0555"
+      }
+    ],
+    "containerExecChecks": [
+      {
+        "argv": [
+          "/opt/hermes/.venv/bin/python",
+          "/opt/data/ops-healthcheck.py"
+        ],
+        "outputContains": "ops-healthcheck: ok"
+      }
+    ]
+  }
+}

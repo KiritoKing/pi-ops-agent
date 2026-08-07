@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   parseMachineId,
@@ -120,7 +121,7 @@ export class MachineContextStore {
   async #write(context: MachineContext): Promise<void> {
     const directory = join(this.#directory, context.machineId);
     const path = join(directory, "context.json");
-    const temporary = `${path}.tmp-${process.pid}`;
+    const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
     await mkdir(directory, { recursive: true, mode: 0o750 });
     await writeFile(temporary, `${JSON.stringify(context, undefined, 2)}\n`, {
       encoding: "utf8",
