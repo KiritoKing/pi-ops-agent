@@ -138,8 +138,8 @@ func (s *Server) handleCapabilities(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
-		"revision": "capability-remote-mvp-v2", "policyRevision": s.Policy.Revision,
-		"operations": []string{"host.snapshot", "systemd.unit", "journal.tail", "change.prepare", "change.status", "plugin.install", "workload.deploy"},
+		"revision": "capability-remote-mvp-v3", "policyRevision": s.Policy.Revision,
+		"operations": []string{"host.snapshot", "process.list", "systemd.unit", "journal.tail", "file.metadata", "file.read", "change.prepare", "change.status", "plugin.install", "workload.deploy"},
 	})
 }
 

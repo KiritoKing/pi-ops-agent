@@ -25,12 +25,19 @@ func TestPolicyStrictlyScopesReadsWritesAndBreakglass(t *testing.T) {
 	if err := os.WriteFile(readFile, []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	policy := parseTestPolicy(t, readRoot, writeRoot)
+	policy := parseTestPolicy(t, readFile, writeRoot)
 	base := protocol.Request{TargetID: "target-managed", PolicyRevision: policy.Revision}
 	read := base
 	read.Method, read.Path = protocol.MethodFileRead, readFile
 	if err := policy.Authorize(read); err != nil {
 		t.Fatalf("allowed read denied: %v", err)
+	}
+	read.Path = filepath.Join(readRoot, "other.txt")
+	if err := os.WriteFile(read.Path, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.Authorize(read); err == nil {
+		t.Fatal("file read inherited permission from an allowed file parent")
 	}
 	write := base
 	write.Method = protocol.MethodChangePrepare

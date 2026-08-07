@@ -247,9 +247,13 @@ func (p *Policy) Authorize(request protocol.Request) error {
 		if !contains(target.Inspect.Units, request.Unit) {
 			return errors.New("systemd unit inspection is outside target policy")
 		}
-	case protocol.MethodFileMetadata, protocol.MethodFileRead:
+	case protocol.MethodFileMetadata:
 		if err := pathWithin(request.Path, target.Inspect.ReadPaths); err != nil {
 			return fmt.Errorf("file inspection is outside target policy: %w", err)
+		}
+	case protocol.MethodFileRead:
+		if err := exactPathAllowed(request.Path, target.Inspect.ReadPaths); err != nil {
+			return fmt.Errorf("file read is outside target policy: %w", err)
 		}
 	case protocol.MethodChangePrepare:
 		return authorizeOperation(target, request.Operation)
@@ -335,6 +339,23 @@ func pathWithin(path string, roots []string) error {
 		return fmt.Errorf("resolve path: %w", err)
 	}
 	return resolvedWithin(resolved, roots)
+}
+
+func exactPathAllowed(path string, allowedPaths []string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+		return errors.New("path must be a clean absolute path below root")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+	for _, allowed := range allowedPaths {
+		resolvedAllowed, allowedErr := filepath.EvalSymlinks(allowed)
+		if allowedErr == nil && resolved == resolvedAllowed {
+			return nil
+		}
+	}
+	return errors.New("file reads require an exact allowed path")
 }
 
 func resolvedWithin(resolved string, roots []string) error {

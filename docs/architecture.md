@@ -184,8 +184,10 @@ Harness 固定目录
 
 `agentd-server` manifest 只是严格数据声明，不能携带代码、Prompt 或动态任意工具。
 
-MVP 工具分为机器/Target 发现、有界只读巡检、本地离线分析、`change_prepare/status` 和
-插件 catalog/prepare/status。远端命令必须建模为固定 executable、typed args、runAs、
+MVP 工具分为机器/Target 发现，有界的主机快照、进程、systemd、journal、文件 metadata/read
+巡检，本地离线分析，`change_prepare/status` 和插件 catalog/prepare/status。每项远端巡检
+同时受已知 capability 与 Target policy 约束；裸 policy 的文件 `readPaths` 为空。远端命令
+必须建模为固定 executable、typed args、runAs、
 timeout、输出上限、备份、验证和回滚的 recipe，禁止 `sudo -u <user> <shell>`。
 工作负载部署复用固定的 OCI 安全模板；插件只能提供已审阅、摘要绑定的容器内声明，不形成
 通用 Docker 管理能力。

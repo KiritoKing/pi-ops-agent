@@ -13,7 +13,10 @@ afterEach(() => {
   }
 });
 
-function runInitializer(existingPolicy: unknown): { inputPath: string; outputPath: string; policy: Record<string, unknown> } {
+function runInitializer(
+  existingPolicy: unknown,
+  enabledArtifactIds: string[] = [],
+): { inputPath: string; outputPath: string; policy: Record<string, unknown> } {
   const directory = mkdtempSync(join(tmpdir(), "ops-policy-upgrade-"));
   temporaryDirectories.push(directory);
   const catalogPath = join(directory, "index.json");
@@ -27,15 +30,37 @@ function runInitializer(existingPolicy: unknown): { inputPath: string; outputPat
     ],
   })}\n`);
   if (existingPolicy !== undefined) writeFileSync(inputPath, `${JSON.stringify(existingPolicy)}\n`);
-  execFileSync(process.execPath, [
+  const initializerArgs = [
     join(process.cwd(), "scripts/initialize-target-policy.mjs"),
     "--catalog-index", catalogPath,
     "--policy", inputPath,
     "--output", outputPath,
-  ]);
+  ];
+  for (const id of enabledArtifactIds) initializerArgs.push("--enable-artifact", id);
+  execFileSync(process.execPath, initializerArgs);
   const parsed = JSON.parse(readFileSync(outputPath, "utf8")) as unknown;
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected policy object");
   return { inputPath, outputPath, policy: parsed as Record<string, unknown> };
+}
+
+function validateArtifacts(enabledArtifactIds: string[]): string {
+  const directory = mkdtempSync(join(tmpdir(), "ops-policy-validate-"));
+  temporaryDirectories.push(directory);
+  const catalogPath = join(directory, "index.json");
+  writeFileSync(catalogPath, `${JSON.stringify({
+    schemaVersion: 1,
+    artifacts: [
+      { id: "adapter.botmux", kind: "im-adapter", version: "1.0.0", publisher: "example/ops", digest: digest("a") },
+      { id: "workload.hermes", kind: "managed-workload", version: "1.0.0", publisher: "example/ops", digest: digest("b") },
+    ],
+  })}\n`);
+  const args = [
+    join(process.cwd(), "scripts/initialize-target-policy.mjs"),
+    "--catalog-index", catalogPath,
+    "--validate-only",
+  ];
+  for (const id of enabledArtifactIds) args.push("--enable-artifact", id);
+  return execFileSync(process.execPath, args, { encoding: "utf8" });
 }
 
 function localTarget(policy: Record<string, unknown>): Record<string, unknown> {
@@ -107,11 +132,96 @@ describe("target policy upgrades", () => {
     expect(changes.units).toEqual([]);
   });
 
-  it("authorizes catalog artifacts and Docker only for a fresh installation", () => {
+  it("creates a core-only policy without catalog artifacts or Docker", () => {
     const { policy } = runInitializer(undefined);
+    const target = localTarget(policy);
+    const changes = targetChanges(target);
+    expect(changes.packages).toEqual([]);
+    expect(changes.units).toEqual([]);
+    expect(changes.plugins).toEqual([]);
+    expect((target.inspect as Record<string, unknown>).units).toEqual([
+      "ops-agent-server.service",
+      "ops-agentd.service",
+    ]);
+    expect((target.inspect as Record<string, unknown>).readPaths).toEqual([]);
+  });
+
+  it("authorizes an explicit adapter without adding Docker permissions", () => {
+    const { policy } = runInitializer(undefined, ["adapter.botmux"]);
     const changes = targetChanges(localTarget(policy));
+    expect(changes.packages).toEqual([]);
+    expect(changes.units).toEqual([]);
+    expect(changes.plugins).toEqual([{
+      id: "adapter.botmux",
+      kind: "im-adapter",
+      version: "1.0.0",
+      publisher: "example/ops",
+      digest: digest("a"),
+    }]);
+  });
+
+  it("authorizes only an explicit managed workload and its Docker prerequisites", () => {
+    const { policy } = runInitializer(undefined, ["workload.hermes"]);
+    const target = localTarget(policy);
+    const changes = targetChanges(target);
     expect(changes.packages).toEqual(["docker.io"]);
     expect(changes.units).toEqual(["docker.service"]);
-    expect(changes.plugins).toHaveLength(2);
+    expect(changes.plugins).toEqual([{
+      id: "workload.hermes",
+      kind: "managed-workload",
+      version: "1.0.0",
+      publisher: "example/ops",
+      digest: digest("b"),
+      credentialBundleDigest: digest("0"),
+    }]);
+    expect((target.inspect as Record<string, unknown>).units).toContain("docker.service");
+  });
+
+  it("sorts multiple explicit artifacts deterministically", () => {
+    const { policy } = runInitializer(undefined, ["workload.hermes", "adapter.botmux"]);
+    const changes = targetChanges(localTarget(policy));
+    expect((changes.plugins as Array<Record<string, unknown>>).map((artifact) => artifact.id))
+      .toEqual(["adapter.botmux", "workload.hermes"]);
+  });
+
+  it("rejects unknown artifact IDs and attempts to widen an existing policy", () => {
+    expect(() => runInitializer(undefined, ["workload.unknown"])).toThrow();
+    expect(() => validateArtifacts(["workload.unknown"])).toThrow();
+    expect(validateArtifacts(["workload.hermes", "adapter.botmux"]))
+      .toBe("adapter.botmux\nworkload.hermes\n");
+    const existing = {
+      version: 1,
+      revision: "policy-existing-v1",
+      targets: [{
+        id: "target-local-system",
+        account: "root",
+        displayName: "Local system",
+        inspect: { hostSnapshot: true, processList: true, units: [], readPaths: [] },
+        changes: { writePaths: ["/etc/ops-agent"], units: [], packages: [], plugins: [] },
+      }],
+    };
+    expect(() => runInitializer(existing, ["adapter.botmux"])).toThrow();
+  });
+
+  it("preserves a custom target even when it uses the former broad read roots", () => {
+    const existing = {
+      version: 1,
+      revision: "policy-existing-v1",
+      targets: [{
+        id: "target-custom-system",
+        account: "custom_agent",
+        displayName: "Custom system",
+        inspect: {
+          hostSnapshot: true,
+          processList: true,
+          units: [],
+          readPaths: ["/var/log", "/etc", "/proc"],
+        },
+        changes: { writePaths: ["/etc/ops-agent"], units: [], packages: [], plugins: [] },
+      }],
+    };
+    const { policy } = runInitializer(existing);
+    expect((localTarget(policy).inspect as Record<string, unknown>).readPaths)
+      .toEqual(["/etc", "/proc", "/var/log"]);
   });
 });

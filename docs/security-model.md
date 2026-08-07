@@ -28,6 +28,13 @@
 
 黑名单和 System Prompt 只减少误触，不是权限证明。
 
+`ops_inspect` 的主机快照、进程、unit、journal、文件 metadata/read 都是独立 capability，
+并再次受 root-owned Target policy 限制。fresh core policy 的 `readPaths` 为空；目录级读取
+授权只允许查询后代 metadata，文件正文必须以精确文件路径授权。Linux broker 使用
+`openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` 把 allowlist 校验和
+打开绑定到同一 fd 链。巡检正文会返回当前模型会话，但不会复制进 agent audit；审计只保留
+请求、root audit ID、成功状态和是否返回数据，远端 summary/error 也不进入该审计。
+
 ## Target 与路径权限
 
 Root-owned policy 把 `targetId` 映射为 UID/GID、允许的路径、unit 和 recipe。模型不能提交

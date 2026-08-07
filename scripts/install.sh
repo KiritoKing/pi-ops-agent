@@ -12,7 +12,7 @@ usage() {
   cat <<'EOF'
 Usage:
   curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-    | sudo sh -s -- init [--admin-user USER] [--no-start]
+    | sudo sh -s -- init [--admin-user USER] [--enable-artifact ID ...] [--no-start]
 
   curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
     | sudo sh -s -- join --controller URL --token-file PATH [--no-start]

@@ -20,17 +20,21 @@ CONTROLLER_URL=""
 START_NOW=true
 POLICY_CANDIDATE=""
 POLICY_BACKUP=""
+ENABLED_ARTIFACTS=()
 
 usage() {
   cat <<'EOF'
 Usage:
-  install-release.sh init [--admin-user USER] [--no-start]
+  install-release.sh init [--admin-user USER] [--enable-artifact ID ...] [--no-start]
   install-release.sh join --controller URL --token-file PATH [--no-start]
 
 This is the host-mutating half of the GitHub Release installer. It consumes an
 already verified OPS_AGENT_PAYLOAD_DIR and never downloads or builds source.
 `init` installs the core controller, local endpoint and TUI only. It never
 installs or initializes BotMux or another external adapter.
+Fresh policies authorize no business artifact unless its exact catalog ID is
+passed with --enable-artifact. Existing policies must be edited and reviewed
+explicitly instead of being widened by the installer.
 EOF
 }
 
@@ -47,6 +51,21 @@ case "${MODE}" in
         --admin-user)
           (($# >= 2)) || { printf 'Missing --admin-user value.\n' >&2; exit 2; }
           ADMIN_USER="$2"
+          shift 2
+          ;;
+        --enable-artifact)
+          (($# >= 2)) || { printf 'Missing --enable-artifact value.\n' >&2; exit 2; }
+          [[ "$2" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]] || {
+            printf 'Invalid --enable-artifact ID: %s\n' "$2" >&2
+            exit 2
+          }
+          for enabled_artifact in "${ENABLED_ARTIFACTS[@]}"; do
+            [[ "${enabled_artifact}" != "$2" ]] || {
+              printf 'Artifact enabled more than once: %s\n' "$2" >&2
+              exit 2
+            }
+          done
+          ENABLED_ARTIFACTS+=("$2")
           shift 2
           ;;
         --no-start) START_NOW=false; shift ;;
@@ -95,6 +114,24 @@ fi
 if [[ -z "${PAYLOAD_DIR}" ]] || [[ ! -d "${PAYLOAD_DIR}/app" ]]; then
   printf 'OPS_AGENT_PAYLOAD_DIR does not contain a release payload.\n' >&2
   exit 1
+fi
+if [[ "${MODE}" == init ]] && ((${#ENABLED_ARTIFACTS[@]} > 0)); then
+  if [[ -f "${CONFIG_ROOT}/targets.json" ]]; then
+    printf '%s\n' '--enable-artifact is only valid for a fresh target policy; review existing policy changes explicitly.' >&2
+    exit 2
+  fi
+  preflight_node="${PAYLOAD_DIR}/app/runtime/node"
+  preflight_initializer="${PAYLOAD_DIR}/app/scripts/initialize-target-policy.mjs"
+  preflight_catalog="${PAYLOAD_DIR}/app/catalog/index.json"
+  [[ -x "${preflight_node}" && -f "${preflight_initializer}" && -f "${preflight_catalog}" ]] || {
+    printf 'Verified payload is missing artifact policy preflight files.\n' >&2
+    exit 1
+  }
+  preflight_args=(--catalog-index "${preflight_catalog}" --validate-only)
+  for enabled_artifact in "${ENABLED_ARTIFACTS[@]}"; do
+    preflight_args+=(--enable-artifact "${enabled_artifact}")
+  done
+  "${preflight_node}" "${preflight_initializer}" "${preflight_args[@]}" >/dev/null
 fi
 
 install_native_dependencies() {
@@ -351,10 +388,17 @@ EOF
     printf 'Refusing to overwrite an existing policy candidate: %s\n' "${POLICY_CANDIDATE}" >&2
     return 1
   }
+  local -a policy_initializer_args=(
+    --catalog-index "${release_dir}/catalog/index.json"
+    --policy "${CONFIG_ROOT}/targets.json"
+    --output "${POLICY_CANDIDATE}"
+  )
+  local enabled_artifact
+  for enabled_artifact in "${ENABLED_ARTIFACTS[@]}"; do
+    policy_initializer_args+=(--enable-artifact "${enabled_artifact}")
+  done
   "${release_dir}/runtime/node" "${release_dir}/scripts/initialize-target-policy.mjs" \
-    --catalog-index "${release_dir}/catalog/index.json" \
-    --policy "${CONFIG_ROOT}/targets.json" \
-    --output "${POLICY_CANDIDATE}" >/dev/null
+    "${policy_initializer_args[@]}" >/dev/null
   chown root:"${SERVER_GROUP}" "${POLICY_CANDIDATE}"
   chmod 0640 "${POLICY_CANDIDATE}"
   if [[ ! -f "${CONFIG_ROOT}/servers.json" ]]; then

@@ -54,11 +54,16 @@ sudo systemctl start ops-agent.target
 `/var/log`，不随程序目录切换。升级前必须先校验 Release checksum/attestation、协议
 兼容性和配置迁移计划，再安装新版本并原子切换 `current`。
 
+多机滚动升级必须 controller-first：先升级持有 Harness 和 capability parser 的 `agentd`，
+再升级各 endpoint。旧 controller 会 fail-closed 拒绝包含未知 capability 的 v3 descriptor；
+在没有 capability negotiation 前，不能先把 endpoint 升到发布新 capability 的版本。
+
 Release 安装器先把迁移后的 target policy 写入同目录候选文件，再备份现行
 `/etc/ops-agent/targets.json`，随后才激活 policy 和 `current`。激活后的启动或健康检查失败
 会恢复旧 policy、旧 `current` 并尝试重新拉起旧服务；成功升级会保留
 `/etc/ops-agent/targets.json.backup.<version>.*` 供人工审计。已有 policy 的迁移不会自动
-加入新 artifact、Docker package 或 unit 授权。
+加入新 artifact、Docker package 或 unit 授权，也不会改写自定义读取范围。协议层统一要求
+`file.read` 精确匹配单个授权文件；目录授权只覆盖 metadata 查询。
 
 若启动或冒烟失败，停止 target，将 `current` 原子指回旧版本，执行
 `systemctl daemon-reload` 后重新启动。程序回退不能自动回退数据 schema；存在不可逆迁移

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -15,12 +14,12 @@ import (
 )
 
 type Inspector interface {
-	Inspect(context.Context, protocol.Request) (interface{}, error)
+	Inspect(context.Context, protocol.Request, []string) (interface{}, error)
 }
 
 type OSInspector struct{ Runner CommandRunner }
 
-func (i OSInspector) Inspect(ctx context.Context, request protocol.Request) (interface{}, error) {
+func (i OSInspector) Inspect(ctx context.Context, request protocol.Request, readPaths []string) (interface{}, error) {
 	runner := i.Runner
 	if runner == nil {
 		runner = ExecRunner{}
@@ -35,9 +34,9 @@ func (i OSInspector) Inspect(ctx context.Context, request protocol.Request) (int
 	case protocol.MethodJournalTail:
 		return runCommand(ctx, runner, "journalctl", "--no-pager", "--output=short-iso", "--unit", request.Unit, "--lines", strconv.Itoa(request.Lines))
 	case protocol.MethodFileMetadata:
-		return inspectMetadata(request.Path)
+		return inspectMetadata(request.Path, readPaths)
 	case protocol.MethodFileRead:
-		return inspectFile(request.Path, request.MaxBytes)
+		return inspectFile(request.Path, request.MaxBytes, readPaths)
 	default:
 		return nil, errors.New("unsupported inspection method")
 	}
@@ -77,15 +76,20 @@ func runCommand(ctx context.Context, runner CommandRunner, name string, args ...
 	return map[string]string{"output": output}, nil
 }
 
-func inspectMetadata(path string) (interface{}, error) {
-	info, err := os.Lstat(path)
+func inspectMetadata(path string, readPaths []string) (interface{}, error) {
+	file, err := openInspectionPath(path, readPaths, false)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
 	data := map[string]interface{}{
 		"path": path, "size": info.Size(), "mode": info.Mode().String(),
 		"modifiedAt": info.ModTime().UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
-		"regular":    info.Mode().IsRegular(), "symlink": info.Mode()&os.ModeSymlink != 0,
+		"regular":    info.Mode().IsRegular(), "symlink": false,
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		data["uid"], data["gid"] = stat.Uid, stat.Gid
@@ -93,8 +97,8 @@ func inspectMetadata(path string) (interface{}, error) {
 	return data, nil
 }
 
-func inspectFile(path string, maximum int) (interface{}, error) {
-	file, err := os.Open(path)
+func inspectFile(path string, maximum int, readPaths []string) (interface{}, error) {
+	file, err := openInspectionPath(path, readPaths, true)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +129,13 @@ func (s *Service) inspect(ctx context.Context, peer peercred.Credential, request
 	if s.Inspector == nil {
 		return denied(request, "root-helper inspection is not configured")
 	}
-	data, err := s.Inspector.Inspect(ctx, request)
+	var readPaths []string
+	if s.Policy != nil {
+		if target, ok := s.Policy.Target(request.TargetID); ok {
+			readPaths = append(readPaths, target.Inspect.ReadPaths...)
+		}
+	}
+	data, err := s.Inspector.Inspect(ctx, request, readPaths)
 	if err != nil {
 		return failed(request, fmt.Errorf("inspect host: %w", err))
 	}

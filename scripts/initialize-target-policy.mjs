@@ -19,18 +19,32 @@ function fail(message) {
 
 const args = process.argv.slice(2);
 const options = new Map();
+const enabledArtifactIds = [];
+let validateOnly = false;
 const supportedOptions = new Set(["--catalog-index", "--policy", "--output"]);
-for (let index = 0; index < args.length; index += 2) {
+for (let index = 0; index < args.length; index += 1) {
   const key = args[index];
+  if (key === "--validate-only") {
+    if (validateOnly) fail("--validate-only was provided more than once.");
+    validateOnly = true;
+    continue;
+  }
   const value = args[index + 1];
-  if (!key?.startsWith("--") || !supportedOptions.has(key) || value === undefined || options.has(key)) fail("Invalid target policy initializer arguments.");
-  options.set(key, value);
+  if (!key?.startsWith("--") || value === undefined || value.startsWith("--")) fail("Invalid target policy initializer arguments.");
+  if (key === "--enable-artifact") {
+    if (enabledArtifactIds.includes(value)) fail(`Artifact ${value} was enabled more than once.`);
+    enabledArtifactIds.push(value);
+  } else {
+    if (!supportedOptions.has(key) || options.has(key)) fail("Invalid target policy initializer arguments.");
+    options.set(key, value);
+  }
+  index += 1;
 }
 const catalogPath = options.get("--catalog-index");
 const policyPath = options.get("--policy");
 const outputPath = options.get("--output") ?? policyPath;
-if (!catalogPath || !policyPath || !outputPath || resolve(catalogPath) !== catalogPath || resolve(policyPath) !== policyPath || resolve(outputPath) !== outputPath) {
-  fail("Usage: initialize-target-policy.mjs --catalog-index ABSOLUTE_PATH --policy ABSOLUTE_PATH [--output ABSOLUTE_PATH]");
+if (!catalogPath || resolve(catalogPath) !== catalogPath || (!validateOnly && (!policyPath || !outputPath || resolve(policyPath) !== policyPath || resolve(outputPath) !== outputPath))) {
+  fail("Usage: initialize-target-policy.mjs --catalog-index ABSOLUTE_PATH [--validate-only] [--policy ABSOLUTE_PATH] [--output ABSOLUTE_PATH] [--enable-artifact ID ...]");
 }
 
 function parseObject(path, label) {
@@ -59,6 +73,18 @@ for (const artifact of catalog.artifacts) {
 }
 
 const zeroDigest = `sha256:${"0".repeat(64)}`;
+const enabledArtifacts = enabledArtifactIds.map((id) => {
+  const artifact = artifactById.get(id);
+  if (!artifact) fail(`Enabled artifact ${id} is not present in the trusted catalog.`);
+  return artifact;
+});
+if (validateOnly) {
+  process.stdout.write(`${enabledArtifactIds.sort().join("\n")}${enabledArtifactIds.length > 0 ? "\n" : ""}`);
+  process.exit(0);
+}
+
+const safeDefaultReadPaths = [];
+
 function policyArtifact(artifact, credentialBundleDigest) {
   const result = {
     id: artifact.id,
@@ -72,11 +98,11 @@ function policyArtifact(artifact, credentialBundleDigest) {
 }
 
 function freshPolicy() {
-  const artifacts = catalog.artifacts.map((artifact) => policyArtifact(artifact));
-  const hasDockerWorkload = catalog.artifacts.some((artifact) => artifact.kind === "managed-workload");
+  const artifacts = enabledArtifacts.map((artifact) => policyArtifact(artifact));
+  const hasDockerWorkload = artifacts.some((artifact) => artifact.kind === "managed-workload");
   return {
     version: 1,
-    revision: "policy-initializing-v2",
+    revision: "policy-initializing-v3",
     targets: [{
       id: "target-local-system",
       account: "root",
@@ -85,7 +111,7 @@ function freshPolicy() {
         hostSnapshot: true,
         processList: true,
         units: hasDockerWorkload ? ["docker.service", "ops-agent-server.service", "ops-agentd.service"] : ["ops-agent-server.service", "ops-agentd.service"],
-        readPaths: ["/etc", "/proc", "/var/log"],
+        readPaths: safeDefaultReadPaths,
       },
       changes: {
         writePaths: ["/etc/ops-agent"],
@@ -126,7 +152,11 @@ function migratePolicy(policy) {
   return policy;
 }
 
-const policy = existsSync(policyPath) ? migratePolicy(parseObject(policyPath, "Existing target policy")) : freshPolicy();
+const policyExists = existsSync(policyPath);
+if (policyExists && enabledArtifactIds.length > 0) {
+  fail("--enable-artifact is only valid while creating a fresh target policy; review existing policy changes explicitly.");
+}
+const policy = policyExists ? migratePolicy(parseObject(policyPath, "Existing target policy")) : freshPolicy();
 for (const target of policy.targets) {
   target.changes.plugins.sort((left, right) => `${left.kind}\0${left.id}`.localeCompare(`${right.kind}\0${right.id}`, "en"));
   for (const key of ["units", "packages", "writePaths"]) {

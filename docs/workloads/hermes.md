@@ -6,6 +6,17 @@
 
 ## 安装与凭据
 
+fresh 主机应在模型外显式授权这个用例；裸 `init` 保持 core-only：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init --enable-artifact workload.hermes
+```
+
+已有 policy 不会被安装器扩权；管理员需要从当前 Release catalog 复制并复核完整
+`id/kind/version/publisher/digest`，以及 managed-workload 所需的 Docker package/unit 后再
+独立修改 root-owned policy。
+
 先在 TUI 要求安装 `workload.hermes`，并以精确 `/approve <changeRef>` 完成插件安装。
 随后准备一个 root-only 输入文件，内容只有以下三个字段：
 

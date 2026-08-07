@@ -2,6 +2,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { Check } from "typebox/value";
+import { AuditLog } from "../../src/agentd/audit.js";
 import { MachineContextStore } from "../../src/agentd/machine-context.js";
 import type { OpsServerClient } from "../../src/agentd/ops-server-client.js";
 import {
@@ -10,6 +12,7 @@ import {
   type ServerRegistration,
 } from "../../src/agentd/server-registry.js";
 import { SessionRegistry } from "../../src/agentd/session-registry.js";
+import { createOpsTools } from "../../src/agentd/tools.js";
 import {
   prependTrustedWorkspaceContext,
   trustedWorkspaceContext,
@@ -25,8 +28,10 @@ import {
   parseCapabilityDescriptor,
   parseTargetDescriptors,
   type CapabilityDescriptor,
+  type InspectionRequest,
   type RemoteResponse,
 } from "../../src/shared/server-protocol.js";
+import type { AgentConfig } from "../../src/shared/config.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -54,6 +59,7 @@ function registration(): ServerRegistration {
 }
 
 class FakeOpsServerClient implements OpsServerClient {
+  readonly inspectionRequests: InspectionRequest[] = [];
   readonly identityValue = {
     serverId: parseServerId("server-12345678"),
     machineId: parseMachineId("machine-12345678"),
@@ -70,7 +76,16 @@ class FakeOpsServerClient implements OpsServerClient {
     return await Promise.resolve({
       revision: "capability-1234",
       policyRevision: "policy-1234",
-      operations: ["host.snapshot", "change.prepare", "change.status"],
+      operations: [
+        "host.snapshot",
+        "process.list",
+        "systemd.unit",
+        "journal.tail",
+        "file.metadata",
+        "file.read",
+        "change.prepare",
+        "change.status",
+      ],
     });
   }
 
@@ -95,8 +110,17 @@ class FakeOpsServerClient implements OpsServerClient {
     return await Promise.resolve([]);
   }
 
-  async inspect(): Promise<RemoteResponse> {
-    return await Promise.resolve({ version: 1, requestId: "request-1234", ok: true });
+  async inspect(request: InspectionRequest): Promise<RemoteResponse> {
+    this.inspectionRequests.push(request);
+    return await Promise.resolve({
+      version: 1,
+      requestId: request.requestId,
+      ok: true,
+      auditId: "audit-12345678",
+      summary: "inspection-summary-secret-value",
+      error: "inspection-error-secret-value",
+      data: { method: request.method, content: "inspection-secret-value" },
+    });
   }
 
   async prepareChange(): Promise<RemoteResponse> {
@@ -110,6 +134,29 @@ class FakeOpsServerClient implements OpsServerClient {
   async changeAction(): Promise<RemoteResponse> {
     return await Promise.resolve({ version: 1, requestId: "request-1234", ok: true });
   }
+}
+
+function testConfig(root: string): AgentConfig {
+  return {
+    socketPath: join(root, "agentd.sock"),
+    rootHelperSocket: join(root, "root-helper.sock"),
+    systemdHelperSocket: join(root, "systemd-helper.sock"),
+    stateDir: root,
+    workspaceRoot: join(root, "workspaces"),
+    sessionDir: join(root, "sessions"),
+    sessionRegistryPath: join(root, "sessions.json"),
+    serverRegistryPath: join(root, "servers.json"),
+    machineContextDir: join(root, "machines"),
+    agentDir: join(root, "agent"),
+    modelsPath: join(root, "models.json"),
+    provider: "deepseek",
+    model: "deepseek-test",
+    apiKeyCredential: "deepseek_api_key",
+    auditPath: join(root, "audit.jsonl"),
+    bwrapPath: "/usr/bin/bwrap",
+    bashPath: "/bin/bash",
+    sandboxEnabled: false,
+  };
 }
 
 describe("controller registries", () => {
@@ -163,6 +210,69 @@ describe("controller registries", () => {
   });
 });
 
+describe("ops inspection tool", () => {
+  it("maps every advertised read-only operation to the exact remote request", async () => {
+    const root = await temporaryDirectory();
+    const config = testConfig(root);
+    const servers = new ServerRegistry(config.serverRegistryPath);
+    const contexts = new MachineContextStore(config.machineContextDir);
+    const sessions = new SessionRegistry(config.sessionRegistryPath, config.workspaceRoot);
+    const audit = new AuditLog(config.auditPath);
+    await Promise.all([servers.initialize(), contexts.initialize(), sessions.initialize(), audit.initialize()]);
+    await servers.register(registration());
+    const client = new FakeOpsServerClient();
+    const sessionId = parseSessionId("session-inspect-1234");
+    const tools = createOpsTools(config, audit, {
+      session: async () => await sessions.open(sessionId),
+      bind: async (machineId, targetId) =>
+        await sessions.bind(sessionId, machineId, targetId, contexts),
+      servers,
+      contexts,
+      clientFactory: async () => await Promise.resolve(client),
+    });
+    const inspect = tools.find((tool) => tool.name === "ops_inspect");
+    if (!inspect) throw new Error("ops_inspect tool is missing");
+    const scope = { machineId: "machine-12345678", targetId: "target-12345678" };
+    expect(Check(inspect.parameters, { ...scope, operation: "systemd_unit", unit: "ops-agentd.service", lines: 5 }))
+      .toBe(false);
+    expect(Check(inspect.parameters, { ...scope, operation: "file_metadata", path: "/etc/os-release", maxBytes: 10 }))
+      .toBe(false);
+    expect(Check(inspect.parameters, { ...scope, operation: "file_read", path: "/etc/os-release", maxBytes: 0 }))
+      .toBe(false);
+    const invocations = [
+      { ...scope, operation: "host_snapshot" },
+      { ...scope, operation: "process_list" },
+      { ...scope, operation: "systemd_unit", unit: "ops-agentd.service" },
+      { ...scope, operation: "journal_tail", unit: "ops-agentd.service", lines: 25 },
+      { ...scope, operation: "file_metadata", path: "/etc/os-release" },
+      { ...scope, operation: "file_read", path: "/etc/os-release", maxBytes: 4096 },
+    ];
+    for (const [index, invocation] of invocations.entries()) {
+      await inspect.execute(`inspect-${index}`, invocation, undefined, undefined, undefined as never);
+    }
+
+    expect(client.inspectionRequests).toMatchObject([
+        { version: 1, ...scope, method: "host.snapshot" },
+        { version: 1, ...scope, method: "process.list" },
+        { version: 1, ...scope, method: "systemd.unit", unit: "ops-agentd.service" },
+        { version: 1, ...scope, method: "journal.tail", unit: "ops-agentd.service", lines: 25 },
+        { version: 1, ...scope, method: "file.metadata", path: "/etc/os-release" },
+        { version: 1, ...scope, method: "file.read", path: "/etc/os-release", maxBytes: 4096 },
+      ]);
+    expect(client.inspectionRequests.map((request) => Object.keys(request).sort())).toEqual([
+      ["deadline", "machineId", "method", "requestId", "targetId", "version"],
+      ["deadline", "machineId", "method", "requestId", "targetId", "version"],
+      ["deadline", "machineId", "method", "requestId", "targetId", "unit", "version"],
+      ["deadline", "lines", "machineId", "method", "requestId", "targetId", "unit", "version"],
+      ["deadline", "machineId", "method", "path", "requestId", "targetId", "version"],
+      ["deadline", "machineId", "maxBytes", "method", "path", "requestId", "targetId", "version"],
+    ]);
+    expect(await readFile(config.auditPath, "utf8")).not.toContain("inspection-secret-value");
+    expect(await readFile(config.auditPath, "utf8")).not.toContain("inspection-summary-secret-value");
+    expect(await readFile(config.auditPath, "utf8")).not.toContain("inspection-error-secret-value");
+  });
+});
+
 describe("trusted workspace context", () => {
   it("is system-prompt-first, bounded, resumable, and refreshes binding revisions", async () => {
     const root = await temporaryDirectory();
@@ -199,6 +309,28 @@ describe("trusted workspace context", () => {
 });
 
 describe("remote protocol validation", () => {
+  it("accepts the complete v3 read-only capability set", () => {
+    expect(parseCapabilityDescriptor({
+      revision: "capability-remote-mvp-v3",
+      policyRevision: "policy-1234",
+      operations: [
+        "host.snapshot",
+        "process.list",
+        "systemd.unit",
+        "journal.tail",
+        "file.metadata",
+        "file.read",
+      ],
+    }).operations).toEqual([
+      "host.snapshot",
+      "process.list",
+      "systemd.unit",
+      "journal.tail",
+      "file.metadata",
+      "file.read",
+    ]);
+  });
+
   it("rejects server-defined capabilities outside the harness catalog", () => {
     expect(() => parseCapabilityDescriptor({
       revision: "capability-1234",

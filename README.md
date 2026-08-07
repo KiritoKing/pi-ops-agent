@@ -81,6 +81,19 @@ GitHub Raw 脚本只做平台探测、Release 下载和完整性校验；版本�
 ops-agent tui
 ```
 
+裸 `init` 只授权核心运维能力：主机快照、进程、核心 systemd unit/journal、受控变更准备和
+状态查询；业务 artifact、Docker package/unit 和文件读取路径均默认为空。首次安装时可由
+管理员在模型外按 catalog ID 精确授权所需扩展，例如：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init --enable-artifact workload.hermes
+```
+
+该参数只把 Release catalog 中匹配 ID 的完整 publisher/version/digest 写入 policy，不能由
+调用者替换身份。只有 `managed-workload` 会同时加入通用 Docker 前置权限；已有 policy 不会
+被安装器借升级静默扩权。
+
 业务能力使用与 Adapter 相同的受信插件目录、严格 manifest、摘要校验和原子安装机制。
 `managed-workload` 插件只声明受限 OCI 工作负载；不能携带 root 代码、宿主命令或原始
 Docker 参数。模型只能准备精确绑定 `id/kind/version/publisher/digest` 的
@@ -96,6 +109,9 @@ BotMux 本体是外部依赖，不由 `init` 或插件包暗中联网安装。�
 ```text
 帮我安装 BotMux adapter
 ```
+
+这要求 fresh init 时已显式传入 `--enable-artifact adapter.botmux`，或管理员已在现有
+Target policy 中复核并加入 catalog 所固定的完整 artifact identity。
 
 Agent 会查询可信插件目录、说明权限和包摘要、准备类型化安装计划，并等待管理员
 `/approve <changeRef>`；Agent 自己不能审批或执行任意安装脚本。提交完成后，在同一个

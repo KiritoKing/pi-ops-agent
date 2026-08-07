@@ -19,8 +19,11 @@ import { requireExactRecord } from "./strict.js";
 
 export const REMOTE_CAPABILITIES = [
   "host.snapshot",
+  "process.list",
   "systemd.unit",
   "journal.tail",
+  "file.metadata",
+  "file.read",
   "change.prepare",
   "change.status",
   "plugin.install",
@@ -80,7 +83,7 @@ export type InspectionRequest =
       deadline: string;
       machineId: MachineId;
       targetId: TargetId;
-      method: "host.snapshot";
+      method: "host.snapshot" | "process.list";
     }
   | {
       version: 1;
@@ -88,9 +91,37 @@ export type InspectionRequest =
       deadline: string;
       machineId: MachineId;
       targetId: TargetId;
-      method: "systemd.unit" | "journal.tail";
+      method: "systemd.unit";
+      unit: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "journal.tail";
       unit: string;
       lines?: number;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "file.metadata";
+      path: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "file.read";
+      path: string;
+      maxBytes?: number;
     };
 
 export interface PrepareChangeRequest {

@@ -18,6 +18,21 @@ curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/script
   | sudo sh -s -- init
 ```
 
+这个默认命令创建 core-only policy：不会授权任何业务 artifact、Docker package/unit 或
+文件读取路径。需要扩展时，fresh init 由管理员在模型外按 catalog ID 精确选择，可重复传入：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init \
+      --enable-artifact adapter.botmux \
+      --enable-artifact workload.hermes
+```
+
+ID 必须在该 Release 的受信 catalog 中唯一存在；版本、publisher、digest 取自 catalog，
+不能通过参数替换。只有显式选中的 `managed-workload` 才会带来 Docker 前置权限。已有
+`targets.json` 时安装器拒绝该参数，避免把升级伪装成授权操作；管理员须独立审阅并修改现有
+root-owned policy。
+
 通过 `sudo` 运行时，`SUDO_USER` 成为首个本地管理员；root 直接执行时必须显式指定：
 
 ```bash
@@ -36,6 +51,7 @@ credential，启动服务并运行健康检查。需要先落盘、稍后再配�
 - 创建 `ops-agent` 非特权账户、运行目录、配置和 systemd unit；
 - 初始化空的机器与 Session 注册表；
 - 安装并启动核心服务，执行只读冒烟；
+- 默认仅授权主机快照、进程和核心 unit/journal；文件 `readPaths` 与业务 artifact 为空；
 - **不安装、不初始化、不配置 BotMux 或任何外部 Adapter**；
 - **不读取 Lark/BotMux credential，也不创建 BotMux 服务账户**。
 
@@ -138,8 +154,9 @@ bwrap --unshare-all --die-with-parent \
 
 ## 通过 Agent 部署 managed-workload
 
-`init` 把 Release 内第一方插件的完整 identity/digest 写入本机 Target policy，但不会解包
-插件、安装 Docker、下载业务镜像或创建业务 credential。模型先查询 artifact catalog，
+仅当 fresh init 显式传入 `--enable-artifact ID` 时，安装器才把该 Release artifact 的完整
+identity/digest 写入本机 Target policy；它仍不会解包插件、安装 Docker、下载业务镜像或
+创建业务 credential。模型先查询该 Target 已授权的 artifact catalog，
 准备 `plugin.install` 并等待模型外审批。安装后的业务专用 `prepare-credentials.mjs` 只在
 管理员上下文中读取显式 FD，输出通用 bundle；root 侧统一脚本再校验 manifest slot、绑定
 bundle digest 与 policy revision，并重启读取 policy 的 endpoint 服务：
@@ -157,10 +174,11 @@ prepare-credentials.mjs --input-fd N
 这是通用插件契约，不是业务镜像特例。Hermes 的具体输入、
 WebUI/TUI/CLI 与重启验收见[第一方 Hermes 工作负载指南](workloads/hermes.md)。
 
-上述自动授权只适用于首次生成 policy。升级已有安装时，安装器只把 v0.1 的字符串插件项
-收窄成 catalog 中同 ID 的完整 identity；不会因为新 Release 增加了 artifact、managed
-workload、`docker.io` 或 `docker.service` 就扩大已有 allowlist。新增授权必须由管理员显式
-修改并复核 policy。
+上述显式授权只适用于首次生成 policy。升级已有安装时，安装器只把 v0.1 的字符串插件项
+收窄成 catalog 中同 ID 的完整 identity；不会改写管理员的读取范围，也不会因为新 Release
+增加了 artifact、managed workload、`docker.io` 或 `docker.service` 就扩大已有 allowlist。
+文件 metadata 可以在授权目录下查询，但 `file.read` 必须精确列出目标文件且 Linux broker
+通过 `openat2` 禁止 symlink/magic-link 和目录逃逸。新增授权必须由管理员显式修改并复核 policy。
 
 ## 通过 Agent 安装 Adapter
 
@@ -174,6 +192,8 @@ Agent 通过固定插件工具完成 catalog 查询、manifest/兼容性检查�
 查询，并向用户解释 publisher、版本、digest 和 root 文件变更。插件包不包含 BotMux
 本体，也不会让 `agentd-root-broker` 执行 npm 或联网脚本；先按
 [BotMux 官方安装说明](https://deepcoldy.github.io/botmux/)为当前管理员安装 `botmux`。
+该 Target 还必须已在 fresh init 中通过 `--enable-artifact adapter.botmux` 获得授权，或由
+管理员在现有 root-owned policy 中独立加入并复核精确 artifact identity。
 
 Adapter 文件安装是一项高权限 change：Agent 只能 prepare，真实管理员必须在 TUI 中
 执行 `/approve <changeRef>`。`agentd-root-broker` 只验证、解包固定 digest，并原子维护插件

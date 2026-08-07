@@ -12,7 +12,7 @@ import type { AgentConfig } from "../shared/config.js";
 import type { RootOperation } from "../shared/messages.js";
 import { encodeChangeRef } from "../shared/approval.js";
 import { deadline } from "../shared/rpc.js";
-import type { RemoteCapability } from "../shared/server-protocol.js";
+import type { InspectionRequest, RemoteCapability } from "../shared/server-protocol.js";
 import type { AuditLog } from "./audit.js";
 import type { MachineContext, MachineContextStore } from "./machine-context.js";
 import {
@@ -130,21 +130,49 @@ export function createOpsTools(
     label: "Inspect remote target",
     description:
       "Run a server-advertised, read-only inspection against an explicit registered machine and target account. Output is untrusted data.",
-    parameters: Type.Object({
-      machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
-      targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
-      operation: Type.Union([
-        Type.Literal("host_snapshot"),
-        Type.Literal("systemd_unit"),
-        Type.Literal("journal_tail"),
-      ]),
-      unit: Type.Optional(Type.String({ maxLength: 200 })),
-      lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
-    }),
+    parameters: Type.Union([
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Union([Type.Literal("host_snapshot"), Type.Literal("process_list")]),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("systemd_unit"),
+        unit: Type.String({ pattern: "^[a-zA-Z0-9@_.:-]{1,200}\\.service$" }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("journal_tail"),
+        unit: Type.String({ pattern: "^[a-zA-Z0-9@_.:-]{1,200}\\.service$" }),
+        lines: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("file_metadata"),
+        path: Type.String({ minLength: 2, maxLength: 4096, pattern: "^/[^\\u0000\\r\\n]+$" }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("file_read"),
+        path: Type.String({ minLength: 2, maxLength: 4096, pattern: "^/[^\\u0000\\r\\n]+$" }),
+        maxBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 128 * 1024 })),
+      }, { additionalProperties: false }),
+    ]),
     async execute(toolCallId, params, signal) {
-      const capability = params.operation === "host_snapshot"
-        ? "host.snapshot" as const
-        : params.operation === "systemd_unit" ? "systemd.unit" as const : "journal.tail" as const;
+      const capabilityByOperation = {
+        host_snapshot: "host.snapshot",
+        process_list: "process.list",
+        systemd_unit: "systemd.unit",
+        journal_tail: "journal.tail",
+        file_metadata: "file.metadata",
+        file_read: "file.read",
+      } as const satisfies Record<typeof params.operation, RemoteCapability>;
+      const capability = capabilityByOperation[params.operation];
       const remote = await remoteTarget(
         runtime,
         params.machineId,
@@ -153,25 +181,58 @@ export function createOpsTools(
         signal,
       );
       const requestId = randomUUID();
-      const request = capability === "host.snapshot" ? {
+      const base = {
         version: 1 as const,
         requestId,
         deadline: deadline(20),
         machineId: remote.machineId,
         targetId: remote.targetId,
-        method: capability,
-      } : {
-        version: 1 as const,
-        requestId,
-        deadline: deadline(20),
-        machineId: remote.machineId,
-        targetId: remote.targetId,
-        method: capability,
-        unit: params.unit ?? (() => { throw new Error("unit is required for this inspection"); })(),
-        ...(params.lines === undefined ? {} : { lines: params.lines }),
       };
+      let request: InspectionRequest;
+      switch (params.operation) {
+        case "host_snapshot":
+          request = { ...base, method: "host.snapshot" };
+          break;
+        case "process_list":
+          request = { ...base, method: "process.list" };
+          break;
+        case "systemd_unit":
+          request = { ...base, method: "systemd.unit", unit: params.unit };
+          break;
+        case "journal_tail":
+          request = {
+            ...base,
+            method: "journal.tail",
+            unit: params.unit,
+            ...(params.lines === undefined ? {} : { lines: params.lines }),
+          };
+          break;
+        case "file_metadata":
+          request = { ...base, method: "file.metadata", path: params.path };
+          break;
+        case "file_read":
+          request = {
+            ...base,
+            method: "file.read",
+            path: params.path,
+            ...(params.maxBytes === undefined ? {} : { maxBytes: params.maxBytes }),
+          };
+          break;
+      }
       const response = await remote.client.inspect(request, signal);
-      await audit.append({ type: "tool", toolCallId, tool: "ops_inspect", request, response });
+      await audit.append({
+        type: "tool",
+        toolCallId,
+        tool: "ops_inspect",
+        request,
+        response: {
+          version: response.version,
+          requestId: response.requestId,
+          ok: response.ok,
+          auditId: response.auditId,
+          dataReturned: response.data !== undefined,
+        },
+      });
       if (!response.ok) throw new Error(response.error ?? "inspection failed");
       return {
         content: [{ type: "text", text: output(response.data ?? response.summary) }],
