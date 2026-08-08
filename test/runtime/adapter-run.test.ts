@@ -65,6 +65,10 @@ function statusDescriptor(adapterId: string): string {
   });
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 async function fixture(adapterId = "adapter.example"): Promise<{
   plugin: ActiveRuntimeSourcePlugin;
   dependencies: AdapterRunnerDependencies;
@@ -79,6 +83,7 @@ async function fixture(adapterId = "adapter.example"): Promise<{
   const snapshot = join(root, "snapshots", "sha256", digest.slice("sha256:".length));
   await mkdir(snapshot, { recursive: true, mode: 0o700 });
   const entrypoint = join(snapshot, "adapter.mjs");
+  const nodePath = join(root, "node");
   const clientPath = join(root, "client.mjs");
   const bwrapPath = join(root, "bwrap");
   await writeFile(entrypoint, [
@@ -90,6 +95,15 @@ async function fixture(adapterId = "adapter.example"): Promise<{
     "",
   ].join("\n"), { mode: 0o500 });
   await chmod(entrypoint, 0o500);
+  // setup-node may install its binary under a different owner than the test
+  // runner. Keep the fixture's trust root internally consistent while the
+  // production dependency continues to require root-owned fixed runtime files.
+  await writeFile(nodePath, [
+    "#!/bin/sh",
+    `exec ${shellSingleQuote(process.execPath)} "$@"`,
+    "",
+  ].join("\n"), { mode: 0o500 });
+  await chmod(nodePath, 0o500);
   await writeFile(clientPath, "// fixed compiled client fixture\n", { mode: 0o400 });
   await chmod(clientPath, 0o400);
   await writeFile(bwrapPath, [
@@ -141,7 +155,7 @@ async function fixture(adapterId = "adapter.example"): Promise<{
     pluginRegistryPath: root,
     pluginCtlPath: "/unused/agentd-pluginctl",
     bwrapPath,
-    nodePath: process.execPath,
+    nodePath,
     clientPath,
     expectedOwnerUid: ownerUid,
     effectiveUid: Math.max(1, ownerUid),
@@ -254,7 +268,7 @@ describe("source adapter runner", () => {
   it("launches adapter.tui only as a declarative profile through the fixed compiled client", async () => {
     const { plugin, dependencies } = await tuiFixture();
     const launch = await prepareAdapterLaunch(plugin.pluginId, ["--version"], dependencies);
-    expect(launch.executable).toBe(await realpath(process.execPath));
+    expect(launch.executable).toBe(await realpath(dependencies.nodePath));
     expect(launch.arguments).toEqual([await realpath(dependencies.clientPath), "--version"]);
     expect(launch.workingDirectory).toBe("/");
     expect(launch.descriptor).toEqual(JSON.parse(tuiDescriptor()));
