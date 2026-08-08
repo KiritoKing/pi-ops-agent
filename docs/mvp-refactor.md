@@ -38,7 +38,7 @@ capabilities 和 requested scopes 的持久 grant；每次安装/更新都在模
 Plugin grant 不等于 root 免审。Root-owned Target policy 的资源 allowlist 决定操作能否 prepare，
 只有独立、显式、精确的 `authorization.standingScopes` 才允许普通 operation 在 prepare 内消费
 既有授权；legacy policy、字段缺失或空数组全部逐次人工审批。当前 package/artifact 安装、
-package/artifact 安装、`plugin.register`、`plugin.install`、`workload.deploy`、manual root capsule 与 rollback 永不 standing。
+`plugin.register`、`plugin.install`、`workload.deploy`、manual root capsule 与 rollback 永不 standing。
 有效权限始终取 plugin grant、Target 资源 policy 与 standing scope/本次人工 grant 的交集。
 通用 `file.write`/`service.action` 由 Core 根据真实 `workload.base` caller 注入摘要；要 standing
 还必须由 Target 的 `authorization.baseWorkloadDigest` 精确绑定该摘要，更新后自动失效。
@@ -126,6 +126,7 @@ Machine/Target policy、root peer UID、approval grant 和 recovery state。也�
 | 审计包含无限 stderr/secret | transport stderr/response 有界，错误脱敏；仍禁止把 secret 放入 `ops_bash` | Core/Adapter |
 | sudoers/wrapper 参数匹配过宽 | wrapper 必须固定 executable/argv；无参 sudoers command spec 使用 `""`；root 不执行 user-writable CLI | 部署/业务 Workload |
 | Go/Release 在 LXC 或跨架构失效 | `CGO_ENABLED=0 -trimpath`，amd64/arm64；排除 `._*`；cache 异常时用干净 GOCACHE 重建 | Release |
+| 协议测试时钟与真实 `context` deadline 跨日漂移 | Parse 与 dispatch 使用同一 server clock 计算 `(0, 10m]` 剩余窗口，再转为 monotonic timeout；过期/回退扩窗在 broker 前拒绝 | HTTPS/Unix transport；防止 admission 槽过早释放 |
 | root watchdog 权限过大 | same-UID guardian 已替代旧 `ops-systemd-helper`，release/target 不再打包或启动旧 binary | Core migration |
 
 `ops_bash` 的 Agent audit 当前仍记录 command/result，因此“错误脱敏”不能被扩张成“所有模型

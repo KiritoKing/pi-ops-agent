@@ -306,7 +306,9 @@ descriptor context，Source 不能替换正式 Client 所见 descriptor。不能
 - Approver role 可 status 与提交签名 action，不可运行普通 inspect/prepare；
 - Admin role 是模型外恢复/管理 identity，可访问两组 endpoint，但 change action 仍必须携带有效
   ApprovalGrant；标准 TUI 不生成或持有 admin 私钥；
-- Server 严格拒绝未知 JSON 字段，限制 header/body/response、deadline 和请求超时；
+- Server 严格拒绝未知 JSON 字段，限制 header/body/response、deadline 和请求超时；协议校验与
+  backend/handler dispatch 必须使用同一 server clock 计算剩余时长，再转成有界 monotonic timeout，
+  已过期或时钟回退导致窗口超过十分钟时均在进入 broker 前 fail closed；
 - Server 将已认证 role 与固定 server identity 写入 Unix RPC，broker 通过 `SO_PEERCRED` 再校验
   本机 server UID；
 - broker 是 mutation 与终态的权威，网络断线后只能查询原 change，不能重发 mutation。

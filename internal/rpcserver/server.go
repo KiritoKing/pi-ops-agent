@@ -21,6 +21,8 @@ type Handler interface {
 	Handle(context.Context, peercred.Credential, protocol.Request) protocol.Response
 }
 
+const maxRequestDispatchTimeout = 10 * time.Minute
+
 type Server struct {
 	Path            string
 	Mode            os.FileMode
@@ -152,7 +154,18 @@ func (s *Server) serveConnection(parent context.Context, connection *net.UnixCon
 			release()
 			continue
 		}
-		ctx, cancel := context.WithDeadline(parent, request.Deadline)
+		ctx, cancel, contextErr := boundedRequestContext(parent, request.Deadline, s.now())
+		if contextErr != nil {
+			response := protocol.Response{
+				Version: protocol.Version, RequestID: request.RequestID, Error: contextErr.Error(),
+			}
+			if writeErr := writeResponse(connection, response); writeErr != nil {
+				release()
+				return
+			}
+			release()
+			continue
+		}
 		response := s.Handler.Handle(ctx, credential, request)
 		cancel()
 		if response.Version == 0 {
@@ -167,6 +180,18 @@ func (s *Server) serveConnection(parent context.Context, connection *net.UnixCon
 		}
 		release()
 	}
+}
+
+func boundedRequestContext(parent context.Context, deadline, now time.Time) (context.Context, context.CancelFunc, error) {
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return nil, nil, errors.New("request deadline expired before handler dispatch")
+	}
+	if remaining > maxRequestDispatchTimeout {
+		return nil, nil, errors.New("request deadline exceeds the bounded handler dispatch window")
+	}
+	ctx, cancel := context.WithTimeout(parent, remaining)
+	return ctx, cancel, nil
 }
 
 func (s *Server) now() time.Time {

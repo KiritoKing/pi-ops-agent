@@ -16,7 +16,10 @@ import (
 	"github.com/KiritoKing/pi-ops-agent/internal/targetpolicy"
 )
 
-const maxBodyBytes = protocol.MaxFrameBytes
+const (
+	maxBodyBytes              = protocol.MaxFrameBytes
+	maxRequestDispatchTimeout = 10 * time.Minute
+)
 
 type Server struct {
 	Identity        Identity
@@ -412,7 +415,11 @@ func (s *Server) forward(writer http.ResponseWriter, ctx context.Context, wire r
 		writeError(writer, http.StatusConflict, "PVE capability is not enabled on this server")
 		return
 	}
-	deadlineCtx, cancel := context.WithDeadline(ctx, request.Deadline)
+	deadlineCtx, cancel, err := boundedRequestContext(ctx, request.Deadline, s.now())
+	if err != nil {
+		writeError(writer, http.StatusRequestTimeout, err.Error())
+		return
+	}
 	defer cancel()
 	response, err := s.Backend.Do(deadlineCtx, request)
 	if err != nil {
@@ -426,6 +433,18 @@ func (s *Server) forward(writer http.ResponseWriter, ctx context.Context, wire r
 	}
 	status := http.StatusOK
 	writeJSON(writer, status, public)
+}
+
+func boundedRequestContext(parent context.Context, deadline, now time.Time) (context.Context, context.CancelFunc, error) {
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return nil, nil, errors.New("request deadline expired before backend dispatch")
+	}
+	if remaining > maxRequestDispatchTimeout {
+		return nil, nil, errors.New("request deadline exceeds the bounded backend dispatch window")
+	}
+	ctx, cancel := context.WithTimeout(parent, remaining)
+	return ctx, cancel, nil
 }
 
 func (s *Server) validateEnvelope(wire rootWire) error {

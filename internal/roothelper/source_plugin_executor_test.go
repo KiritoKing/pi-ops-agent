@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,26 @@ func writeSourcePlugin(t *testing.T, root, version, body string) string {
 func writableRegistryTestRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
+	// The production registry is pre-provisioned as a stable owner/reader-group
+	// directory. On Linux, setgid is part of that boundary so every snapshot and
+	// registration directory inherits the same reader group. TempDir starts as
+	// 0700 without setgid, so make the fixture match the installed registry
+	// instead of weakening pluginregistry.Open's integrity checks.
+	mode := os.FileMode(0o750)
+	if runtime.GOOS == "linux" {
+		mode |= os.ModeSetgid
+	}
+	if err := os.Chmod(root, mode); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o750 ||
+		(runtime.GOOS == "linux" && info.Mode()&os.ModeSetgid == 0) {
+		t.Fatalf("source-plugin registry fixture is not a stable setgid reader directory: mode=%v", info.Mode())
+	}
 	t.Cleanup(func() {
 		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {

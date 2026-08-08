@@ -248,6 +248,51 @@ func TestHTTPSAdmissionLimitsRateAndConcurrentRequestsPerCertificate(t *testing.
 	}
 }
 
+func TestHTTPSDispatchDeadlineUsesBoundedInjectedClock(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 30, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name        string
+		dispatchNow time.Time
+		errorText   string
+	}{
+		{
+			name:        "deadline expires after validation",
+			dispatchNow: now.Add(2 * time.Minute),
+			errorText:   "deadline expired before backend dispatch",
+		},
+		{
+			name:        "clock retreat cannot extend execution window",
+			dispatchNow: now.Add(-10 * time.Minute),
+			errorText:   "deadline exceeds the bounded backend dispatch window",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, backend := testServer(t, now)
+			var clockCalls atomic.Int32
+			server.Now = func() time.Time {
+				if clockCalls.Add(1) <= 2 {
+					return now
+				}
+				return test.dispatchNow
+			}
+			handler, err := server.Handler()
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/inspect",
+				strings.NewReader(requestBody(now, `"method":"host.snapshot"`)))
+			request.TLS = tlsState(t, RoleAgent)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusRequestTimeout ||
+				!strings.Contains(recorder.Body.String(), test.errorText) || len(backend.requests) != 0 {
+				t.Fatalf("invalid dispatch deadline reached backend: code=%d body=%s requests=%#v",
+					recorder.Code, recorder.Body.String(), backend.requests)
+			}
+		})
+	}
+}
+
 func TestAgentRoleForwardsEveryInspectionTaggedUnion(t *testing.T) {
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	digest := "sha256:" + strings.Repeat("a", 64)

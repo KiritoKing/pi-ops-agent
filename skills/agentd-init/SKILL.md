@@ -279,6 +279,9 @@ Use the current artifact names from the architecture document. Verify all applic
   not implemented.
 - Healthcheck, service restart, and an interrupted-change status query preserve authoritative
   broker state and do not replay mutation.
+- Generate controller and Unix-RPC request deadlines from the active server clock. Verify an expired
+  deadline, or a clock retreat that would extend the window beyond ten minutes, fails before backend
+  dispatch; the transport must derive its monotonic execution timeout from that same clock.
 - Approval smoke must show that prepare binds the real bounded/redacted user input to the exact
   Session, turn, and change. Multiple pending changes must keep separate intent; later prompts,
   wrong-turn events, Client restart, or Session resume must not substitute a global last input.

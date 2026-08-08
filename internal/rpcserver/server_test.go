@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -116,6 +117,69 @@ func TestUnixAdmissionRejectsConcurrentWorkPerUID(t *testing.T) {
 	close(release)
 	if first := <-firstDone; !first.OK {
 		t.Fatalf("admitted Unix request failed: %#v", first)
+	}
+}
+
+func TestUnixDispatchDeadlineUsesBoundedInjectedClock(t *testing.T) {
+	now := time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC)
+	limits := admission.Limits{
+		MaxConcurrent: 2, MaxConcurrentPerKey: 1,
+		MaxRequestsPerWindow: 10, MaxGlobalPerWindow: 20,
+		MaxKeys: 2, Window: time.Second, IdleTTL: time.Minute,
+	}
+	for _, test := range []struct {
+		name        string
+		dispatchNow time.Time
+		errorText   string
+	}{
+		{
+			name:        "deadline expires after validation",
+			dispatchNow: now.Add(2 * time.Minute),
+			errorText:   "deadline expired before handler dispatch",
+		},
+		{
+			name:        "clock retreat cannot extend execution window",
+			dispatchNow: now.Add(-10 * time.Minute),
+			errorText:   "deadline exceeds the bounded handler dispatch window",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &countingHandler{}
+			var clockCalls atomic.Int32
+			clock := func() time.Time {
+				if clockCalls.Add(1) <= 2 {
+					return now
+				}
+				return test.dispatchNow
+			}
+			server := &Server{
+				Resolver: staticResolver{credential: peercred.Credential{UID: 1001}},
+				Handler:  handler,
+				Now:      clock,
+			}
+			limiter, err := admission.New(limits, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			serverConnection, connection := unixSocketPair(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				server.serveConnection(ctx, serverConnection, limiter)
+			}()
+			defer func() {
+				cancel()
+				_ = connection.Close()
+				<-done
+			}()
+
+			response := exchange(t, connection, requestPayload(now, "unix-deadline-request-1"))
+			if response.OK || !strings.Contains(response.Error, test.errorText) || handler.calls.Load() != 0 {
+				t.Fatalf("invalid dispatch deadline reached handler: response=%#v calls=%d",
+					response, handler.calls.Load())
+			}
+		})
 	}
 }
 
