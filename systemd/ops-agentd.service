@@ -2,8 +2,8 @@
 Description=Pi Ops Agent unprivileged agent daemon
 Documentation=file:/opt/pi-ops-agent/current/README.md
 PartOf=ops-agent.target
-Requires=ops-root-helper.service ops-systemd-helper.service
-After=ops-root-helper.service ops-systemd-helper.service network-online.target
+Requires=agentd-approval-reviewer.service agentd-plugin-lease-broker.service agentd-guardian.service
+After=agentd-approval-reviewer.service agentd-plugin-lease-broker.service agentd-guardian.service network-online.target
 StartLimitIntervalSec=60s
 StartLimitBurst=10
 
@@ -11,6 +11,7 @@ StartLimitBurst=10
 Type=simple
 User=ops-agent
 Group=ops-agent
+SupplementaryGroups=ops-agent-client
 WorkingDirectory=/var/lib/ops-agent
 Environment=NODE_ENV=production
 Environment=OPS_AGENT_CONFIG=/etc/ops-agent/agentd.json
@@ -32,15 +33,17 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
+ProcSubset=pid
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
+RestrictNamespaces=user ipc net mnt pid
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/ops-agent/agentd /var/lib/ops-agent/workspaces /var/lib/ops-agent/sessions /var/lib/ops-agent/registry /var/lib/ops-agent/machines /var/lib/ops-agent/pi /var/log/ops-agent/agentd
-ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent /run/ops-agent/helper
-InaccessiblePaths=-/etc/ops-agent/workloads -/run/docker.sock -/var/run/docker.sock
+ReadWritePaths=/run/ops-agent/agentd /var/lib/ops-agent/workspaces /var/lib/ops-agent/sessions /var/lib/ops-agent/registry /var/lib/ops-agent/machines /var/lib/ops-agent/pi /var/log/ops-agent/agentd /proc/sys/user/max_user_namespaces
+ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent
+InaccessiblePaths=-/run/ops-agent/helper -/etc/ops-agent/workloads -/etc/pve -/run/docker.sock -/var/run/docker.sock
 
 [Install]
 WantedBy=ops-agent.target

@@ -154,7 +154,7 @@ describe("managed workload plugin manifest", () => {
     )) as unknown;
     expect(parseManagedWorkloadPluginManifest(repositoryManifest)).toMatchObject({
       id: "workload.hermes",
-      version: "0.2.0",
+      version: "0.3.0",
       workload: { containerName: "ops-agent-hermes", expectedUser: "root" },
     });
   });

@@ -31,11 +31,22 @@ describe("framing", () => {
 
 describe("message validation", () => {
   it("validates session identifiers and prompt bounds", () => {
-    expect(parseAgentClientMessage({ type: "hello", sessionId: "session-123" })).toEqual({
+    const peer = {
+      apiVersion: "agentd.client-peer/v1",
+      adapterId: "adapter.tui",
+      digest: `sha256:${"a".repeat(64)}`,
+    };
+    expect(parseAgentClientMessage({ type: "hello", sessionId: "session-123", peer })).toEqual({
       type: "hello",
       sessionId: "session-123",
+      peer,
     });
-    expect(() => parseAgentClientMessage({ type: "hello", sessionId: "bad" })).toThrow();
+    expect(() => parseAgentClientMessage({ type: "hello", sessionId: "bad", peer })).toThrow();
+    expect(() => parseAgentClientMessage({
+      type: "hello",
+      sessionId: "session-123",
+      peer: { ...peer, adapterId: "adapter.botmux", extra: true },
+    })).toThrow("not supported");
   });
 
   it("does not trust a malformed helper response", () => {
@@ -58,6 +69,16 @@ describe("redaction", () => {
   it("redacts token-shaped values and secret keys", () => {
     const secret = `sk-${"a".repeat(32)}`;
     expect(redactText(`token=${secret}`)).not.toContain(secret);
+    expect(redactText("authorization: Bearer abc123")).toBe(
+      "authorization: [REDACTED]",
+    );
+    expect(JSON.parse(redactText(JSON.stringify({
+      env: { OPENAI_API_KEY: "plain-secret", SAFE: "visible" },
+      name: "bot",
+    })))).toEqual({
+      env: { OPENAI_API_KEY: "[REDACTED]", SAFE: "visible" },
+      name: "bot",
+    });
     expect(redact({ nested: { apiKey: secret } })).toEqual({ nested: { apiKey: "[REDACTED]" } });
   });
 });

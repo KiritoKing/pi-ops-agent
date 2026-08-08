@@ -12,6 +12,7 @@ export default tseslint.config(
       "scripts/*.mjs",
       "integrations/**/*.mjs",
       "plugins/**/*.mjs",
+      "test/fixtures/**/*.mjs",
     ],
   },
   {

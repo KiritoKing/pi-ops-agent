@@ -1,0 +1,23 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "workload.hermes-ops",
+  "kind": "workload",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Digest-approved Hermes service inspection, fixed doctor/gateway-status command profiles, and typed lifecycle operations.",
+  "entrypoint": "workload.mjs",
+  "capabilities": [
+    "hermes.config.inspect",
+    "hermes.doctor.inspect",
+    "hermes.gateway.inspect",
+    "hermes.health.inspect",
+    "hermes.service.inspect",
+    "hermes.service.manage"
+  ],
+  "requestedScopes": [
+    "control.target.inspect",
+    "control.workload.command.inspect",
+    "control.workload.service.manage"
+  ]
+}

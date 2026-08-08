@@ -15,9 +15,11 @@ import {
   type RemoteResponse,
   type ServerIdentity,
   type TargetDescriptor,
+  type WorkloadCommandInspectionRequest,
 } from "../shared/server-protocol.js";
 import type { TargetId } from "../shared/domain.js";
 import type { ServerRegistration } from "./server-registry.js";
+import { verifyBrokerResponse, type BrokerDomain } from "../shared/broker-receipt.js";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_TRANSPORT_TIMEOUT_MS = 30_000;
@@ -39,6 +41,10 @@ export interface OpsServerClient {
   targets(signal?: AbortSignal): Promise<TargetDescriptor[]>;
   artifacts(targetId: TargetId, signal?: AbortSignal): Promise<ArtifactDescriptor[]>;
   inspect(request: InspectionRequest, signal?: AbortSignal): Promise<RemoteResponse>;
+  workloadCommandInspect(
+    request: WorkloadCommandInspectionRequest,
+    signal?: AbortSignal,
+  ): Promise<RemoteResponse>;
   prepareChange(request: PrepareChangeRequest, signal?: AbortSignal): Promise<RemoteResponse>;
   changeStatus(request: ChangeStatusRequest, signal?: AbortSignal): Promise<RemoteResponse>;
   changeAction(request: ChangeActionRequest, signal?: AbortSignal): Promise<RemoteResponse>;
@@ -50,14 +56,25 @@ interface TlsMaterial {
   key: Buffer;
 }
 
+interface ReceiptMaterial {
+  core?: { keyId: string; publicKey: Buffer };
+  pve?: { keyId: string; publicKey: Buffer };
+}
+
 export class HttpsOpsServerClient implements OpsServerClient {
   readonly #registration: ServerRegistration;
   readonly #tls: TlsMaterial;
   readonly #agent: HttpsAgent;
+  readonly #receipts: ReceiptMaterial;
 
-  private constructor(registration: ServerRegistration, tls: TlsMaterial) {
+  private constructor(
+    registration: ServerRegistration,
+    tls: TlsMaterial,
+    receipts: ReceiptMaterial,
+  ) {
     this.#registration = registration;
     this.#tls = tls;
+    this.#receipts = receipts;
     this.#agent = new HttpsAgent({
       keepAlive: true,
       keepAliveMsecs: 15_000,
@@ -68,12 +85,49 @@ export class HttpsOpsServerClient implements OpsServerClient {
   }
 
   static async create(registration: ServerRegistration): Promise<HttpsOpsServerClient> {
-    const [ca, cert, key] = await Promise.all([
+    return await HttpsOpsServerClient.#createWithCredential(
+      registration,
+      registration.certPath,
+      registration.keyPath,
+    );
+  }
+
+  static async createObserver(registration: ServerRegistration): Promise<HttpsOpsServerClient> {
+    if (registration.observerCertPath === undefined
+      || registration.observerKeyPath === undefined) {
+      throw new Error("server registration has no complete observer credentials");
+    }
+    return await HttpsOpsServerClient.#createWithCredential(
+      registration,
+      registration.observerCertPath,
+      registration.observerKeyPath,
+    );
+  }
+
+  static async #createWithCredential(
+    registration: ServerRegistration,
+    certPath: string,
+    keyPath: string,
+  ): Promise<HttpsOpsServerClient> {
+    const [ca, cert, key, coreReceiptKey, pveReceiptKey] = await Promise.all([
       readFile(registration.caPath),
-      readFile(registration.certPath),
-      readFile(registration.keyPath),
+      readFile(certPath),
+      readFile(keyPath),
+      registration.coreReceiptPublicKeyPath === undefined
+        ? Promise.resolve(undefined)
+        : readFile(registration.coreReceiptPublicKeyPath),
+      registration.pveReceiptPublicKeyPath === undefined
+        ? Promise.resolve(undefined)
+        : readFile(registration.pveReceiptPublicKeyPath),
     ]);
-    return new HttpsOpsServerClient(registration, { ca, cert, key });
+    return new HttpsOpsServerClient(registration, { ca, cert, key }, {
+      ...(coreReceiptKey === undefined || registration.coreReceiptKeyId === undefined
+        ? {}
+        : { core: { keyId: registration.coreReceiptKeyId, publicKey: coreReceiptKey } }),
+      ...(pveReceiptKey === undefined || registration.pveReceiptKeyId === undefined
+        ? {}
+        : { pve: { keyId: registration.pveReceiptKeyId, publicKey: pveReceiptKey } }),
+    });
   }
 
   async identity(signal?: AbortSignal): Promise<ServerIdentity> {
@@ -100,33 +154,91 @@ export class HttpsOpsServerClient implements OpsServerClient {
   }
 
   async inspect(request: InspectionRequest, signal?: AbortSignal): Promise<RemoteResponse> {
-    return parseRemoteResponse(await this.#request(
+    const response = parseRemoteResponse(await this.#request(
       "POST",
       "/v1/inspect",
       request,
       signal,
       transportTimeoutForDeadline(request.deadline),
     ));
+    if (response.requestId !== request.requestId) {
+      throw new Error("inspection response request ID does not match");
+    }
+    return response;
+  }
+
+  async workloadCommandInspect(
+    request: WorkloadCommandInspectionRequest,
+    signal?: AbortSignal,
+  ): Promise<RemoteResponse> {
+    const response = parseRemoteResponse(await this.#request(
+      "POST",
+      "/v1/workload-command-inspections",
+      request,
+      signal,
+      transportTimeoutForDeadline(request.deadline),
+    ));
+    if (response.requestId !== request.requestId) {
+      throw new Error("workload command inspection response request ID does not match");
+    }
+    const receipt = this.#receipts.core;
+    if (receipt === undefined) {
+      throw new Error("server registration has no pinned core broker receipt key");
+    }
+    verifyBrokerResponse(response, {
+      keyId: receipt.keyId,
+      domain: "core",
+      requestId: request.requestId,
+      method: "workload.command.inspect",
+      serverId: this.#registration.serverId,
+      machineId: request.machineId,
+      targetId: request.targetId,
+      changeId: "",
+      pluginId: request.pluginId,
+      pluginDigest: request.pluginDigest,
+      profileKey: request.profileKey,
+    }, receipt.publicKey);
+    return response;
   }
 
   async prepareChange(request: PrepareChangeRequest, signal?: AbortSignal): Promise<RemoteResponse> {
-    return parseRemoteResponse(await this.#request(
+    const response = parseRemoteResponse(await this.#request(
       "POST",
       "/v1/changes",
       request,
       signal,
       transportTimeoutForDeadline(request.deadline),
     ));
+    if (response.requestId !== request.requestId) {
+      throw new Error("prepare response request ID does not match");
+    }
+    return response;
   }
 
   async changeStatus(request: ChangeStatusRequest, signal?: AbortSignal): Promise<RemoteResponse> {
-    return parseRemoteResponse(await this.#request(
+    const response = parseRemoteResponse(await this.#request(
       "GET",
       `/v1/changes/${encodeURIComponent(request.changeId)}?requestId=${encodeURIComponent(request.requestId)}&deadline=${encodeURIComponent(request.deadline)}&machineId=${encodeURIComponent(request.machineId)}&targetId=${encodeURIComponent(request.targetId)}`,
       undefined,
       signal,
       transportTimeoutForDeadline(request.deadline),
     ));
+    const domain: BrokerDomain = request.changeId.startsWith("pve-change-") ? "pve" : "core";
+    const receipt = this.#receipts[domain];
+    if (receipt === undefined) {
+      throw new Error(`server registration has no pinned ${domain} broker receipt key`);
+    }
+    verifyBrokerResponse(response, {
+      keyId: receipt.keyId,
+      domain,
+      requestId: request.requestId,
+      method: "change.status",
+      serverId: this.#registration.serverId,
+      machineId: request.machineId,
+      targetId: request.targetId,
+      changeId: request.changeId,
+    }, receipt.publicKey);
+    return response;
   }
 
   async changeAction(request: ChangeActionRequest, signal?: AbortSignal): Promise<RemoteResponse> {
@@ -138,13 +250,35 @@ export class HttpsOpsServerClient implements OpsServerClient {
       targetId: request.targetId,
       approval: request.approval,
     };
-    return parseRemoteResponse(await this.#request(
+    const response = parseRemoteResponse(await this.#request(
       "POST",
       `/v1/changes/${encodeURIComponent(request.changeId)}/${request.action}`,
       body,
       signal,
       transportTimeoutForDeadline(request.deadline),
     ));
+    const domain: BrokerDomain = request.changeId.startsWith("pve-change-") ? "pve" : "core";
+    const receipt = this.#receipts[domain];
+    if (receipt === undefined) {
+      throw new Error(`server registration has no pinned ${domain} broker receipt key`);
+    }
+    const method = request.action === "approve"
+      ? "change.approve" as const
+      : request.action === "reject"
+        ? "change.reject" as const
+        : "change.rollback" as const;
+    verifyBrokerResponse(response, {
+      keyId: receipt.keyId,
+      domain,
+      requestId: request.requestId,
+      method,
+      serverId: this.#registration.serverId,
+      machineId: request.machineId,
+      targetId: request.targetId,
+      changeId: request.changeId,
+      planHash: request.approval.planHash,
+    }, receipt.publicKey);
+    return response;
   }
 
   close(): void {

@@ -15,7 +15,13 @@ Usage:
     | sudo sh -s -- init [--admin-user USER] [--enable-artifact ID ...] [--no-start]
 
   curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-    | sudo sh -s -- join --controller URL --token-file PATH [--no-start]
+    | sudo sh -s -- join --controller URL --controller-ca-sha256 FINGERPRINT \
+      --token-file PATH [--no-start]
+
+  # Existing endpoint release upgrade: validate and reuse its enrollment.
+  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+    | sudo sh -s -- join --controller URL --controller-ca-sha256 FINGERPRINT \
+      [--no-start]
 
 Environment:
   OPS_AGENT_VERSION=v1.2.3            install a specific GitHub release

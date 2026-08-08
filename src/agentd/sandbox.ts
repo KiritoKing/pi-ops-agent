@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_ADDRESS_SPACE_BYTES = 1024 * 1024 * 1024;
 
 const DENIED_COMMANDS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /(^|[;&|\s])(sudo|doas|pkexec)(\s|$)/i, reason: "privilege escalation" },
@@ -36,6 +38,24 @@ export function validateSandboxCommand(command: string): void {
   }
 }
 
+function fixedRootExecutable(path: string, label: string): string {
+  if (!existsSync(path)) throw new Error(`${label} does not exist at its fixed path`);
+  const resolved = realpathSync(path);
+  const info = lstatSync(resolved);
+  if (!info.isFile() || info.uid !== 0 || (info.mode & 0o022) !== 0
+    || (info.mode & 0o111) === 0) {
+    throw new Error(`${label} must be a root-owned, non-writable executable file`);
+  }
+  return resolved;
+}
+
+function fixedPrlimit(): string {
+  for (const path of ["/usr/bin/prlimit", "/bin/prlimit"]) {
+    if (existsSync(path)) return fixedRootExecutable(path, "prlimit");
+  }
+  throw new Error("sandbox requires the fixed util-linux prlimit boundary");
+}
+
 export async function runSandboxedCommand(options: {
   command: string;
   timeoutSeconds: number;
@@ -51,14 +71,25 @@ export async function runSandboxedCommand(options: {
   if (process.platform !== "linux") {
     throw new Error("bubblewrap execution is supported only on Linux");
   }
-  if (!existsSync(options.bwrapPath)) {
-    throw new Error(`bubblewrap not found at ${options.bwrapPath}`);
-  }
+  const bwrapPath = fixedRootExecutable(options.bwrapPath, "bubblewrap");
+  const bashPath = fixedRootExecutable(options.bashPath, "bash");
+  const prlimitPath = fixedPrlimit();
 
   const args = [
     "--die-with-parent",
     "--new-session",
-    "--unshare-all",
+    // Keep this list aligned with ops-agentd.service RestrictNamespaces= and
+    // the Source Workload host. bwrap creates the mount namespace itself;
+    // requesting --unshare-all would also request UTS/cgroup namespaces that
+    // the hardened service deliberately denies.
+    "--unshare-user",
+    "--unshare-ipc",
+    "--unshare-pid",
+    "--unshare-net",
+    "--as-pid-1",
+    "--disable-userns",
+    "--cap-drop",
+    "ALL",
     "--proc",
     "/proc",
     "--dev",
@@ -83,16 +114,46 @@ export async function runSandboxedCommand(options: {
     "LANG",
     "C.UTF-8",
   ];
-  for (const path of ["/usr", "/bin", "/sbin", "/lib", "/lib64"]) {
-    if (existsSync(path)) args.push("--ro-bind", path, path);
+  if (!existsSync("/usr") || lstatSync("/usr").isSymbolicLink()) {
+    throw new Error("sandbox requires a real /usr directory");
+  }
+  args.push("--ro-bind", "/usr", "/usr");
+  for (const path of ["/bin", "/sbin", "/lib", "/lib64"]) {
+    if (!existsSync(path)) continue;
+    const stat = lstatSync(path);
+    if (!stat.isSymbolicLink()) {
+      args.push("--ro-bind", path, path);
+      continue;
+    }
+    const target = readlinkSync(path);
+    const expected = `usr/${path.slice(1)}`;
+    if (target !== expected && target !== `/${expected}`) {
+      throw new Error(`sandbox refuses unexpected merged-/usr link: ${path} -> ${target}`);
+    }
+    args.push("--symlink", target, path);
   }
   for (const path of ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"]) {
     if (existsSync(path)) args.push("--ro-bind", path, path);
   }
-  args.push(options.bashPath, "--noprofile", "--norc", "-lc", options.command);
+  const cpuSeconds = Math.min(125, Math.max(2, options.timeoutSeconds + 2));
+  args.push(
+    prlimitPath,
+    `--as=${MAX_ADDRESS_SPACE_BYTES}:${MAX_ADDRESS_SPACE_BYTES}`,
+    "--core=0:0",
+    `--cpu=${cpuSeconds}:${cpuSeconds}`,
+    `--fsize=${MAX_FILE_BYTES}:${MAX_FILE_BYTES}`,
+    "--nofile=128:128",
+    "--nproc=64:64",
+    "--",
+    bashPath,
+    "--noprofile",
+    "--norc",
+    "-lc",
+    options.command,
+  );
 
   return await new Promise<SandboxResult>((resolve, reject) => {
-    const child = spawn(options.bwrapPath, args, {
+    const child = spawn(bwrapPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: {},
     });

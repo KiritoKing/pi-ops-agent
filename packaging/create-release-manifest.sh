@@ -10,6 +10,10 @@ if [[ -z "${directory}" ]] || [[ -z "${version}" ]] || [[ -z "${repository}" ]] 
   printf 'Usage: create-release-manifest.sh DIRECTORY VERSION REPOSITORY COMMIT_SHA\n' >&2
   exit 2
 fi
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  printf 'Release manifest version is invalid: %s\n' "${version}" >&2
+  exit 2
+fi
 command -v jq >/dev/null 2>&1 || { printf 'jq is required.\n' >&2; exit 1; }
 
 directory="$(CDPATH= cd -- "${directory}" && pwd -P)"
@@ -18,10 +22,30 @@ directory="$(CDPATH= cd -- "${directory}" && pwd -P)"
   exit 1
 }
 
+required_assets=(
+  "ops-agent-linux-amd64.tar.gz"
+  "ops-agent-linux-arm64.tar.gz"
+  "ops-agent-all_${version}_amd64.deb"
+  "ops-agent-all_${version}_arm64.deb"
+  "ops-agent-linux-amd64.spdx.json"
+  "ops-agent-linux-arm64.spdx.json"
+  "adapter-botmux_${version}.opspkg"
+  "workload-hermes_${version}.opspkg"
+)
+for required_asset in "${required_assets[@]}"; do
+  [[ -f "${directory}/${required_asset}" && ! -L "${directory}/${required_asset}" ]] || {
+    printf 'Release asset set is incomplete: %s\n' "${required_asset}" >&2
+    exit 1
+  }
+done
+
 assets_file="$(mktemp "${TMPDIR:-/tmp}/ops-agent-assets.XXXXXX")"
 trap 'rm -f -- "${assets_file:-}"' EXIT HUP INT TERM
 for path in "${directory}"/*; do
-  [[ -f "${path}" ]] || continue
+  [[ -f "${path}" && ! -L "${path}" ]] || {
+    printf 'Release directory contains a non-regular or symlink entry: %s\n' "${path}" >&2
+    exit 1
+  }
   name="$(basename "${path}")"
   [[ "${name}" != checksums.txt ]] || continue
   case "${name}" in

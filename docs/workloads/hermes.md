@@ -41,7 +41,9 @@ sudo rm -f -- /root/hermes-input.json /root/hermes-bundle.json
 
 准备工具生成 scrypt WebUI verifier 与随机 session secret。通用配置器校验 slot、已安装包的
 publisher/version/digest 和 Target policy，写入 root-only bundle，并更新 policy revision。
-它不会执行插件代码。`v0.2.0` 只支持首次部署；部署后禁止 credential replacement。
+它不会执行插件代码。该 legacy compatibility configurer 目前只支持首次部署；部署后禁止
+credential replacement。这里描述的是仍需保留的旧 `.opspkg` 恢复边界，不代表当前 Source
+Workload 或 Release 版本。
 
 ## 部署与交互
 

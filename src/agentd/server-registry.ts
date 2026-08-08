@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { isAbsolute, normalize } from "node:path";
 import {
   parseMachineId,
   parseServerId,
@@ -16,6 +16,12 @@ export interface ServerRegistration {
   caPath: string;
   certPath: string;
   keyPath: string;
+  observerCertPath?: string;
+  observerKeyPath?: string;
+  coreReceiptKeyId?: string;
+  coreReceiptPublicKeyPath?: string;
+  pveReceiptKeyId?: string;
+  pveReceiptPublicKeyPath?: string;
   approverCertPath?: string;
   approverKeyPath?: string;
   approvalSigningKeyPath?: string;
@@ -41,13 +47,18 @@ function parseBaseUrl(value: unknown, label: string): string {
 
 function parseAbsolutePath(value: unknown, label: string): string {
   const path = requireString(value, label, { max: 4096 });
-  if (!isAbsolute(path)) throw new Error(`${label} must be absolute`);
+  if (!isAbsolute(path) || normalize(path) !== path || path.includes("\0")
+    || path.includes("\n") || path.includes("\r")) {
+    throw new Error(`${label} must be a clean absolute path`);
+  }
   return path;
 }
 
 export function parseServerRegistration(value: unknown, label = "server registration"): ServerRegistration {
   const input = requireExactRecord(value, label, [
     "serverId", "machineId", "baseUrl", "caPath", "certPath", "keyPath",
+    "observerCertPath", "observerKeyPath",
+    "coreReceiptKeyId", "coreReceiptPublicKeyPath", "pveReceiptKeyId", "pveReceiptPublicKeyPath",
     "approverCertPath", "approverKeyPath", "approvalSigningKeyPath", "approvalKeyId",
     "serverName", "enabled",
   ]);
@@ -63,6 +74,48 @@ export function parseServerRegistration(value: unknown, label = "server registra
   };
   if (input.serverName !== undefined) {
     registration.serverName = requireString(input.serverName, `${label}.serverName`, { max: 253 });
+  }
+  if (input.observerCertPath !== undefined) {
+    registration.observerCertPath = parseAbsolutePath(
+      input.observerCertPath,
+      `${label}.observerCertPath`,
+    );
+  }
+  if (input.observerKeyPath !== undefined) {
+    registration.observerKeyPath = parseAbsolutePath(
+      input.observerKeyPath,
+      `${label}.observerKeyPath`,
+    );
+  }
+  if ((registration.observerCertPath === undefined)
+    !== (registration.observerKeyPath === undefined)) {
+    throw new Error(`${label} must configure both observer credential fields together`);
+  }
+  for (const [keyName, pathName] of [
+    ["coreReceiptKeyId", "coreReceiptPublicKeyPath"],
+    ["pveReceiptKeyId", "pveReceiptPublicKeyPath"],
+  ] as const) {
+    const keyValue = input[keyName];
+    const pathValue = input[pathName];
+    if ((keyValue === undefined) !== (pathValue === undefined)) {
+      throw new Error(`${label} must configure ${keyName} and ${pathName} together`);
+    }
+    if (keyValue !== undefined && pathValue !== undefined) {
+      registration[keyName] = requireString(keyValue, `${label}.${keyName}`, {
+        min: 8,
+        max: 160,
+        pattern: /^[a-zA-Z0-9][a-zA-Z0-9._:-]{7,159}$/u,
+      });
+      registration[pathName] = parseAbsolutePath(pathValue, `${label}.${pathName}`);
+    }
+  }
+  if (registration.coreReceiptKeyId !== undefined
+    && registration.pveReceiptKeyId === registration.coreReceiptKeyId) {
+    throw new Error(`${label} must use distinct core and PVE receipt key IDs`);
+  }
+  if (registration.coreReceiptPublicKeyPath !== undefined
+    && registration.pveReceiptPublicKeyPath === registration.coreReceiptPublicKeyPath) {
+    throw new Error(`${label} must use distinct core and PVE receipt public keys`);
   }
   if (input.approverCertPath !== undefined) {
     registration.approverCertPath = parseAbsolutePath(input.approverCertPath, `${label}.approverCertPath`);

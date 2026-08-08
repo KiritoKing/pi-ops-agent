@@ -1,6 +1,7 @@
 package agentserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/KiritoKing/pi-ops-agent/internal/admission"
 	"github.com/KiritoKing/pi-ops-agent/internal/protocol"
 	"github.com/KiritoKing/pi-ops-agent/internal/targetpolicy"
 )
@@ -17,11 +19,13 @@ import (
 const maxBodyBytes = protocol.MaxFrameBytes
 
 type Server struct {
-	Identity   Identity
-	Policy     *targetpolicy.Policy
-	Backend    Backend
-	Now        func() time.Time
-	CatalogDir string
+	Identity        Identity
+	Policy          *targetpolicy.Policy
+	Backend         Backend
+	Now             func() time.Time
+	CatalogDir      string
+	PVEEnabled      bool
+	AdmissionLimits admission.Limits
 }
 
 type requestEnvelope struct {
@@ -34,11 +38,26 @@ type requestEnvelope struct {
 
 type inspectRequest struct {
 	requestEnvelope
-	Method   string `json:"method"`
-	Unit     string `json:"unit,omitempty"`
-	Lines    int    `json:"lines,omitempty"`
-	Path     string `json:"path,omitempty"`
-	MaxBytes int    `json:"maxBytes,omitempty"`
+	Method       string `json:"method"`
+	PluginID     string `json:"pluginId,omitempty"`
+	PluginDigest string `json:"pluginDigest,omitempty"`
+	Unit         string `json:"unit,omitempty"`
+	Lines        int    `json:"lines,omitempty"`
+	Path         string `json:"path,omitempty"`
+	MaxBytes     int    `json:"maxBytes,omitempty"`
+	Node         string `json:"node,omitempty"`
+	Storage      string `json:"storage,omitempty"`
+	GuestType    string `json:"guestType,omitempty"`
+	VMID         int    `json:"vmid,omitempty"`
+	UPID         string `json:"upid,omitempty"`
+}
+
+type workloadCommandInspectRequest struct {
+	requestEnvelope
+	Method       string `json:"method"`
+	PluginID     string `json:"pluginId"`
+	PluginDigest string `json:"pluginDigest"`
+	ProfileKey   string `json:"profileKey"`
 }
 
 type changeRequest struct {
@@ -51,41 +70,62 @@ type changeRequest struct {
 
 type actionRequest struct {
 	requestEnvelope
-	Approval protocol.ApprovalGrant `json:"approval"`
+	Approval       protocol.ApprovalGrant `json:"approval"`
+	ClearanceToken string                 `json:"clearanceToken,omitempty"`
+}
+
+type clearancePrepareRequest struct {
+	requestEnvelope
+}
+
+type clearanceConfirmRequest struct {
+	requestEnvelope
+	ClearanceApproval protocol.PVERecoveryClearanceApproval `json:"clearanceApproval"`
 }
 
 type rootWire struct {
-	Version            int                     `json:"version"`
-	RequestID          string                  `json:"requestId"`
-	Deadline           string                  `json:"deadline"`
-	Method             protocol.Method         `json:"method"`
-	ServerID           string                  `json:"serverId"`
-	MachineID          string                  `json:"machineId"`
-	TargetID           string                  `json:"targetId"`
-	SessionID          string                  `json:"sessionId,omitempty"`
-	TurnID             string                  `json:"turnId,omitempty"`
-	PolicyRevision     string                  `json:"policyRevision"`
-	CapabilityRevision string                  `json:"capabilityRevision,omitempty"`
-	CallerRole         string                  `json:"callerRole"`
-	ChangeID           string                  `json:"changeId,omitempty"`
-	Unit               string                  `json:"unit,omitempty"`
-	Lines              int                     `json:"lines,omitempty"`
-	Path               string                  `json:"path,omitempty"`
-	MaxBytes           int                     `json:"maxBytes,omitempty"`
-	Operation          json.RawMessage         `json:"operation,omitempty"`
-	Approval           *protocol.ApprovalGrant `json:"approval,omitempty"`
+	Version            int                                    `json:"version"`
+	RequestID          string                                 `json:"requestId"`
+	Deadline           string                                 `json:"deadline"`
+	Method             protocol.Method                        `json:"method"`
+	ServerID           string                                 `json:"serverId"`
+	MachineID          string                                 `json:"machineId"`
+	TargetID           string                                 `json:"targetId"`
+	SessionID          string                                 `json:"sessionId,omitempty"`
+	TurnID             string                                 `json:"turnId,omitempty"`
+	PolicyRevision     string                                 `json:"policyRevision"`
+	CapabilityRevision string                                 `json:"capabilityRevision,omitempty"`
+	CallerRole         string                                 `json:"callerRole"`
+	ChangeID           string                                 `json:"changeId,omitempty"`
+	Unit               string                                 `json:"unit,omitempty"`
+	Lines              int                                    `json:"lines,omitempty"`
+	Path               string                                 `json:"path,omitempty"`
+	MaxBytes           int                                    `json:"maxBytes,omitempty"`
+	Node               string                                 `json:"node,omitempty"`
+	Storage            string                                 `json:"storage,omitempty"`
+	GuestType          string                                 `json:"guestType,omitempty"`
+	VMID               int                                    `json:"vmid,omitempty"`
+	UPID               string                                 `json:"upid,omitempty"`
+	PluginID           string                                 `json:"pluginId,omitempty"`
+	PluginDigest       string                                 `json:"pluginDigest,omitempty"`
+	ProfileKey         string                                 `json:"profileKey,omitempty"`
+	Operation          json.RawMessage                        `json:"operation,omitempty"`
+	Approval           *protocol.ApprovalGrant                `json:"approval,omitempty"`
+	ClearanceApproval  *protocol.PVERecoveryClearanceApproval `json:"clearanceApproval,omitempty"`
+	ClearanceToken     string                                 `json:"clearanceToken,omitempty"`
 }
 
 type publicResponse struct {
-	Version   int         `json:"version"`
-	RequestID string      `json:"requestId,omitempty"`
-	OK        bool        `json:"ok"`
-	AuditID   string      `json:"auditId,omitempty"`
-	ChangeID  string      `json:"changeId,omitempty"`
-	State     string      `json:"state,omitempty"`
-	Summary   string      `json:"summary,omitempty"`
-	Data      interface{} `json:"data,omitempty"`
-	Error     string      `json:"error,omitempty"`
+	Version   int                     `json:"version"`
+	RequestID string                  `json:"requestId,omitempty"`
+	OK        bool                    `json:"ok"`
+	AuditID   string                  `json:"auditId,omitempty"`
+	ChangeID  string                  `json:"changeId,omitempty"`
+	State     string                  `json:"state,omitempty"`
+	Summary   string                  `json:"summary,omitempty"`
+	Data      interface{}             `json:"data,omitempty"`
+	Error     string                  `json:"error,omitempty"`
+	Receipt   *protocol.BrokerReceipt `json:"brokerReceipt,omitempty"`
 }
 
 func (s *Server) Handler() (http.Handler, error) {
@@ -102,19 +142,43 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.HandleFunc("GET /v1/targets", s.handleTargets)
 	mux.HandleFunc("GET /v1/artifacts", s.handleArtifacts)
 	mux.HandleFunc("POST /v1/inspect", s.handleInspect)
+	mux.HandleFunc("POST /v1/workload-command-inspections", s.handleWorkloadCommandInspect)
 	mux.HandleFunc("POST /v1/changes", s.handleChangePrepare)
 	mux.HandleFunc("GET /v1/changes/{changeRef}", s.handleChangeStatus)
 	mux.HandleFunc("POST /v1/changes/{changeRef}/{action}", s.handleChangeAction)
+	limits := s.AdmissionLimits
+	if limits.MaxConcurrent == 0 {
+		limits = admission.Limits{
+			MaxConcurrent: 64, MaxConcurrentPerKey: 16,
+			MaxRequestsPerWindow: 128, MaxGlobalPerWindow: 512,
+			MaxKeys: 1024, Window: time.Second, IdleTTL: 5 * time.Minute,
+		}
+	}
+	limiter, err := admission.New(limits, s.Now)
+	if err != nil {
+		return nil, fmt.Errorf("configure HTTPS admission: %w", err)
+	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Header().Set("Cache-Control", "no-store")
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		key := "unauthenticated"
+		if principal, authErr := authenticate(request.TLS); authErr == nil {
+			key = principal.Fingerprint
+		}
+		release, rejected := limiter.Acquire(key)
+		if rejected != "" {
+			writer.Header().Set("Retry-After", "1")
+			writeError(writer, http.StatusTooManyRequests, string(rejected))
+			return
+		}
+		defer release()
 		mux.ServeHTTP(writer, request)
 	}), nil
 }
 
 func (s *Server) handleHealth(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := s.requireRole(writer, request, RoleAgent, RoleApprover, RoleAdmin); !ok {
+	if _, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleApprover, RoleAdmin); !ok {
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
@@ -124,7 +188,7 @@ func (s *Server) handleHealth(writer http.ResponseWriter, request *http.Request)
 }
 
 func (s *Server) handleIdentity(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := s.requireRole(writer, request, RoleAgent, RoleApprover, RoleAdmin); !ok {
+	if _, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleApprover, RoleAdmin); !ok {
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
@@ -134,17 +198,36 @@ func (s *Server) handleIdentity(writer http.ResponseWriter, request *http.Reques
 }
 
 func (s *Server) handleCapabilities(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := s.requireRole(writer, request, RoleAgent, RoleApprover, RoleAdmin); !ok {
+	if _, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleApprover, RoleAdmin); !ok {
 		return
 	}
+	operations := []string{"host.snapshot", "process.list", "systemd.unit", "journal.tail", "file.metadata", "file.read", "workload.command.inspect", "change.prepare", "change.status", "plugin.install", "plugin.register", "workload.deploy"}
+	if s.PVEEnabled {
+		operations = append(operations, "pve.cluster.status", "pve.node.status", "pve.storage.status", "pve.task.status", "pve.guest.status")
+	}
+	if policyHasRootTarget(s.Policy) {
+		operations = append(operations, "breakglass.prepare")
+	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
-		"revision": "capability-remote-mvp-v3", "policyRevision": s.Policy.Revision,
-		"operations": []string{"host.snapshot", "process.list", "systemd.unit", "journal.tail", "file.metadata", "file.read", "change.prepare", "change.status", "plugin.install", "workload.deploy"},
+		"revision": protocol.CapabilityRevision, "policyRevision": s.Policy.Revision,
+		"operations": operations,
 	})
 }
 
+func policyHasRootTarget(policy *targetpolicy.Policy) bool {
+	if policy == nil {
+		return false
+	}
+	for _, target := range policy.PublicTargets() {
+		if target.Account == "root" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleTargets(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := s.requireRole(writer, request, RoleAgent, RoleApprover, RoleAdmin); !ok {
+	if _, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleApprover, RoleAdmin); !ok {
 		return
 	}
 	targets := s.Policy.PublicTargets()
@@ -181,6 +264,27 @@ func (s *Server) handleInspect(writer http.ResponseWriter, request *http.Request
 	}
 	wire := rootWireFromEnvelope(input.requestEnvelope, principal, method)
 	wire.Unit, wire.Lines, wire.Path, wire.MaxBytes = input.Unit, input.Lines, input.Path, input.MaxBytes
+	wire.Node, wire.Storage, wire.GuestType, wire.VMID, wire.UPID = input.Node, input.Storage, input.GuestType, input.VMID, input.UPID
+	wire.PluginID, wire.PluginDigest = input.PluginID, input.PluginDigest
+	s.forward(writer, request.Context(), wire)
+}
+
+func (s *Server) handleWorkloadCommandInspect(writer http.ResponseWriter, request *http.Request) {
+	principal, ok := s.requireRole(writer, request, RoleAgent)
+	if !ok {
+		return
+	}
+	var input workloadCommandInspectRequest
+	if err := decodeStrictBody(writer, request, &input); err != nil {
+		writeError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	if input.Method != string(protocol.MethodWorkloadCommandInspect) {
+		writeError(writer, http.StatusBadRequest, "method must be workload.command.inspect")
+		return
+	}
+	wire := rootWireFromEnvelope(input.requestEnvelope, principal, protocol.MethodWorkloadCommandInspect)
+	wire.PluginID, wire.PluginDigest, wire.ProfileKey = input.PluginID, input.PluginDigest, input.ProfileKey
 	s.forward(writer, request.Context(), wire)
 }
 
@@ -202,14 +306,18 @@ func (s *Server) handleChangePrepare(writer http.ResponseWriter, request *http.R
 		writeError(writer, http.StatusBadRequest, "method must be change.prepare")
 		return
 	}
+	if input.CapabilityRevision != protocol.CapabilityRevision {
+		writeError(writer, http.StatusConflict, "capabilityRevision does not match the active compiled contract")
+		return
+	}
 	wire := rootWireFromEnvelope(input.requestEnvelope, principal, protocol.MethodChangePrepare)
-	wire.PolicyRevision, wire.CapabilityRevision = input.PolicyRevision, input.CapabilityRevision
+	wire.PolicyRevision = input.PolicyRevision
 	wire.Operation = input.Operation
 	s.forward(writer, request.Context(), wire)
 }
 
 func (s *Server) handleChangeStatus(writer http.ResponseWriter, request *http.Request) {
-	principal, ok := s.requireRole(writer, request, RoleAgent, RoleApprover, RoleAdmin)
+	principal, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleApprover, RoleAdmin)
 	if !ok {
 		return
 	}
@@ -228,6 +336,34 @@ func (s *Server) handleChangeAction(writer http.ResponseWriter, request *http.Re
 	if !ok {
 		return
 	}
+	action := request.PathValue("action")
+	if action == "pve-recovery-clearance-prepare" || action == "pve-recovery-clearance-confirm" {
+		if principal.Role != RoleApprover {
+			writeError(writer, http.StatusForbidden, "PVE recovery clearance requires the approver certificate role")
+			return
+		}
+		if action == "pve-recovery-clearance-prepare" {
+			var input clearancePrepareRequest
+			if err := decodeStrictBody(writer, request, &input); err != nil {
+				writeError(writer, http.StatusBadRequest, err.Error())
+				return
+			}
+			wire := rootWireFromEnvelope(input.requestEnvelope, principal, protocol.MethodPVERecoveryClearancePrepare)
+			wire.ChangeID = request.PathValue("changeRef")
+			s.forward(writer, request.Context(), wire)
+			return
+		}
+		var input clearanceConfirmRequest
+		if err := decodeStrictBody(writer, request, &input); err != nil {
+			writeError(writer, http.StatusBadRequest, err.Error())
+			return
+		}
+		wire := rootWireFromEnvelope(input.requestEnvelope, principal, protocol.MethodPVERecoveryClearanceConfirm)
+		wire.ChangeID = request.PathValue("changeRef")
+		wire.ClearanceApproval = &input.ClearanceApproval
+		s.forward(writer, request.Context(), wire)
+		return
+	}
 	var input actionRequest
 	if err := decodeStrictBody(writer, request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, err.Error())
@@ -236,19 +372,25 @@ func (s *Server) handleChangeAction(writer http.ResponseWriter, request *http.Re
 	methods := map[string]protocol.Method{
 		"approve": protocol.MethodChangeApprove, "reject": protocol.MethodChangeReject, "rollback": protocol.MethodChangeRollback,
 	}
-	method, exists := methods[request.PathValue("action")]
+	method, exists := methods[action]
 	if !exists {
 		writeError(writer, http.StatusNotFound, "unsupported change action")
+		return
+	}
+	if input.ClearanceToken != "" && (principal.Role != RoleApprover || method != protocol.MethodChangeApprove) {
+		writeError(writer, http.StatusForbidden, "PVE recovery clearance may only accompany an approver-role approve action")
 		return
 	}
 	wire := rootWireFromEnvelope(input.requestEnvelope, principal, method)
 	wire.ChangeID = request.PathValue("changeRef")
 	wire.Approval = &input.Approval
+	wire.ClearanceToken = input.ClearanceToken
 	s.forward(writer, request.Context(), wire)
 }
 
 func (s *Server) forward(writer http.ResponseWriter, ctx context.Context, wire rootWire) {
 	wire.ServerID = s.Identity.ServerID
+	wire.CapabilityRevision = protocol.CapabilityRevision
 	if wire.PolicyRevision == "" {
 		wire.PolicyRevision = s.Policy.Revision
 	}
@@ -266,6 +408,10 @@ func (s *Server) forward(writer http.ResponseWriter, ctx context.Context, wire r
 		writeError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
+	if protocol.IsPVERequest(request) && !s.PVEEnabled {
+		writeError(writer, http.StatusConflict, "PVE capability is not enabled on this server")
+		return
+	}
 	deadlineCtx, cancel := context.WithDeadline(ctx, request.Deadline)
 	defer cancel()
 	response, err := s.Backend.Do(deadlineCtx, request)
@@ -276,6 +422,7 @@ func (s *Server) forward(writer http.ResponseWriter, ctx context.Context, wire r
 	public := publicResponse{
 		Version: response.Version, RequestID: response.RequestID, OK: response.OK, AuditID: response.AuditID,
 		ChangeID: response.ChangeID, State: response.State, Summary: response.Summary, Data: response.Data, Error: response.Error,
+		Receipt: response.Receipt,
 	}
 	status := http.StatusOK
 	writeJSON(writer, status, public)
@@ -287,6 +434,9 @@ func (s *Server) validateEnvelope(wire rootWire) error {
 	}
 	if wire.PolicyRevision != s.Policy.Revision {
 		return errors.New("policyRevision does not match the active policy")
+	}
+	if wire.CapabilityRevision != protocol.CapabilityRevision {
+		return errors.New("capabilityRevision does not match the active compiled contract")
 	}
 	if _, ok := s.Policy.Target(wire.TargetID); !ok {
 		return errors.New("unknown targetId")
@@ -321,6 +471,9 @@ func inspectMethod(kind string) (protocol.Method, error) {
 		"host.snapshot": protocol.MethodHostSnapshot, "process.list": protocol.MethodProcessList,
 		"systemd.unit": protocol.MethodSystemdUnit, "journal.tail": protocol.MethodJournalTail,
 		"file.metadata": protocol.MethodFileMetadata, "file.read": protocol.MethodFileRead,
+		"pve.cluster.status": protocol.MethodPVEClusterStatus, "pve.node.status": protocol.MethodPVENodeStatus,
+		"pve.storage.status": protocol.MethodPVEStorageStatus, "pve.task.status": protocol.MethodPVETaskStatus,
+		"pve.guest.status": protocol.MethodPVEGuestStatus,
 	}
 	method, ok := methods[kind]
 	if !ok {
@@ -346,7 +499,17 @@ func envelopeFromQuery(query url.Values) (requestEnvelope, error) {
 
 func decodeStrictBody(writer http.ResponseWriter, request *http.Request, target interface{}) error {
 	request.Body = http.MaxBytesReader(writer, request.Body, maxBodyBytes)
-	decoder := json.NewDecoder(request.Body)
+	payload, err := io.ReadAll(request.Body)
+	if err != nil {
+		return fmt.Errorf("read request: %w", err)
+	}
+	if len(payload) == 0 {
+		return errors.New("decode request: empty body")
+	}
+	if err := rejectDuplicateJSONKeys(payload); err != nil {
+		return fmt.Errorf("decode request: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("decode request: %w", err)
@@ -356,6 +519,69 @@ func decodeStrictBody(writer http.ResponseWriter, request *http.Request, target 
 			return errors.New("decode request: trailing value")
 		}
 		return fmt.Errorf("decode request: %w", err)
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	var walk func() error
+	walk = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key is not a string")
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("duplicate JSON field %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				return errors.New("unterminated JSON object")
+			}
+		case '[':
+			for decoder.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				return errors.New("unterminated JSON array")
+			}
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+		return nil
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("unexpected trailing JSON token %v", token)
 	}
 	return nil
 }

@@ -17,7 +17,7 @@ type publicArtifact struct {
 }
 
 func (s *Server) handleArtifacts(writer http.ResponseWriter, request *http.Request) {
-	if _, ok := s.requireRole(writer, request, RoleAgent, RoleAdmin); !ok {
+	if _, ok := s.requireRole(writer, request, RoleAgent, RoleObserver, RoleAdmin); !ok {
 		return
 	}
 	query := request.URL.Query()

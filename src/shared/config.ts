@@ -4,13 +4,18 @@ import { optionalString, requireRecord, requireString } from "./guards.js";
 
 export interface AgentConfig {
   socketPath: string;
-  rootHelperSocket: string;
-  systemdHelperSocket: string;
+  backendSocketPath: string;
   stateDir: string;
   workspaceRoot: string;
   sessionDir: string;
   sessionRegistryPath: string;
   serverRegistryPath: string;
+  reviewerSocket: string;
+  guardianHeartbeatPath: string;
+  pluginRegistryPath: string;
+  pluginLeaseSocketPath: string;
+  pluginCtlPath: string;
+  approvalSubmitPath: string;
   machineContextDir: string;
   agentDir: string;
   modelsPath: string;
@@ -24,14 +29,19 @@ export interface AgentConfig {
 }
 
 const DEFAULTS: AgentConfig = {
-  socketPath: "/run/ops-agent/agentd.sock",
-  rootHelperSocket: "/run/ops-agent/root-helper.sock",
-  systemdHelperSocket: "/run/ops-agent/systemd-helper.sock",
+  socketPath: "/run/ops-agent/agentd/agentd.sock",
+  backendSocketPath: "/run/ops-agent/agentd/backend.sock",
   stateDir: "/var/lib/ops-agent",
   workspaceRoot: "/var/lib/ops-agent/workspaces",
   sessionDir: "/var/lib/ops-agent/sessions",
   sessionRegistryPath: "/var/lib/ops-agent/registry/sessions.json",
   serverRegistryPath: "/etc/ops-agent/servers.json",
+  reviewerSocket: "/run/ops-agent/reviewer/reviewer.sock",
+  guardianHeartbeatPath: "/run/ops-agent/agentd/heartbeat.json",
+  pluginRegistryPath: "/var/lib/ops-agent/plugins",
+  pluginLeaseSocketPath: "/run/ops-agent/plugin-lease/lease.sock",
+  pluginCtlPath: "/opt/pi-ops-agent/current/bin/agentd-pluginctl",
+  approvalSubmitPath: "/opt/pi-ops-agent/current/bin/agentd-approval-submit",
   machineContextDir: "/var/lib/ops-agent/machines",
   agentDir: "/var/lib/ops-agent/pi",
   modelsPath: "/etc/ops-agent/models.json",
@@ -48,8 +58,12 @@ export async function loadAgentConfig(path: string): Promise<AgentConfig> {
   const raw = JSON.parse(await readFile(path, "utf8")) as unknown;
   const input = requireRecord(raw, "agent config");
   const config = { ...DEFAULTS };
+  // The lease socket is a fixed trust endpoint, not a deployment-level
+  // override. In particular, an untrusted process cannot nominate a fake
+  // broker through OPS_AGENT_CONFIG.
   const stringKeys = (Object.keys(DEFAULTS) as Array<keyof AgentConfig>)
-    .filter((key): key is Exclude<keyof AgentConfig, "sandboxEnabled"> => key !== "sandboxEnabled");
+    .filter((key): key is Exclude<keyof AgentConfig, "sandboxEnabled" | "pluginLeaseSocketPath"> =>
+      key !== "sandboxEnabled" && key !== "pluginLeaseSocketPath");
   for (const key of stringKeys) {
     const next = optionalString(input[key], `config.${key}`, { max: 4096 });
     if (next !== undefined) {

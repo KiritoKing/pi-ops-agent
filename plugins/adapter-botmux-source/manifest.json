@@ -1,0 +1,22 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "adapter.botmux",
+  "kind": "adapter",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Digest-approved BotMux source adapter executed only as the dedicated non-root BotMux identity; remote root approval is intentionally unsupported.",
+  "entrypoint": "adapter.mjs",
+  "capabilities": [
+    "adapter.inbound.text",
+    "adapter.outbound.send",
+    "adapter.session.bind",
+    "approval.status"
+  ],
+  "requestedScopes": [
+    "adapter.inbound.text.botmux",
+    "adapter.outbound.send.botmux",
+    "adapter.session.bind.botmux",
+    "approval.status.remote"
+  ]
+}

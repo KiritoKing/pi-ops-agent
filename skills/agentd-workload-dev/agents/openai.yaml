@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agentd Workload Development"
+  short_description: "Build typed source workloads for Agentd operations"
+  default_prompt: "Use $agentd-workload-dev to design and verify a typed source workload for Agentd."

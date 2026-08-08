@@ -1,0 +1,26 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "workload.botmux-ops",
+  "kind": "workload",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Digest-approved BotMux inspection, schema-exact setup summaries, local-approval semantic config edits, and typed lifecycle operations.",
+  "entrypoint": "workload.mjs",
+  "capabilities": [
+    "botmux.config.edit",
+    "botmux.config.inspect",
+    "botmux.health.inspect",
+    "botmux.service.inspect",
+    "botmux.service.manage",
+    "botmux.sessions.inspect",
+    "botmux.setup.inspect",
+    "botmux.status.inspect"
+  ],
+  "requestedScopes": [
+    "control.target.inspect",
+    "control.workload.command.inspect",
+    "control.workload.json-config.edit",
+    "control.workload.service.manage"
+  ]
+}

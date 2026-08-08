@@ -8,9 +8,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/KiritoKing/pi-ops-agent/internal/admission"
 	"github.com/KiritoKing/pi-ops-agent/internal/peercred"
 	"github.com/KiritoKing/pi-ops-agent/internal/protocol"
 )
@@ -20,11 +22,14 @@ type Handler interface {
 }
 
 type Server struct {
-	Path      string
-	Mode      os.FileMode
-	SocketGID int
-	Resolver  peercred.Resolver
-	Handler   Handler
+	Path            string
+	Mode            os.FileMode
+	SocketGID       int
+	Resolver        peercred.Resolver
+	Handler         Handler
+	MaxConnections  int
+	AdmissionLimits admission.Limits
+	Now             func() time.Time
 
 	mu       sync.Mutex
 	listener *net.UnixListener
@@ -71,6 +76,23 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		<-ctx.Done()
 		listener.Close()
 	}()
+	limits := s.AdmissionLimits
+	if limits.MaxConcurrent == 0 {
+		limits = admission.Limits{
+			MaxConcurrent: 64, MaxConcurrentPerKey: 16,
+			MaxRequestsPerWindow: 128, MaxGlobalPerWindow: 512,
+			MaxKeys: 256, Window: time.Second, IdleTTL: 5 * time.Minute,
+		}
+	}
+	limiter, err := admission.New(limits, s.Now)
+	if err != nil {
+		return fmt.Errorf("configure Unix admission: %w", err)
+	}
+	maxConnections := s.MaxConnections
+	if maxConnections <= 0 {
+		maxConnections = 64
+	}
+	connectionSlots := make(chan struct{}, maxConnections)
 	for {
 		connection, err := listener.AcceptUnix()
 		if err != nil {
@@ -79,7 +101,15 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			}
 			return err
 		}
-		go s.serveConnection(ctx, connection)
+		select {
+		case connectionSlots <- struct{}{}:
+			go func(connection *net.UnixConn) {
+				defer func() { <-connectionSlots }()
+				s.serveConnection(ctx, connection, limiter)
+			}(connection)
+		default:
+			_ = connection.Close()
+		}
 	}
 }
 
@@ -92,7 +122,7 @@ func (s *Server) Close() error {
 	return s.listener.Close()
 }
 
-func (s *Server) serveConnection(parent context.Context, connection *net.UnixConn) {
+func (s *Server) serveConnection(parent context.Context, connection *net.UnixConn, limiter *admission.Limiter) {
 	defer connection.Close()
 	credential, err := s.Resolver.Resolve(connection)
 	if err != nil {
@@ -104,12 +134,22 @@ func (s *Server) serveConnection(parent context.Context, connection *net.UnixCon
 		if err != nil {
 			return
 		}
-		request, err := protocol.ParseRequest(payload, time.Now())
-		if err != nil {
-			response := protocol.Response{Version: protocol.Version, RequestID: requestIDFromMalformed(payload), OK: false, Error: err.Error()}
+		release, rejected := limiter.Acquire(strconv.FormatUint(uint64(credential.UID), 10))
+		if rejected != "" {
+			response := protocol.Response{Version: protocol.Version, RequestID: requestIDFromMalformed(payload), OK: false, Error: "request admission rejected: " + string(rejected)}
 			if writeErr := writeResponse(connection, response); writeErr != nil {
 				return
 			}
+			continue
+		}
+		request, err := protocol.ParseRequest(payload, s.now())
+		if err != nil {
+			response := protocol.Response{Version: protocol.Version, RequestID: requestIDFromMalformed(payload), OK: false, Error: err.Error()}
+			if writeErr := writeResponse(connection, response); writeErr != nil {
+				release()
+				return
+			}
+			release()
 			continue
 		}
 		ctx, cancel := context.WithDeadline(parent, request.Deadline)
@@ -122,9 +162,18 @@ func (s *Server) serveConnection(parent context.Context, connection *net.UnixCon
 			response.RequestID = request.RequestID
 		}
 		if err := writeResponse(connection, response); err != nil {
+			release()
 			return
 		}
+		release()
 	}
+}
+
+func (s *Server) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func writeResponse(connection *net.UnixConn, response protocol.Response) error {

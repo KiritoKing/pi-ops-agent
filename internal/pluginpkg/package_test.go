@@ -101,7 +101,7 @@ func TestRepositoryHermesWorkloadManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.ID != "workload.hermes" || manifest.Version != "0.2.0" || manifest.Workload == nil {
+	if manifest.ID != "workload.hermes" || manifest.Version != "0.3.0" || manifest.Workload == nil {
 		t.Fatalf("unexpected repository workload manifest: %#v", manifest)
 	}
 	for _, file := range manifest.Workload.Files {

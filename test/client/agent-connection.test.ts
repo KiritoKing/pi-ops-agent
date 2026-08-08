@@ -55,7 +55,15 @@ describe("AgentConnection", () => {
     });
     const connection = await AgentConnection.connect(
       socketPath,
-      { type: "hello", sessionId: parseSessionId("session-1234") },
+      {
+        type: "hello",
+        sessionId: parseSessionId("session-1234"),
+        peer: {
+          apiVersion: "agentd.client-peer/v1",
+          adapterId: "adapter.tui",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+      },
       {
         onMessage: (message) => {
           messages.push(message.type);
@@ -71,7 +79,15 @@ describe("AgentConnection", () => {
     await Promise.all([promptReceived, messagesReceived]);
 
     expect(received[0]).toEqual(
-      { type: "hello", sessionId: "session-1234" },
+      {
+        type: "hello",
+        sessionId: "session-1234",
+        peer: {
+          apiVersion: "agentd.client-peer/v1",
+          adapterId: "adapter.tui",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+      },
     );
     expect(received[1]).toMatchObject({
       type: "prompt",

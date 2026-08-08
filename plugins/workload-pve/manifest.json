@@ -1,0 +1,34 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "workload.pve",
+  "kind": "workload",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Preview until real PVE lab acceptance: digest-bound Proxmox VE inspection and typed root maintenance without raw pvesh, qm, pct, shell, or argv delegation.",
+  "entrypoint": "workload.mjs",
+  "capabilities": [
+    "pve.backup",
+    "pve.cluster.inspect",
+    "pve.guest.inspect",
+    "pve.guest.lifecycle",
+    "pve.guest.migrate",
+    "pve.guest.restore",
+    "pve.node.inspect",
+    "pve.snapshot.manage",
+    "pve.storage.inspect",
+    "pve.task.inspect"
+  ],
+  "requestedScopes": [
+    "pve.backup.prepare",
+    "pve.cluster.read",
+    "pve.guest.lifecycle",
+    "pve.guest.migrate",
+    "pve.guest.read",
+    "pve.guest.restore",
+    "pve.node.read",
+    "pve.snapshot.manage",
+    "pve.storage.read",
+    "pve.task.read"
+  ]
+}

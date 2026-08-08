@@ -32,6 +32,7 @@ describe("BotMux configuration hardener", () => {
       sandbox: true,
       sandboxHidePaths: ["/private"],
       sandboxNetwork: false,
+      env: { PRESERVED: "yes", PATH: "/untrusted/path" },
     }];
     writeFileSync(configPath, `${JSON.stringify(original)}\n`, { encoding: "utf8", mode: 0o600 });
     chmodSync(configPath, 0o600);
@@ -39,7 +40,10 @@ describe("BotMux configuration hardener", () => {
     const output = execFileSync(
       process.execPath,
       [join(process.cwd(), "scripts/configure-botmux.mjs"), configPath],
-      { encoding: "utf8" },
+      {
+        encoding: "utf8",
+        env: { ...process.env, OPS_AGENT_BOTMUX_TEST_ONLY: "1" },
+      },
     );
     const configured = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
     if (!Array.isArray(configured)) throw new Error("expected a BotMux config array");
@@ -49,10 +53,20 @@ describe("BotMux configuration hardener", () => {
     expect(bot).toMatchObject({
       larkAppSecret: secret,
       cliId: "pi",
-      cliPathOverride: "/opt/pi-ops-agent/bin/ops-agent-botmux",
+      cliPathOverride: "/opt/pi-ops-agent/botmux-bin/pi",
       p2pOpen: false,
       disableCliBypass: true,
+      launchShell: "/bin/bash",
+      env: {
+        PRESERVED: "yes",
+        PATH: "/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      },
       sandbox: false,
+      autoGrantRequestCards: false,
+      autoStartOnGroupJoin: false,
+      autoStartOnNewTopic: false,
+      disableStreamingCard: true,
+      silentTurnReactions: true,
       writableTerminalLinkInCard: false,
     });
     expect(bot).not.toHaveProperty("sandboxHidePaths");

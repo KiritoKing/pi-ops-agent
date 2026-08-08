@@ -2,7 +2,7 @@
 
 # Pi Ops Agent
 
-**一个原生运行于 Linux/systemd、面向多机器与多账号的最小权限运维 Agent。**
+**面向 Linux/systemd 的最小权限运维 Agent：核心负责隔离和授权，Adapter 与 Workload 提供业务能力。**
 
 [![CI](https://github.com/KiritoKing/pi-ops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/KiritoKing/pi-ops-agent/actions/workflows/ci.yml)
 ![Linux](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-blue)
@@ -11,157 +11,174 @@
 
 </div>
 
-Pi Ops Agent 使用 Pi Agent Harness 提供自然语言诊断和受控变更能力。`agentd` 始终使用
-非特权账户；模型 API 请求需要网络，而模型可调用的 `ops_bash` 仅在无网络 bubblewrap
-可用时注册。跨机器访问经 mTLS `agentd-server`，root 能力只存在于目标机本地、
-Unix-only 的类型化 `agentd-root-broker`，审批在模型上下文之外完成。
+Pi Ops Agent 的安全目标不是让 Agent “永远做不了高权限操作”，而是让它**不能自主、
+免审批地做未授权操作**。普通 root 操作由版本化的类型协议表达；只有 root-owned Target policy
+在 `authorization.standingScopes` 中逐项列出的普通 scope 才能复用持久授权，其余操作都在模型
+上下文之外逐次审批。无法预先类型化的例外操作进入显式、计划绑定的 manual root capsule；
+它可以在受管 host 产生任意 root 副作用，但永远只允许本地 TUI 经 PASSWD sudo 和真实
+`/dev/tty` 人工审批，不能由 Agent、reviewer、standing policy 或外部 Adapter 自行授权，也不是
+普通操作可复用的 raw-command RPC。
 
-## MVP 能力
+能力分成三层：
 
-- 一个中央 `agentd` 管理多台 systemd Linux 机器。
-- 目标态 `agentd-guard` 与 `agentd` 同 UID，只做语义心跳和有界保活；当前
-  `ops-systemd-helper` 仍是 root 兼容层，能力只允许继续收缩。
-- 每台机器一个非 root `agentd-server`，管理多个 Target/Unix 账号。
-- 每台机器一个 root `agentd-root-broker`，只执行 root-owned policy 允许的类型化操作。
-- 多 Session；一个 Session 首次访问时原子绑定一个 Machine + Target，同一机器可有多个
-  Session，每个 Session 独占可写 scratch workspace。
-- 有界主机、进程、service、journal 和文件巡检。
-- 类型化 change、写前备份、不可变计划、人类审批、验证与版本化回滚证据。
-- 摘要绑定的声明式 `managed-workload` 插件；通用 OCI 执行器固定 loopback、资源、mount 与 capability 安全模板，不暴露宿主 shell 或原始 Docker argv。
-- TUI 是始终安装的本地入口；BotMux 等 IM 以独立 Adapter Plugin 后装。
-- amd64/arm64 预构建 Release；目标机无需 Git、Node、npm、Go 或本地构建。
+- **Core**：Pi Harness、非特权 sandbox、进程/账号隔离、HTTPS/mTLS C/S、类型化 root broker、
+  审批与审计。Core 不内置 Agent 可见的业务工具。
+- **Adapter**：决定外部会话、消息、发送动作和审批意图如何接入。TUI 是必须安装的恢复入口，
+  BotMux 等外部系统由后装 Adapter 接入。
+- **Workload**：提供 Agent 可见工具和受控运维 recipe。`workload.base` 提供基础诊断与 workspace
+  命令；Hermes、BotMux 运维和 PVE 管理属于业务 Workload。
 
-Ops Agent 自身不提供 Docker、OCI、Compose 或非 systemd 部署。MVP 也不提供通用容器
-管理、任意远端 root shell、记忆/自进化、自动批准写操作、多人审批和 controller HA。
+`adapter.tui` 与 `workload.base` 是启动所需的两个源码插件。安装器会先展示它们的源码摘要和
+请求 scope，再要求用户明确同意；它们不是因“第一方”身份而自动可信。
+真实 bubblewrap/user namespace 不可用时，初始化会失败并回滚，不会让必需的
+`workload.base` 退化成宿主 shell 或进程内 loader。
 
-## 架构
+## 架构概览
 
 ```mermaid
 flowchart LR
-  U["用户"] --> T["TUI"]
-  U --> I["可选 Adapter Plugin"]
-  T --> G["Client Gateway"]
-  I --> G
-  G -->|"prompt"| A["agentd / Pi Harness\n非 root"]
-  G -->|"模型外审批"| P["Approval Router"]
-  A -->|"语义心跳"| W["ops-systemd-helper\n当前 root 兼容层"]
-  W -.->|"有界终止卡死 agentd"| A
-  A -->|"HTTPS + JSON + mTLS"| S["agentd-server\n每机器一个，非 root"]
-  P -->|"独立 approver principal"| S
-  S -->|"Unix typed RPC"| R["agentd-root-broker\n每机器一个，root"]
-  R --> T1["Target: 本机系统"]
-  R --> T2["Target: 其他账号/资源"]
+  U["用户"] --> T["adapter.tui\n本地恢复与审批"]
+  U --> X["其他 Adapter\n消息与会话"]
+  T --> C["compiled Client"]
+  X --> C
+  C --> W["peer-authenticated\nlocal session gateway"]
+  W --> A["agentd + Pi Harness\nops-agent UID"]
+  A --> G["agentd-guardian\n同 UID、仅保活"]
+  C --> V["approval reviewer\n独立 UID、仅建议"]
+  C --> Q["agentd-approval-submit\nPASSWD sudo、root 短进程"]
+  A -->|"HTTPS + mTLS\nagent role"| S["agentd-server\n专用非 root UID"]
+  C -->|"HTTPS + mTLS\nobserver role / status only"| S
+  Q -->|"HTTPS + mTLS\napprover role"| S
+  S -->|"Unix socket + typed RPC"| R["agentd-root-broker\nroot、无网络监听"]
+  R --> H["root-owned policy\n备份/执行/验证/恢复"]
 ```
 
-`agentd-server` 的服务账户本身不需要拥有业务资源。`agentd-root-broker` 根据 root-owned policy
-把 Target 映射到 UID/GID、路径、unit 和固定 recipe；“允许 root 操作”不等于 server
-获得 root 或任意 shell。
+规范名称与当前 artifact 并非全部相同：
 
-规范组件名是 `agentd / agentd-guard / agentd-server / agentd-root-broker`。当前版本
-仍保留 `ops-agentd`、`ops-systemd-helper`、`ops-agent-server`、`ops-root-helper` 等 artifact
-名称；部署命令继续使用真实 unit 名称。完整职责和迁移边界见[架构](docs/architecture.md)。
+| 规范组件 | 当前 artifact | 当前状态 |
+|---|---|---|
+| `agentd` | `ops-agentd.service` | 已运行于 `ops-agent` 非 root 账号 |
+| `agentd-guardian` | `agentd-guardian.service` | 同 UID 心跳与身份复核；旧 root `ops-systemd-helper` 已退出 release/runtime |
+| local session gateway | `agentd-client-gateway.service` / `agentd-client-gateway` | `SO_PEERCRED` + exact Adapter digest Session namespace；公开 socket 与 owner-only agentd backend 分离 |
+| approval reviewer | `agentd-approval-reviewer.service` | 独立 UID/Unix socket；确定性风险解释，不能签名或批准 |
+| approval submitter | `agentd-approval-submit` | 无 daemon/socket；每次以 PASSWD sudo 启动 root 短进程，重新展示/确认权威计划后签名 |
+| `agentd-server` | `ops-agent-server.service` / `ops-agent-server` | TLS 1.3 mTLS HTTPS 入口，专用非 root 账号 |
+| `agentd-root-broker` | `ops-root-helper.service` / `ops-root-helper` | root-only Unix RPC、策略、变更状态和恢复证据 |
+| PVE root broker | `ops-pve-root-helper.service` / `ops-root-helper --domain=pve` | `init` 要求本机 `/usr/bin/pvesh`；`join` 还要求 signed `--pve` enrollment 精确匹配；独立 socket/state/audit |
 
-安全边界详见[安全模型](docs/security-model.md)。
+完整进程、身份和兼容边界见[架构文档](docs/architecture.md)。
 
-## 一条命令初始化
+## 当前实现范围
 
-Pi Ops Agent 只提供原生 systemd 部署。PVE LXC 不需要 Docker：
+已经接入的关键边界：
+
+- Pi 依赖升级到 `0.84.1`，以公开 `agent_settled` 作为一次 turn 的权威完成事件；
+- Client 在 agentd socket 断开后立即停止读取 stdin 并退出，外部 PTY 可重建会话；
+- 公开 `agentd.sock` 由 local session gateway 持有；同一可预测 Session ID 会按真实 peer UID、
+  Adapter ID/digest 隔离，单个 namespace 同时只允许一个 live writer，agentd 只监听 `backend.sock 0600`；
+- agent key 保持 `ops-agent:ops-agent 0600`；本地管理员与 Adapter 只经独立
+  `ops-agent-client` group 访问 agent socket、Plugin CAS 和 status-only observer identity；
+- `workload.base` 的持久化授权决定基础工具是否注册，未注册时 Agent 不会获得这些工具；
+- Source Plugin 使用严格 manifest、canonical SHA-256、不可变快照、scope 绑定和原子 `current`；
+  常规注册通过 broker 的 typed `plugin.register` 把 version、publisher、capabilities、digest 与
+  requestedScopes 一并写入权威计划，执行前 re-hash 并逐项重验，失败时恢复先前 registration；
+- Plugin 注册授权和 Target 授权相互独立：每次安装或源码更新都因新 digest 经过本地逐次审批，
+  实际 root 能力再取 plugin grant、Target 资源 allowlist 与显式 standing scope 的交集；
+- legacy policy 或缺少/留空 `authorization.standingScopes` 的 Target 仍逐次人工审批；当前只有
+  精确的普通文件、service/workload service 与非 critical PVE operation scope 可 standing execute；
+  其中通用 `file.write`/`service.action` 还必须由真实 `workload.base` caller 注入当前摘要，且
+  Target 的 `authorization.baseWorkloadDigest` 必须与它完全一致，源码更新后不会继承旧授信；
+  PVE stop/reboot、snapshot delete/rollback、restore、migrate 固定逐次人工审批，
+  package/artifact 安装、`plugin.register`、`plugin.install`、`workload.deploy` 与
+  `breakglass.script` 永不使用 standing 授权；
+- 每次 `change.prepare` 后 controller 都必须再发起 `change.status` 并校验该 domain pinned
+  Ed25519 broker key 的 receipt；只有签名状态为 `PENDING_APPROVAL` 时才向审批 side-channel
+  暴露 change，签名状态为 `COMMITTED` 则表示命中了 standing policy；
+- `/approve` 与 `/rollback` 先取得 broker 的权威计划，独立 reviewer 解释风险；第二次相同
+  命令只会启动 root-owned submitter，它再次查询计划、要求本地密码和包含 plan hash 的精确
+  TTY 确认后才签名执行；
+- server 只转发 broker 结果；core/PVE broker 用隔离的 Ed25519 key 签署 status/action receipt，
+  Client 与 submitter 按 server registration 固定的公钥验证完整 scope 和结果摘要；
+- ApprovalGrant 同时绑定 server、machine、Target、change、plan、policy revision、capability
+  revision、期限和 nonce；
+- PVE 已建模为固定 node/VM/LXC/snapshot/backup/restore/migration 类型，不接收通用
+  `pvesh`、`qm` 或 `pct` 参数。
+- `workload.hermes-ops` 与 `workload.botmux-ops` 把固定 unit/path schema 留在 digest-covered
+  source 中，通过通用 `target.inspect` / `workload.command.inspect` / `workload.service.manage`
+  providers 工作；fixed command provider 只接收 semantic profileKey，由 root policy 固定
+  root-owned executable/argv 并在 non-root network-isolated transient service 中运行，结果有 core
+  broker receipt 且 audit 不存正文；service provider 以
+  `workload.service.action` 准备 actual caller digest/account/manager/unit/action 全绑定的
+  `reload`/`reset-failed`/`restart`/`start`/`stop`；root policy、权威前置状态和执行后验证仍由
+  broker 负责，任意 CLI/argv 和配置正文不开放，`reload`/`reset-failed` 永不 standing；
+- `adapter.tui` 的不可执行 `profile.json` 经固定 runner 校验后只启动 compiled Client；
+  `adapter.botmux` 则从不可变 snapshot 执行真实 Source entrypoint，运行于专用
+  `ops-agent-botmux` UID；两者每次都重验 active digest，并以真实 UID 通过独立非 root lease
+  broker 的固定 socket 持有 exact digest，不能直接打开 registry lock；
+
+仍在迁移中的边界必须按现状理解：
+
+- Adapter 已有固定、非特权 Source runner：任意获批 `.mjs` Adapter 必须通过 strict descriptor，
+  且除精确 `adapter.tui` profile 外都被强制为 status-only；Workload 源码在隔离 bubblewrap host
+  中运行，tool capability 必须与 manifest 精确一致，provider 则只按 name + requested scope
+  policy 授权；两者同名不会产生额外 authority；
+- 旧 `.opspkg` catalog、`plugin.install`、`workload.deploy` 和 Hermes OCI executor 仍保留作
+  兼容路径，尚未全部迁移成 Source Workload；
+- 升级安装会停用并删除旧 `ops-systemd-helper` unit/drop-in，但保留历史 state/audit；
+- 任意 root Target 都可以准备 manual root capsule，但它永远是逐次本地 TUI/PASSWD/TTY 审批；
+  script 与 network 声明必须进入计划，backup paths 和 verify 可留空，但 reviewer 会把缺少恢复
+  或验证证据标为 critical；PVE broker 不接受该 raw-script 例外，且 capsule 不提供自动回滚；
+- reviewer 当前是只看用户原始输入与 broker 权威计划的确定性解释器；LLM/AST 拆分、基于
+  reviewer 的低风险自动批准、多方审批、外部审计锚定和 controller HA 尚未实现。
+
+更多准确状态见[重构基线](docs/mvp-refactor.md)。
+
+## 初始化
+
+仅支持 systemd Linux。Raw bootstrap 下载匹配架构的 Release、校验 checksum，并在可用时
+通过 GitHub CLI 验证 attestation；主机修改由 Release 内的版本化安装器完成。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
   | sudo sh -s -- init
 ```
 
-GitHub Raw 脚本只做平台探测、Release 下载和完整性校验；版本化 Release 安装器创建账号、
-配置、systemd unit、模型 credential，启动核心并执行冒烟。目标机不会构建源码。
+交互式初始化会分别显示 `adapter.tui` 与 `workload.base` 的 digest 和 scopes，并要求输入
+精确确认。自动化环境必须先在变更系统中获得同等的人类授权，再显式传入：
 
-`init` 不安装或初始化 BotMux。完成后重新登录并进入 TUI：
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
+  | sudo sh -s -- init --approve-required-plugins
+```
+
+这个参数不是让 Agent 自批；它表示调用方已经在外部流程中批准安装器刚展示且随 Release
+固定的两个必要源码插件。任何其他 Adapter/Workload，以及这两个插件更新后的新 digest，
+都必须重新审批。
+
+完成后重新登录以刷新 supplementary groups，再运行：
 
 ```bash
 ops-agent tui
 ```
 
-裸 `init` 只授权核心运维能力：主机快照、进程、核心 systemd unit/journal、受控变更准备和
-状态查询；业务 artifact、Docker package/unit 和文件读取路径均默认为空。首次安装时可由
-管理员在模型外按 catalog ID 精确授权所需扩展，例如：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- init --enable-artifact workload.hermes
-```
-
-该参数只把 Release catalog 中匹配 ID 的完整 publisher/version/digest 写入 policy，不能由
-调用者替换身份。只有 `managed-workload` 会同时加入通用 Docker 前置权限；已有 policy 不会
-被安装器借升级静默扩权。
-
-业务能力使用与 Adapter 相同的受信插件目录、严格 manifest、摘要校验和原子安装机制。
-`managed-workload` 插件只声明受限 OCI 工作负载；不能携带 root 代码、宿主命令或原始
-Docker 参数。模型只能准备精确绑定 `id/kind/version/publisher/digest` 的
-`plugin.install` 与 `workload.deploy`，每一步仍需模型外 `/approve <changeRef>`。
-
-仓库随 Release 提供 `workload.hermes` 作为首个验证用例，但核心协议、Target 和执行器均不
-包含 Hermes 专用字段。安装、模型外 credential 配置和交互验收见
-[Hermes 工作负载指南](docs/workloads/hermes.md)。
-
-BotMux 本体是外部依赖，不由 `init` 或插件包暗中联网安装。先按
-[BotMux 官方文档](https://deepcoldy.github.io/botmux/)安装 `botmux`，随后直接向 Agent 发送：
-
-```text
-帮我安装 BotMux adapter
-```
-
-这要求 fresh init 时已显式传入 `--enable-artifact adapter.botmux`，或管理员已在现有
-Target policy 中复核并加入 catalog 所固定的完整 artifact identity。
-
-Agent 会查询可信插件目录、说明权限和包摘要、准备类型化安装计划，并等待管理员
-`/approve <changeRef>`；Agent 自己不能审批或执行任意安装脚本。提交完成后，在同一个
-交互式 TUI 输入精确命令 `/botmux-setup`：client 在模型外调用 BotMux 官方 setup、把
-首个 bot 固定到 ops-agent wrapper、关闭开放私聊与 CLI 免审批绕过，再重启 BotMux。
-Lark secret 只进入 BotMux 的终端交互，不进入模型、Agent transcript 或 argv。
-
-固定 Tag、`.deb`、GitHub artifact attestation、PVE LXC 和后续机器 `join` 见
+生产部署应固定 Release tag；`join`、离线 enrollment、回退和 LXC 约束见
 [部署文档](docs/deployment.md)。
 
-## 权限与变更
+## Plugin 入口
 
-有效能力取以下交集：
+- [Source Plugin 信任、摘要、安装和更新](docs/plugins.md)
+- [Adapter 会话、消息与审批边界](docs/adapters.md)
+- [Workload 工具和类型化 recipe](docs/workloads.md)
+- [Hermes 兼容工作负载](docs/workloads/hermes.md)
+- [PVE 标准工作负载（typed ABI 已实现；真实 PVE lab 验收前为预览）](docs/workloads/pve.md)
 
-```text
-Harness 固定工具
-∩ Principal/Session 权限
-∩ 已知 capability schema
-∩ agentd-server capability
-∩ root-owned policy
-```
+仓库同时提供给其他代码 Agent 使用的开发 Skill：
 
-模型不能传 endpoint、证书、UID、`runAs`、任意宿主路径或 root argv。所有写操作遵循：
-
-```text
-PREPARED -> APPROVED -> EXECUTING -> COMMITTED
-     |                        |
-     +-> REJECTED/EXPIRED     +-> ROLLED_BACK/RECOVERY_REQUIRED
-```
-
-审批绑定 agentd-server、machine、Target、change、plan hash、policy/capability revision、前置条件、
-期限和 nonce。连接中断后只查询原 change，不能重放 mutation。
-
-## 目录
-
-```text
-src/             TypeScript Harness、Session、Client Gateway 与共享协议
-cmd/             Go 命令薄入口
-internal/        agentd-server、agentd-root-broker、兼容 guard、策略、备份、审计与恢复
-plugins/         IM Adapter 与声明式 managed-workload 插件
-integrations/    Adapter runtime
-systemd/         原生 systemd unit 与 tmpfiles
-scripts/         Raw bootstrap、Release 安装、健康与卸载
-packaging/       可复现原生 Release、Debian 与插件打包
-docs/            架构、安全、部署和运维事实
-```
+- [`agentd-init`](skills/agentd-init/SKILL.md)：初始化、join、升级与恢复；
+- [`agentd-adapter-dev`](skills/agentd-adapter-dev/SKILL.md)：Adapter API、威胁边界和示例；
+- [`agentd-workload-dev`](skills/agentd-workload-dev/SKILL.md)：Workload API、typed broker recipe 和示例。
 
 ## 开发验证
-
-本地开发仍需仓库工具链，但它与目标机部署无关：
 
 ```bash
 npm ci
@@ -172,12 +189,14 @@ go test -race ./internal/...
 git diff --check
 ```
 
-Linux 发布前还需验证 systemd unit、bubblewrap、干净 systemd VM/LXC、enrollment、真实模型和
-Adapter 端到端。不能通过关闭 sandbox、放宽 UID/路径策略或跳过审批制造通过结果。
+涉及 systemd、bubblewrap、安装器、真实模型、PVE 或 Adapter 的变更，还必须在隔离的
+systemd Linux 上做对应冒烟、故障注入与恢复测试。没有完成的环境验证必须如实记录；不能
+通过关闭 sandbox、放宽 UID/path/policy 或跳过审批制造通过结果。
 
 ## 文档
 
-- [架构与领域模型](docs/architecture.md)
+- [架构、进程与数据流](docs/architecture.md)
 - [安全模型](docs/security-model.md)
-- [原生部署与接入](docs/deployment.md)
+- [部署与接入](docs/deployment.md)
 - [升级、审计与恢复](docs/operations.md)
+- [v0.3 重构基线与上游同步](docs/mvp-refactor.md)

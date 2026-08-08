@@ -4,6 +4,7 @@ import {
   optionalString,
   requireRecord,
   requireString,
+  requireStringArray,
 } from "../shared/guards.js";
 import {
   parseMachineId,
@@ -13,6 +14,7 @@ import {
   type TurnId,
 } from "../shared/domain.js";
 import { requireExactRecord } from "../shared/strict.js";
+import { encodeChangeRef, parseChangeRef } from "../shared/approval.js";
 import { encodeFrame, FrameDecoder } from "../shared/framing.js";
 import type {
   AgentClientMessage,
@@ -71,7 +73,8 @@ function parseAgentServerMessage(value: unknown): AgentServerMessage {
     }
     case "tool": {
       const input = requireExactRecord(base, "agent tool response", [
-        "type", "phase", "name", "isError", "sessionId", "turnId", "machineId", "targetId",
+        "type", "phase", "name", "isError", "preparedChangeRefs",
+        "sessionId", "turnId", "machineId", "targetId",
       ]);
       const phase = requireString(input.phase, "agent response.phase", { max: 16 });
       if (phase !== "start" && phase !== "end") {
@@ -80,13 +83,36 @@ function parseAgentServerMessage(value: unknown): AgentServerMessage {
       if (input.isError !== undefined && typeof input.isError !== "boolean") {
         throw new Error("agent response.isError must be a boolean");
       }
+      const preparedChangeRefs = input.preparedChangeRefs === undefined
+        ? undefined
+        : requireStringArray(
+          input.preparedChangeRefs,
+          "agent response.preparedChangeRefs",
+          32,
+        ).map((reference, index) => {
+          const parsed = parseChangeRef(reference);
+          if (encodeChangeRef(parsed) !== reference) {
+            throw new Error(`agent response.preparedChangeRefs[${index}] is not canonical`);
+          }
+          return reference;
+        });
+      if (phase === "start" && preparedChangeRefs !== undefined) {
+        throw new Error("agent tool start cannot report prepared changes");
+      }
+      if (preparedChangeRefs?.length === 0) {
+        throw new Error("agent tool end preparedChangeRefs cannot be empty");
+      }
       const message: AgentServerMessage = {
         type,
         phase,
         name: requireString(input.name, "agent response.name", { max: 256 }),
         ...correlation(input),
       };
-      return input.isError === undefined ? message : { ...message, isError: input.isError };
+      return {
+        ...message,
+        ...(input.isError === undefined ? {} : { isError: input.isError }),
+        ...(preparedChangeRefs === undefined ? {} : { preparedChangeRefs }),
+      };
     }
     case "error": {
       const input = requireExactRecord(base, "agent error response", [

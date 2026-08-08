@@ -9,21 +9,22 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: 22.19.0
+  GO_VERSION: 1.26.5
+  NODE_VERSION: 22.23.2
 
 jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
       - name: Verify tag and manifests use the package version
@@ -33,6 +34,24 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           package_version="$(node -p 'require("./package.json").version')"
           test "${version}" = "${package_version}"
+          lock_version="$(node -p 'require("./package-lock.json").packages[""].version')"
+          test "${version}" = "${lock_version}"
+          NODE_VERSION="${NODE_VERSION}" node <<'NODE'
+          const packageDocument = require("./package.json");
+          const match = /^>=(\d+)\.(\d+)\.(\d+)$/u.exec(packageDocument.engines?.node ?? "");
+          if (match === null) throw new Error("package engines.node must be one exact minimum");
+          const minimum = match.slice(1).map(Number);
+          const runtime = process.env.NODE_VERSION.split(".").map(Number);
+          for (let index = 0; index < 3; index += 1) {
+            if (runtime[index] > minimum[index]) break;
+            if (runtime[index] < minimum[index]) throw new Error("pinned runtime is below engines.node");
+          }
+          for (const dependency of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"]) {
+            if (!/^\d+\.\d+\.\d+$/u.test(packageDocument.dependencies?.[dependency] ?? "")) {
+              throw new Error(`${dependency} must use an exact version`);
+            }
+          }
+          NODE
           client_version="$(sed -n 's/^const VERSION = "\([^"]*\)";$/\1/p' src/client/index.ts)"
           test "${version}" = "${client_version}"
           for manifest in plugins/*/manifest.json; do
@@ -44,6 +63,65 @@ jobs:
       - run: go vet ./cmd/... ./internal/...
       - run: go test -race ./internal/...
       - run: git diff --check
+
+  adapter-linux-runtime:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - run: npm run build
+      - name: Install the real Adapter sandbox dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+      - name: Create the disposable Adapter identity fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_identity="$(id -a)"
+          if /usr/bin/getent passwd ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Disposable runner unexpectedly contains an ops-agent probe identity" >&2
+            exit 1
+          fi
+          sudo /usr/sbin/groupadd --system ops-agent-client
+          sudo /usr/sbin/groupadd --system ops-agent-botmux
+          sudo /usr/sbin/useradd --system \
+            --gid ops-agent-botmux \
+            --groups ops-agent-client \
+            --home-dir /var/lib/ops-agent/adapters/botmux \
+            --shell /usr/sbin/nologin \
+            --no-create-home \
+            ops-agent-botmux
+          sudo /usr/bin/install -d \
+            -o ops-agent-botmux -g ops-agent-botmux -m 0700 \
+            /var/lib/ops-agent/adapters/botmux
+          sudo /usr/bin/install -d -o root -g root -m 0755 /opt/pi-ops-agent
+          test "$(id -a)" = "${runner_identity}"
+      - name: Run the release-blocking real Linux Adapter probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_directory="$(dirname "$(command -v node)")"
+          set +e
+          sudo /usr/bin/env \
+            "PATH=${node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            npm run test:adapter-linux-runtime
+          probe_status="$?"
+          set -e
+          if [[ "${probe_status}" -ne 0 ]]; then
+            echo "Real Linux Adapter probe failed with status ${probe_status}; status 77 is unverified and blocks release" >&2
+            exit "${probe_status}"
+          fi
 
   build:
     needs: validate
@@ -60,14 +138,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
       - run: npm run build
@@ -77,13 +155,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-bin
-          for command_dir in cmd/*; do
-            test -f "${command_dir}/main.go" || continue
-            command_name="$(basename "${command_dir}")"
-            CGO_ENABLED=0 go build -trimpath \
+          release_commands=(
+            ops-agent-server
+            ops-root-helper
+            agentd-guardian
+            agentd-client-gateway
+            agentd-pluginctl
+            agentd-approval-submit
+            agentd-json-config-helper
+          )
+          for command_name in "${release_commands[@]}"; do
+            test -f "cmd/${command_name}/main.go"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" go build -trimpath \
               -ldflags="-s -w" \
-              -o "release-bin/${command_name}" "./${command_dir}"
+              -o "release-bin/${command_name}" "./cmd/${command_name}"
           done
+          test ! -e release-bin/ops-systemd-helper
       - name: Download and verify the pinned Node runtime
         shell: bash
         run: |
@@ -95,7 +182,9 @@ jobs:
           grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict
           mkdir -p node-runtime
           tar -xJf "${node_archive}" --strip-components=1 -C node-runtime
+          test "$(node-runtime/bin/node -p 'process.versions.node')" = "${NODE_VERSION}"
       - name: Build native archive and Debian package
+        id: native_package
         shell: bash
         run: |
           set -euo pipefail
@@ -106,41 +195,74 @@ jobs:
             --node-runtime-dir node-runtime \
             --bin-dir release-bin \
             --output-dir release
+          packaging/verify-release.sh \
+            --version "${GITHUB_REF_NAME#v}" \
+            --arch "${{ matrix.arch }}" \
+            --node-version "${NODE_VERSION}" \
+            --archive "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" \
+            --deb "release/ops-agent-all_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.deb"
           mkdir -p sbom-root
           tar -xzf "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" -C sbom-root
-          node-runtime/bin/node --check sbom-root/payload/app/dist/agentd/index.js
+          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+      - name: Isolate verified native packages before SBOM generation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-packages-${{ matrix.arch }}
+          path: |
+            release/ops-agent-linux-${{ matrix.arch }}.tar.gz
+            release/ops-agent-all_${{ steps.native_package.outputs.version }}_${{ matrix.arch }}.deb
+          if-no-files-found: error
+          retention-days: 7
       - name: Generate installed-payload SPDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: sbom-root/payload/app
           format: spdx-json
           output-file: release/ops-agent-linux-${{ matrix.arch }}.spdx.json
           upload-artifact: false
-      - uses: actions/upload-artifact@v4
+          upload-release-assets: false
+      - name: Upload generated SBOM separately
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-${{ matrix.arch }}
-          path: release/*
+          name: native-sbom-${{ matrix.arch }}
+          path: release/ops-agent-linux-${{ matrix.arch }}.spdx.json
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    needs: build
+    needs:
+      - build
+      - adapter-linux-runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: native-*
           path: release
           merge-multiple: true
+      - name: Re-verify downloaded native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            packaging/verify-release.sh \
+              --version "${GITHUB_REF_NAME#v}" \
+              --arch "${arch}" \
+              --node-version "${NODE_VERSION}" \
+              --archive "release/ops-agent-linux-${arch}.tar.gz" \
+              --deb "release/ops-agent-all_${GITHUB_REF_NAME#v}_${arch}.deb" \
+              --no-payload-execution
+          done
       - name: Build optional first-party plugins
         shell: bash
         run: |
@@ -158,7 +280,7 @@ jobs:
             sha256sum -- * | sort -k 2 > checksums.txt
           )
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/*.deb
@@ -166,6 +288,7 @@ jobs:
             release/*.opspkg
             release/*.spdx.json
             release/manifest.json
+            release/checksums.txt
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

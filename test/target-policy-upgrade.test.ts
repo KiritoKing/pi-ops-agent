@@ -77,6 +77,14 @@ function targetChanges(target: Record<string, unknown>): Record<string, unknown>
   return changes as Record<string, unknown>;
 }
 
+function targetStandingScopes(target: Record<string, unknown>): unknown {
+  const authorization = target.authorization;
+  if (authorization === null || typeof authorization !== "object" || Array.isArray(authorization)) {
+    throw new Error("expected authorization object");
+  }
+  return (authorization as Record<string, unknown>).standingScopes;
+}
+
 describe("target policy upgrades", () => {
   it("migrates only an existing legacy plugin grant and stages the result", () => {
     const original = {
@@ -96,6 +104,7 @@ describe("target policy upgrades", () => {
     const changes = targetChanges(target);
     expect(changes.packages).toEqual([]);
     expect(changes.units).toEqual([]);
+    expect(changes.writePaths).toEqual([]);
     expect(changes.plugins).toEqual([{
       id: "adapter.botmux",
       kind: "im-adapter",
@@ -104,6 +113,7 @@ describe("target policy upgrades", () => {
       digest: digest("a"),
     }]);
     expect((target.inspect as Record<string, unknown>).units).toEqual(["ops-agentd.service"]);
+    expect(targetStandingScopes(target)).toEqual([]);
   });
 
   it("does not refresh or widen an existing structured allowlist", () => {
@@ -130,6 +140,8 @@ describe("target policy upgrades", () => {
     expect(changes.plugins).toEqual([pinned]);
     expect(changes.packages).toEqual([]);
     expect(changes.units).toEqual([]);
+    expect(changes.writePaths).toEqual([]);
+    expect(targetStandingScopes(localTarget(policy))).toEqual([]);
   });
 
   it("creates a core-only policy without catalog artifacts or Docker", () => {
@@ -139,11 +151,13 @@ describe("target policy upgrades", () => {
     expect(changes.packages).toEqual([]);
     expect(changes.units).toEqual([]);
     expect(changes.plugins).toEqual([]);
+    expect(changes.writePaths).toEqual([]);
     expect((target.inspect as Record<string, unknown>).units).toEqual([
       "ops-agent-server.service",
       "ops-agentd.service",
     ]);
     expect((target.inspect as Record<string, unknown>).readPaths).toEqual([]);
+    expect(targetStandingScopes(target)).toEqual([]);
   });
 
   it("authorizes an explicit adapter without adding Docker permissions", () => {
@@ -223,5 +237,43 @@ describe("target policy upgrades", () => {
     const { policy } = runInitializer(existing);
     expect((localTarget(policy).inspect as Record<string, unknown>).readPaths)
       .toEqual(["/etc", "/proc", "/var/log"]);
+    expect(targetChanges(localTarget(policy)).writePaths).toEqual([]);
+    expect(targetStandingScopes(localTarget(policy))).toEqual([]);
+  });
+
+  it("preserves explicit standing scopes but never derives them from legacy allowlists", () => {
+    const baseWorkloadDigest = `sha256:${"b".repeat(64)}`;
+    const original = {
+      version: 1,
+      revision: "policy-standing-v1",
+      targets: [{
+        id: "target-local-system",
+        account: "root",
+        displayName: "Local system",
+        inspect: { hostSnapshot: true, processList: true, units: [], readPaths: [] },
+        changes: { writePaths: [], units: ["example.service"], packages: ["curl"], plugins: [] },
+        authorization: { standingScopes: ["service.action"], baseWorkloadDigest },
+      }],
+    };
+    const { policy } = runInitializer(original);
+    expect(targetStandingScopes(localTarget(policy))).toEqual(["service.action"]);
+    expect((localTarget(policy).authorization as Record<string, unknown>).baseWorkloadDigest)
+      .toBe(baseWorkloadDigest);
+  });
+
+  it("refuses to migrate standing base operations without an exact workload.base digest", () => {
+    const original = {
+      version: 1,
+      revision: "policy-unsafe-standing-v1",
+      targets: [{
+        id: "target-local-system",
+        account: "root",
+        displayName: "Local system",
+        inspect: { hostSnapshot: true, processList: true, units: [], readPaths: [] },
+        changes: { writePaths: [], units: ["example.service"], packages: [], plugins: [] },
+        authorization: { standingScopes: ["service.action"] },
+      }],
+    };
+    expect(() => runInitializer(original)).toThrow();
   });
 });

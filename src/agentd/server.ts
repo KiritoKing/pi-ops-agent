@@ -6,7 +6,6 @@ import type { AgentConfig } from "../shared/config.js";
 import { parseTurnId, type SessionId, type TurnId } from "../shared/domain.js";
 import { encodeFrame, FrameDecoder } from "../shared/framing.js";
 import { parseAgentClientMessage, type AgentServerMessage } from "../shared/messages.js";
-import { callHelper, deadline, requestId } from "../shared/rpc.js";
 import type { AuditLog } from "./audit.js";
 import type { OpsSession, SessionFactory } from "./session.js";
 
@@ -26,7 +25,6 @@ export class AgentServer {
   readonly #sessions: SessionFactory;
   readonly #audit: AuditLog;
   readonly #server = createServer();
-  #heartbeat?: NodeJS.Timeout;
 
   constructor(config: AgentConfig, sessions: SessionFactory, audit: AuditLog) {
     this.#config = config;
@@ -35,26 +33,26 @@ export class AgentServer {
   }
 
   async start(): Promise<void> {
-    await mkdir(dirname(this.#config.socketPath), { recursive: true, mode: 0o750 });
-    await removeStaleSocket(this.#config.socketPath);
+    await mkdir(dirname(this.#config.backendSocketPath), { recursive: true, mode: 0o750 });
+    await removeStaleSocket(this.#config.backendSocketPath);
     this.#server.on("connection", (socket) => this.#handleConnection(socket));
     await new Promise<void>((resolve, reject) => {
       this.#server.once("error", reject);
-      this.#server.listen(this.#config.socketPath, () => {
+      this.#server.listen(this.#config.backendSocketPath, () => {
         this.#server.off("error", reject);
         resolve();
       });
     });
-    await chmod(this.#config.socketPath, 0o660);
-    this.#heartbeat = setInterval(() => void this.#sendHeartbeat(), 10_000);
-    this.#heartbeat.unref();
-    await this.#audit.append({ type: "agentd_started", socket: this.#config.socketPath });
+    await chmod(this.#config.backendSocketPath, 0o600);
+    await this.#audit.append({
+      type: "agentd_started",
+      backendSocket: this.#config.backendSocketPath,
+    });
   }
 
   async stop(): Promise<void> {
-    if (this.#heartbeat) clearInterval(this.#heartbeat);
     await new Promise<void>((resolve) => this.#server.close(() => resolve()));
-    await unlink(this.#config.socketPath).catch(() => undefined);
+    await unlink(this.#config.backendSocketPath).catch(() => undefined);
     await this.#audit.append({ type: "agentd_stopped" });
   }
 
@@ -122,20 +120,4 @@ export class AgentServer {
     socket.once("close", cleanup);
   }
 
-  async #sendHeartbeat(): Promise<void> {
-    const request = {
-      version: 1 as const,
-      requestId: requestId(),
-      deadline: deadline(5),
-      method: "heartbeat" as const,
-    };
-    try {
-      await callHelper(this.#config.systemdHelperSocket, request, undefined, 5000);
-    } catch (error) {
-      await this.#audit.append({
-        type: "heartbeat_failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
 }

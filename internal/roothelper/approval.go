@@ -67,7 +67,7 @@ func (v *ApprovalVerifier) Verify(grant protocol.ApprovalGrant, action string, c
 	if now.Before(issuedAt.Add(-30*time.Second)) || !now.Before(expiresAt) {
 		return errors.New("approval grant is not currently valid")
 	}
-	if grant.Action != action || grant.ServerID != change.ServerID || grant.MachineID != change.MachineID || grant.TargetID != change.TargetID || grant.ChangeID != change.ID || grant.PlanHash != change.PlanHash || grant.PolicyRevision != change.PolicyRevision {
+	if grant.Action != action || grant.ServerID != change.ServerID || grant.MachineID != change.MachineID || grant.TargetID != change.TargetID || grant.ChangeID != change.ID || grant.PlanHash != change.PlanHash || grant.PolicyRevision != change.PolicyRevision || grant.CapabilityRevision != change.CapabilityRevision {
 		return errors.New("approval grant does not match the authoritative change")
 	}
 	payload, err := grant.ApprovalPayload()
@@ -77,6 +77,48 @@ func (v *ApprovalVerifier) Verify(grant protocol.ApprovalGrant, action string, c
 	signature, err := base64.RawStdEncoding.DecodeString(grant.Signature)
 	if err != nil || len(signature) != ed25519.SignatureSize || !ed25519.Verify(v.PublicKey, payload, signature) {
 		return errors.New("approval grant signature is invalid")
+	}
+	return nil
+}
+
+func (v *ApprovalVerifier) VerifyPVERecoveryClearance(
+	approval protocol.PVERecoveryClearanceApproval,
+	challenge protocol.PVERecoveryClearanceChallenge,
+	change *Change,
+	now time.Time,
+) error {
+	if v == nil || len(v.PublicKey) != ed25519.PublicKeySize || approval.KeyID != v.KeyID {
+		return errors.New("PVE recovery clearance signing key is not trusted")
+	}
+	if err := approval.ValidateShape(); err != nil {
+		return err
+	}
+	if err := challenge.Validate(); err != nil {
+		return err
+	}
+	issuedAt, _ := time.Parse(time.RFC3339Nano, approval.IssuedAt)
+	expiresAt, _ := time.Parse(time.RFC3339Nano, approval.ExpiresAt)
+	challengeExpiry, _ := time.Parse(time.RFC3339Nano, challenge.ExpiresAt)
+	if now.Before(issuedAt.Add(-30*time.Second)) || !now.Before(expiresAt) || expiresAt.After(challengeExpiry) {
+		return errors.New("PVE recovery clearance approval is not currently valid")
+	}
+	if change == nil || approval.Action != protocol.PVERecoveryClearanceAction ||
+		approval.ServerID != change.ServerID || approval.MachineID != change.MachineID || approval.TargetID != change.TargetID ||
+		approval.ClearanceID != challenge.ClearanceID || approval.ParentChangeID != challenge.ParentChangeID ||
+		approval.ChildChangeID != change.ID || approval.ChildChangeID != challenge.ChildChangeID ||
+		approval.ChildPlanHash != change.PlanHash || approval.ChildPlanHash != challenge.ChildPlanHash ||
+		approval.ResourceKey != change.ResourceKey || approval.ResourceKey != challenge.ResourceKey ||
+		approval.ChallengeDigest != challenge.ChallengeDigest || approval.PolicyRevision != change.PolicyRevision ||
+		approval.CapabilityRevision != change.CapabilityRevision {
+		return errors.New("PVE recovery clearance approval does not match the authoritative challenge")
+	}
+	payload, err := approval.ApprovalPayload()
+	if err != nil {
+		return err
+	}
+	signature, err := base64.RawStdEncoding.DecodeString(approval.Signature)
+	if err != nil || len(signature) != ed25519.SignatureSize || !ed25519.Verify(v.PublicKey, payload, signature) {
+		return errors.New("PVE recovery clearance approval signature is invalid")
 	}
 	return nil
 }

@@ -16,8 +16,7 @@ StartLimitBurst=10
 Type=simple
 User=ops-agent-server
 Group=ops-agent-server
-SupplementaryGroups=ops-agent
-ExecStart=/opt/pi-ops-agent/current/bin/ops-agent-server --listen=0.0.0.0:7443 --identity-file=/etc/ops-agent/server-identity.json --target-policy=/etc/ops-agent/targets.json --tls-cert=/etc/ops-agent/tls/server.crt --tls-key=/etc/ops-agent/tls/server.key --client-ca=/etc/ops-agent/tls/client-ca.crt --root-helper-socket=/run/ops-agent/helper/root-helper.sock --plugin-catalog=/opt/pi-ops-agent/current/catalog
+ExecStart=/opt/pi-ops-agent/current/bin/ops-agent-server --listen=0.0.0.0:7443 --identity-file=/etc/ops-agent/server-identity.json --target-policy=/etc/ops-agent/targets.json --tls-cert=/etc/ops-agent/tls/server.crt --tls-key=/etc/ops-agent/tls/server.key --client-ca=/etc/ops-agent/tls/client-ca.crt --root-helper-socket=/run/ops-agent/helper/root-helper.sock --pve-root-helper-socket=/run/ops-agent/helper/pve-root-helper.sock --plugin-catalog=/opt/pi-ops-agent/current/catalog
 Restart=always
 RestartSec=3s
 TimeoutStopSec=20s
@@ -42,6 +41,7 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent /run/ops-agent/helper
+InaccessiblePaths=-/etc/pve
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+{
+  "apiVersion": "agentd.adapter-session-control/v1",
+  "schemaVersion": 1,
+  "type": "bind",
+  "controlId": "control:00000001",
+  "externalSessionId": "botmux/session/00000001",
+  "sessionId": "agent-session-00000001"
+}

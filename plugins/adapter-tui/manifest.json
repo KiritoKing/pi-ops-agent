@@ -1,0 +1,22 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "adapter.tui",
+  "kind": "adapter",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Local terminal adapter providing the recovery session and model-external approval path.",
+  "entrypoint": "profile.json",
+  "capabilities": [
+    "adapter.inbound.text",
+    "adapter.outbound.display",
+    "adapter.session.bind",
+    "approval.local"
+  ],
+  "requestedScopes": [
+    "adapter.inbound.text.local",
+    "adapter.outbound.display.local",
+    "adapter.session.bind.local",
+    "approval.submit.local"
+  ]
+}

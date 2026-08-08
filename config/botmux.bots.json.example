@@ -2,13 +2,22 @@
   {
     "name": "ops-agent",
     "cliId": "pi",
-    "cliPathOverride": "/opt/pi-ops-agent/bin/ops-agent-botmux",
+    "cliPathOverride": "/opt/pi-ops-agent/botmux-bin/pi",
     "defaultWorkingDir": "/var/lib/ops-agent/workspace",
     "allowedUsers": ["owner@example.com"],
     "p2pOpen": false,
     "disableCliBypass": true,
+    "launchShell": "/bin/bash",
+    "env": {
+      "PATH": "/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
     "backendType": "tmux",
     "sandbox": false,
+    "autoGrantRequestCards": false,
+    "autoStartOnGroupJoin": false,
+    "autoStartOnNewTopic": false,
+    "disableStreamingCard": true,
+    "silentTurnReactions": true,
     "writableTerminalLinkInCard": false
   }
 ]

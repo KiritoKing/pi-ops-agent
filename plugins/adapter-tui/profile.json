@@ -1,0 +1,44 @@
+{
+  "apiVersion": "agentd.adapter/v1",
+  "schemaVersion": 1,
+  "adapterId": "adapter.tui",
+  "runtimeAuthority": {
+    "execution": "compiled-client",
+    "filesystem": "host-as-runtime-uid",
+    "network": "host",
+    "credentials": "runtime-uid-readable",
+    "actionScopeEnforcement": "digest-review-and-typed-ipc-contract"
+  },
+  "session": {
+    "mapping": "local-terminal",
+    "writerLease": "gateway-global",
+    "controlApiVersion": "agentd.adapter-session-control/v1",
+    "supportedControls": [
+      "bind"
+    ]
+  },
+  "inbound": {
+    "transport": "tty",
+    "framing": "terminal-text",
+    "contractApiVersion": "agentd.adapter-inbound/v1",
+    "supportedTypes": [
+      "text"
+    ],
+    "maxFrameBytes": 131072
+  },
+  "outbound": {
+    "transport": "stdout",
+    "framing": "terminal-text",
+    "schema": "terminal.text/v1",
+    "actionApiVersion": "agentd.adapter-outbound-action/v1",
+    "supportedActions": [
+      "display"
+    ],
+    "maxFrameBytes": 131072
+  },
+  "approval": {
+    "mode": "local-tty",
+    "identitySource": "os-user+tty+sudo-pam",
+    "replayProtection": "local-command"
+  }
+}

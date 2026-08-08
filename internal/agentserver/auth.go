@@ -13,6 +13,7 @@ type Role string
 
 const (
 	RoleAgent    Role = "agent"
+	RoleObserver Role = "observer"
 	RoleApprover Role = "approver"
 	RoleAdmin    Role = "admin"
 )
@@ -50,7 +51,7 @@ func roleFromURI(uri *url.URL) (Role, bool) {
 	}
 	value := Role(strings.TrimPrefix(uri.EscapedPath(), "/role/"))
 	switch value {
-	case RoleAgent, RoleApprover, RoleAdmin:
+	case RoleAgent, RoleObserver, RoleApprover, RoleAdmin:
 		return value, uri.EscapedPath() == "/role/"+string(value)
 	default:
 		return "", false

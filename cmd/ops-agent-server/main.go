@@ -24,6 +24,9 @@ func main() {
 		case "enroll":
 			runEnroll(os.Args[2:])
 			return
+		case "validate-enrollment":
+			runValidateEnrollment(os.Args[2:])
+			return
 		case "issue-enrollment":
 			runIssueEnrollment(os.Args[2:])
 			return
@@ -34,22 +37,45 @@ func main() {
 	runServer()
 }
 
+func runValidateEnrollment(arguments []string) {
+	flags := flag.NewFlagSet("ops-agent-server validate-enrollment", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	controller := flags.String("controller", "", "controller HTTPS origin bound into the installed enrollment")
+	controllerCASHA256 := flags.String("controller-ca-sha256", "", "externally pinned controller CA certificate SHA-256 fingerprint")
+	configRoot := flags.String("config-root", "/etc/ops-agent", "endpoint configuration root")
+	if err := flags.Parse(arguments); err != nil {
+		fatal(err.Error())
+	}
+	if flags.NArg() != 0 || *controller == "" || *controllerCASHA256 == "" {
+		fatal("validate-enrollment requires --controller and --controller-ca-sha256")
+	}
+	if err := enrollment.ValidateInstalled(enrollment.ValidateInstalledOptions{
+		Controller:         *controller,
+		ControllerCASHA256: *controllerCASHA256,
+		ConfigRoot:         *configRoot,
+	}); err != nil {
+		fatal("validate installed endpoint enrollment: " + err.Error())
+	}
+}
+
 func runEnroll(arguments []string) {
 	flags := flag.NewFlagSet("ops-agent-server enroll", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	controller := flags.String("controller", "", "controller HTTPS origin bound into the enrollment bundle")
+	controllerCASHA256 := flags.String("controller-ca-sha256", "", "externally pinned controller CA certificate SHA-256 fingerprint")
 	tokenFile := flags.String("token-file", "", "root-only signed enrollment bundle")
 	configRoot := flags.String("config-root", "/etc/ops-agent", "endpoint configuration root")
 	if err := flags.Parse(arguments); err != nil {
 		fatal(err.Error())
 	}
-	if flags.NArg() != 0 || *controller == "" || *tokenFile == "" {
-		fatal("enroll requires --controller and --token-file")
+	if flags.NArg() != 0 || *controller == "" || *controllerCASHA256 == "" || *tokenFile == "" {
+		fatal("enroll requires --controller, --controller-ca-sha256 and --token-file")
 	}
 	if err := enrollment.Install(enrollment.InstallOptions{
-		Controller: *controller,
-		BundlePath: *tokenFile,
-		ConfigRoot: *configRoot,
+		Controller:         *controller,
+		ControllerCASHA256: *controllerCASHA256,
+		BundlePath:         *tokenFile,
+		ConfigRoot:         *configRoot,
 	}); err != nil {
 		fatal("enroll endpoint: " + err.Error())
 	}
@@ -64,22 +90,30 @@ func runIssueEnrollment(arguments []string) {
 	machineName := flags.String("machine-name", "", "human-readable new machine name")
 	output := flags.String("output", "", "new root-only enrollment bundle path")
 	configRoot := flags.String("config-root", "/etc/ops-agent", "controller configuration root")
+	pve := flags.Bool("pve", false, "issue a separate PVE broker receipt identity for a PVE endpoint")
 	if err := flags.Parse(arguments); err != nil {
 		fatal(err.Error())
 	}
 	if flags.NArg() != 0 || *controller == "" || *endpoint == "" || *machineID == "" || *machineName == "" || *output == "" {
 		fatal("issue-enrollment requires --controller, --endpoint, --machine-id, --machine-name and --output")
 	}
+	controllerCASHA256, err := enrollment.ControllerCAFingerprint(*configRoot)
+	if err != nil {
+		fatal("read controller CA fingerprint: " + err.Error())
+	}
 	if err := enrollment.Issue(enrollment.IssueOptions{
-		Controller:  *controller,
-		Endpoint:    *endpoint,
-		MachineID:   *machineID,
-		MachineName: *machineName,
-		OutputPath:  *output,
-		ConfigRoot:  *configRoot,
+		Controller:         *controller,
+		ControllerCASHA256: controllerCASHA256,
+		Endpoint:           *endpoint,
+		MachineID:          *machineID,
+		MachineName:        *machineName,
+		OutputPath:         *output,
+		ConfigRoot:         *configRoot,
+		PVE:                *pve,
 	}); err != nil {
 		fatal("issue enrollment: " + err.Error())
 	}
+	fmt.Printf("controller-ca-sha256=%s\n", controllerCASHA256)
 }
 
 func runServer() {
@@ -90,7 +124,9 @@ func runServer() {
 	tlsKey := flag.String("tls-key", "/etc/ops-agent/tls/server.key", "server TLS private key")
 	clientCA := flag.String("client-ca", "/etc/ops-agent/tls/client-ca.crt", "client certificate authority bundle")
 	rootSocket := flag.String("root-helper-socket", "/run/ops-agent/helper/root-helper.sock", "root-helper Unix socket")
+	pveRootSocket := flag.String("pve-root-helper-socket", "/run/ops-agent/helper/pve-root-helper.sock", "PVE-only root-helper Unix socket")
 	pluginCatalog := flag.String("plugin-catalog", "/opt/pi-ops-agent/current/catalog", "root-owned local plugin catalog")
+	_ = flag.Bool("allow-breakglass", false, "deprecated compatibility flag; manually approved root capsules are advertised for root targets")
 	requestTimeout := flag.Duration("request-timeout", 10*time.Minute, "maximum root broker round trip")
 	flag.Parse()
 	if *requestTimeout <= 0 || *requestTimeout > 10*time.Minute {
@@ -104,9 +140,18 @@ func runServer() {
 	if err != nil {
 		fatal("load target policy: " + err.Error())
 	}
+	pveEnabled := executableExists("/usr/bin/pvesh")
+	var pveBackend agentserver.Backend
+	if pveEnabled {
+		pveBackend = agentserver.RootClient{Socket: *pveRootSocket, Timeout: *requestTimeout}
+	}
 	application := &agentserver.Server{
 		Identity: identity, Policy: policy,
-		Backend: agentserver.RootClient{Socket: *rootSocket, Timeout: *requestTimeout}, CatalogDir: *pluginCatalog,
+		Backend: agentserver.RoutingBackend{
+			Core: agentserver.RootClient{Socket: *rootSocket, Timeout: *requestTimeout},
+			PVE:  pveBackend,
+		},
+		CatalogDir: *pluginCatalog, PVEEnabled: pveEnabled,
 	}
 	handler, err := application.Handler()
 	if err != nil {
@@ -138,6 +183,11 @@ func runServer() {
 			fatal("shutdown: " + err.Error())
 		}
 	}
+}
+
+func executableExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func loadTLS(certificateFile, keyFile, caFile string) (*tls.Config, error) {

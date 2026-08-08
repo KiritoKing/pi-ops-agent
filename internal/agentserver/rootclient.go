@@ -14,6 +14,25 @@ type Backend interface {
 	Do(context.Context, protocol.Request) (protocol.Response, error)
 }
 
+// RoutingBackend keeps the broadly sandboxed core broker and the host-capable,
+// PVE-only broker as separate processes and sockets. Both brokers still parse
+// and authorize the complete protocol independently.
+type RoutingBackend struct {
+	Core Backend
+	PVE  Backend
+}
+
+func (b RoutingBackend) Do(ctx context.Context, request protocol.Request) (protocol.Response, error) {
+	backend := b.Core
+	if protocol.IsPVERequest(request) {
+		backend = b.PVE
+	}
+	if backend == nil {
+		return protocol.Response{}, errors.New("requested privileged broker is unavailable")
+	}
+	return backend.Do(ctx, request)
+}
+
 type RootClient struct {
 	Socket  string
 	Timeout time.Duration

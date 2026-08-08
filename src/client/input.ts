@@ -1,8 +1,10 @@
-import { StringDecoder } from "node:string_decoder";
+import { TextDecoder } from "node:util";
+import { unwrapBotMuxInput } from "./botmux-envelope.js";
+import { isForbiddenTextControl } from "../shared/terminal-safety.js";
 
 const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
-const MAX_INPUT_CHARACTERS = 64 * 1024;
+const MAX_INPUT_BYTES = 64 * 1024;
 
 export type InputEvent =
   | { type: "submit"; text: string }
@@ -10,20 +12,25 @@ export type InputEvent =
   | { type: "eof" };
 
 export class TerminalInputParser {
-  readonly #decoder = new StringDecoder("utf8");
+  readonly #decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  readonly #unwrapBotMux: boolean;
   #pending = "";
   #current = "";
+  #currentBytes = 0;
   #inPaste = false;
   #skipLineFeed = false;
 
+  constructor(environment: NodeJS.ProcessEnv = process.env) {
+    this.#unwrapBotMux = environment.OPS_AGENT_INPUT_ENVELOPE === "botmux-v1";
+  }
+
   push(chunk: Buffer): InputEvent[] {
-    this.#pending += this.#decoder.write(chunk);
+    this.#pending += this.#decoder.decode(chunk, { stream: true });
     return this.#drain(false);
   }
 
   end(chunk?: Buffer): InputEvent[] {
-    if (chunk) this.#pending += this.#decoder.end(chunk);
-    else this.#pending += this.#decoder.end();
+    this.#pending += this.#decoder.decode(chunk);
     const events = this.#drain(true);
     if (this.#current.length > 0) {
       events.push({ type: "submit", text: this.#takeCurrent() });
@@ -43,9 +50,10 @@ export class TerminalInputParser {
       }
       if (!final && marker.startsWith(this.#pending)) break;
 
-      const character = this.#pending[0];
-      if (character === undefined) break;
-      this.#pending = this.#pending.slice(1);
+      const codePoint = this.#pending.codePointAt(0);
+      if (codePoint === undefined) break;
+      const character = String.fromCodePoint(codePoint);
+      this.#pending = this.#pending.slice(character.length);
 
       if (this.#inPaste) {
         this.#append(character);
@@ -53,6 +61,7 @@ export class TerminalInputParser {
       }
       if (character === "\u0003") {
         this.#current = "";
+        this.#currentBytes = 0;
         events.push({ type: "abort" });
         continue;
       }
@@ -64,7 +73,10 @@ export class TerminalInputParser {
         continue;
       }
       if (character === "\u007f" || character === "\b") {
-        this.#current = Array.from(this.#current).slice(0, -1).join("");
+        const characters = Array.from(this.#current);
+        const removed = characters.pop();
+        this.#current = characters.join("");
+        if (removed !== undefined) this.#currentBytes -= Buffer.byteLength(removed, "utf8");
         continue;
       }
       if (character === "\r") {
@@ -87,16 +99,25 @@ export class TerminalInputParser {
   }
 
   #append(value: string): void {
-    this.#current += value;
-    if (this.#current.length > MAX_INPUT_CHARACTERS) {
+    if (isForbiddenTextControl(value.codePointAt(0) ?? 0, true)) {
       this.#current = "";
-      throw new Error(`input exceeds ${MAX_INPUT_CHARACTERS} characters`);
+      this.#currentBytes = 0;
+      throw new Error("input contains a forbidden control character");
     }
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (this.#currentBytes + bytes > MAX_INPUT_BYTES) {
+      this.#current = "";
+      this.#currentBytes = 0;
+      throw new Error(`input exceeds ${MAX_INPUT_BYTES} UTF-8 bytes`);
+    }
+    this.#current += value;
+    this.#currentBytes += bytes;
   }
 
   #takeCurrent(): string {
     const value = this.#current;
     this.#current = "";
-    return value;
+    this.#currentBytes = 0;
+    return this.#unwrapBotMux ? unwrapBotMuxInput(value).text : value;
   }
 }

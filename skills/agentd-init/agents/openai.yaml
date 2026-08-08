@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agentd Init"
+  short_description: "Initialize or join Agentd safely on systemd Linux"
+  default_prompt: "Use $agentd-init to initialize or join an Agentd deployment without bypassing approval."

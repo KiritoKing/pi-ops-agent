@@ -73,6 +73,7 @@ for (const artifact of catalog.artifacts) {
 }
 
 const zeroDigest = `sha256:${"0".repeat(64)}`;
+const canonicalDigest = /^sha256:[a-f0-9]{64}$/u;
 const enabledArtifacts = enabledArtifactIds.map((id) => {
   const artifact = artifactById.get(id);
   if (!artifact) fail(`Enabled artifact ${id} is not present in the trusted catalog.`);
@@ -114,11 +115,12 @@ function freshPolicy() {
         readPaths: safeDefaultReadPaths,
       },
       changes: {
-        writePaths: ["/etc/ops-agent"],
+        writePaths: [],
         units: hasDockerWorkload ? ["docker.service"] : [],
         packages: hasDockerWorkload ? ["docker.io"] : [],
         plugins: artifacts,
       },
+      authorization: { standingScopes: [] },
     }],
   };
 }
@@ -148,6 +150,38 @@ function migratePolicy(policy) {
       }
     }
     target.changes.plugins = migrated;
+    if (!Array.isArray(target.changes.writePaths)) {
+      fail("Existing target policy contains an invalid write path allowlist.");
+    }
+    // v0.2 initialized this broad root so generic file.write could update the
+    // agent itself. v0.3 makes the control plane a permanent typed-only
+    // boundary; remove the obsolete grant while preserving unrelated roots.
+    target.changes.writePaths = target.changes.writePaths.filter(
+      (path) => path !== "/etc/ops-agent",
+    );
+    if (target.authorization === undefined) {
+      // Legacy allowlists meant "eligible for a separately approved change".
+      // Never reinterpret them as standing authorization during an upgrade.
+      target.authorization = { standingScopes: [] };
+    } else {
+      if (target.authorization === null || typeof target.authorization !== "object" ||
+          Array.isArray(target.authorization) ||
+          Object.keys(target.authorization).some(
+            (key) => key !== "standingScopes" && key !== "baseWorkloadDigest",
+          ) ||
+          !Array.isArray(target.authorization.standingScopes) ||
+          target.authorization.standingScopes.some((scope) => typeof scope !== "string") ||
+          (target.authorization.baseWorkloadDigest !== undefined &&
+            (typeof target.authorization.baseWorkloadDigest !== "string" ||
+              !canonicalDigest.test(target.authorization.baseWorkloadDigest)))) {
+        fail(`Existing target ${target.id ?? "unknown"} contains an invalid authorization policy.`);
+      }
+      if ((target.authorization.standingScopes.includes("file.write") ||
+          target.authorization.standingScopes.includes("service.action")) &&
+          !canonicalDigest.test(target.authorization.baseWorkloadDigest ?? "")) {
+        fail(`Existing target ${target.id ?? "unknown"} must bind standing base operations to baseWorkloadDigest.`);
+      }
+    }
   }
   return policy;
 }
@@ -165,6 +199,7 @@ for (const target of policy.targets) {
   for (const key of ["units", "readPaths"]) {
     if (Array.isArray(target.inspect?.[key])) target.inspect[key].sort();
   }
+  target.authorization.standingScopes.sort();
 }
 policy.revision = "policy-pending-revision";
 const revisionDigest = createHash("sha256").update(JSON.stringify(policy)).digest("hex").slice(0, 24);

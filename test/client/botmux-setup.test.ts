@@ -14,7 +14,7 @@ describe("model-external BotMux setup", () => {
     expect(() => parseLocalClientCommand("/botmux-setup now")).toThrow("usage");
   });
 
-  it("uses fixed argv for setup, hardening, and restart", async () => {
+  it("uses one fixed password-gated root wrapper with no caller arguments", async () => {
     const commands: InteractiveCommand[] = [];
     const runner: InteractiveCommandRunner = (invocation) => {
       commands.push(invocation);
@@ -29,17 +29,25 @@ describe("model-external BotMux setup", () => {
       input,
       output,
       runner,
-      botmuxCommand: "/usr/bin/botmux",
-      nodeCommand: "/opt/runtime/node",
-      setupScript: "/opt/plugin/configure-botmux.mjs",
+      setupHelper: "/usr/libexec/pi-ops-agent/setup-botmux",
     });
 
     expect(commands).toEqual([
-      { command: "/usr/bin/botmux", arguments: ["setup"] },
-      { command: "/opt/runtime/node", arguments: ["/opt/plugin/configure-botmux.mjs"] },
-      { command: "/usr/bin/botmux", arguments: ["restart"] },
+      {
+        command: "/usr/bin/sudo",
+        arguments: ["-k", "--", "/usr/libexec/pi-ops-agent/setup-botmux"],
+      },
     ]);
     expect(text).toContain("outside the model");
+    expect(text).toContain("dedicated ops-agent-botmux account");
     expect(text).toContain("initialized and restarted");
+  });
+
+  it("rejects a non-normalized setup helper path", async () => {
+    await expect(initializeBotMux({
+      input: new PassThrough(),
+      output: new PassThrough(),
+      setupHelper: "/usr/libexec/pi-ops-agent/../pi-ops-agent/setup-botmux",
+    })).rejects.toThrow(/absolute and normalized/u);
   });
 });

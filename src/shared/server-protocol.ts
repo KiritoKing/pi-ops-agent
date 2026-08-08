@@ -16,6 +16,7 @@ import {
 import type { RootOperation } from "./messages.js";
 import type { ApprovalAction, ApprovalGrant } from "./approval.js";
 import { requireExactRecord } from "./strict.js";
+import { parseBrokerReceipt, type BrokerReceipt } from "./broker-receipt.js";
 
 export const REMOTE_CAPABILITIES = [
   "host.snapshot",
@@ -24,9 +25,17 @@ export const REMOTE_CAPABILITIES = [
   "journal.tail",
   "file.metadata",
   "file.read",
+  "workload.command.inspect",
+  "pve.cluster.status",
+  "pve.node.status",
+  "pve.storage.status",
+  "pve.task.status",
+  "pve.guest.status",
+  "breakglass.prepare",
   "change.prepare",
   "change.status",
   "plugin.install",
+  "plugin.register",
   "workload.deploy",
 ] as const;
 
@@ -74,6 +83,7 @@ export interface RemoteResponse {
   summary?: string;
   data?: unknown;
   error?: string;
+  brokerReceipt?: BrokerReceipt;
 }
 
 export type InspectionRequest =
@@ -122,7 +132,77 @@ export type InspectionRequest =
       method: "file.read";
       path: string;
       maxBytes?: number;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "pve.cluster.status";
+      pluginId: string;
+      pluginDigest: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "pve.node.status";
+      pluginId: string;
+      pluginDigest: string;
+      node: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "pve.storage.status";
+      pluginId: string;
+      pluginDigest: string;
+      node: string;
+      storage: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "pve.task.status";
+      pluginId: string;
+      pluginDigest: string;
+      node: string;
+      upid: string;
+    }
+  | {
+      version: 1;
+      requestId: string;
+      deadline: string;
+      machineId: MachineId;
+      targetId: TargetId;
+      method: "pve.guest.status";
+      pluginId: string;
+      pluginDigest: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
     };
+
+export interface WorkloadCommandInspectionRequest {
+  version: 1;
+  requestId: string;
+  deadline: string;
+  machineId: MachineId;
+  targetId: TargetId;
+  method: "workload.command.inspect";
+  pluginId: string;
+  pluginDigest: string;
+  profileKey: string;
+}
 
 export interface PrepareChangeRequest {
   version: 1;
@@ -273,6 +353,7 @@ function parseArtifacts(value: unknown, label: string): ArtifactDescriptor[] {
 export function parseRemoteResponse(value: unknown): RemoteResponse {
   const input = requireExactRecord(value, "server response", [
     "version", "requestId", "ok", "auditId", "changeId", "state", "summary", "data", "error",
+    "brokerReceipt",
   ]);
   if (input.version !== 1 || typeof input.ok !== "boolean") {
     throw new Error("server response has an unsupported version or status");
@@ -303,6 +384,9 @@ export function parseRemoteResponse(value: unknown): RemoteResponse {
       min: 0,
       max: 16 * 1024,
     });
+  }
+  if (input.brokerReceipt !== undefined) {
+    response.brokerReceipt = parseBrokerReceipt(input.brokerReceipt);
   }
   return response;
 }

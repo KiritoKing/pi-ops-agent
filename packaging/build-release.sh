@@ -14,9 +14,10 @@ Usage: packaging/build-release.sh \
   --version 1.2.3 --arch amd64|arm64 \
   --node-runtime-dir PATH --bin-dir PATH --output-dir PATH
 
-Builds a source-free native release archive and Debian package. TypeScript,
-node_modules, Go binaries and the Node runtime must already exist; this command
-does not fetch dependencies or compile source.
+Builds a native release archive and Debian package. Core TypeScript and Go are
+precompiled; audited Adapter/Workload source trees and Skills are deliberately
+included for inspection and digest-bound registration. This command does not
+fetch dependencies or compile source.
 EOF
 }
 
@@ -47,21 +48,91 @@ done
 required_paths=(
   "${REPOSITORY_ROOT}/dist/agentd/index.js"
   "${REPOSITORY_ROOT}/dist/client/index.js"
+  "${REPOSITORY_ROOT}/dist/reviewer/index.js"
+  "${REPOSITORY_ROOT}/dist/runtime/adapter-run.js"
+  "${REPOSITORY_ROOT}/dist/runtime/botmux-setup-run.js"
+  "${REPOSITORY_ROOT}/dist/runtime/workload-host.js"
   "${REPOSITORY_ROOT}/node_modules/@earendil-works/pi-coding-agent/package.json"
   "${REPOSITORY_ROOT}/scripts/install-release.sh"
   "${REPOSITORY_ROOT}/scripts/ops-agent.sh"
+  "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-fixture.mjs"
+  "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-runtime.mjs"
+  "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-runtime.sh"
+  "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-socket.mjs"
+  "${REPOSITORY_ROOT}/systemd/agentd-approval-reviewer.service"
+  "${REPOSITORY_ROOT}/systemd/agentd-client-gateway.service"
+  "${REPOSITORY_ROOT}/systemd/agentd-plugin-lease-broker.service"
+  "${REPOSITORY_ROOT}/systemd/agentd-guardian.service"
+  "${REPOSITORY_ROOT}/systemd/ops-pve-root-helper.service"
+  "${REPOSITORY_ROOT}/plugins/adapter-tui/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/adapter-tui/profile.json"
+  "${REPOSITORY_ROOT}/plugins/adapter-botmux-source/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/adapter-botmux-source/adapter.mjs"
+  "${REPOSITORY_ROOT}/plugins/workload-base/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/workload-base/workload.mjs"
+  "${REPOSITORY_ROOT}/plugins/workload-botmux-ops/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/workload-botmux-ops/workload.mjs"
+  "${REPOSITORY_ROOT}/plugins/workload-hermes-ops/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/workload-hermes-ops/workload.mjs"
+  "${REPOSITORY_ROOT}/plugins/workload-pve/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/workload-pve/workload.mjs"
+  "${REPOSITORY_ROOT}/plugins/workload-example/manifest.json"
+  "${REPOSITORY_ROOT}/plugins/workload-example/workload.mjs"
+  "${REPOSITORY_ROOT}/skills/agentd-init/SKILL.md"
+  "${REPOSITORY_ROOT}/skills/agentd-init/agents/openai.yaml"
+  "${REPOSITORY_ROOT}/skills/agentd-adapter-dev/SKILL.md"
+  "${REPOSITORY_ROOT}/skills/agentd-adapter-dev/agents/openai.yaml"
+  "${REPOSITORY_ROOT}/skills/agentd-workload-dev/SKILL.md"
+  "${REPOSITORY_ROOT}/skills/agentd-workload-dev/agents/openai.yaml"
+  "${REPOSITORY_ROOT}/docs/workloads/pve.md"
   "${NODE_RUNTIME_DIR}/bin/node"
 )
 for required_path in "${required_paths[@]}"; do
-  [[ -e "${required_path}" ]] || {
+  [[ -f "${required_path}" && ! -L "${required_path}" ]] || {
     printf 'Missing release input: %s\n' "${required_path}" >&2
     exit 1
   }
 done
-if ! compgen -G "${BIN_DIR}/ops-*" >/dev/null; then
-  printf 'No prebuilt Go binaries found in %s.\n' "${BIN_DIR}" >&2
+if find "${REPOSITORY_ROOT}/plugins" "${REPOSITORY_ROOT}/skills" \
+    -type l -print -quit | grep -q .; then
+  printf 'Refusing to package symlinks from Source Plugin or Skill trees.\n' >&2
   exit 1
 fi
+"${NODE_RUNTIME_DIR}/bin/node" - "${REPOSITORY_ROOT}" "${VERSION}" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const repositoryRoot = process.argv[2];
+const expectedVersion = process.argv[3];
+const packageDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8"));
+const lockDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package-lock.json"), "utf8"));
+if (packageDocument.version !== expectedVersion || lockDocument.packages?.[""]?.version !== expectedVersion) {
+  throw new Error("package and lockfile versions do not match --version");
+}
+for (const directory of fs.readdirSync(path.join(repositoryRoot, "plugins"), { withFileTypes: true })) {
+  if (!directory.isDirectory()) continue;
+  const manifestPath = path.join(repositoryRoot, "plugins", directory.name, "manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (manifest.version !== expectedVersion) {
+    throw new Error(`plugin manifest version mismatch: ${directory.name}`);
+  }
+}
+NODE
+cmp -s "${REPOSITORY_ROOT}/integrations/botmux/adapter.mjs" \
+  "${REPOSITORY_ROOT}/plugins/adapter-botmux-source/adapter.mjs" || {
+  printf 'Source adapter.botmux runtime is not synchronized with the audited integration runtime.\n' >&2
+  exit 1
+}
+cmp -s "${REPOSITORY_ROOT}/scripts/configure-botmux.mjs" \
+  "${REPOSITORY_ROOT}/plugins/adapter-botmux-source/configure-botmux.mjs" || {
+  printf 'Source adapter.botmux hardener is not synchronized with the fixed setup hardener.\n' >&2
+  exit 1
+}
+for binary_name in ops-agent-server ops-root-helper agentd-guardian agentd-client-gateway agentd-pluginctl agentd-approval-submit agentd-json-config-helper; do
+  [[ -x "${BIN_DIR}/${binary_name}" ]] || {
+    printf 'Missing prebuilt Go binary: %s/%s\n' "${BIN_DIR}" "${binary_name}" >&2
+    exit 1
+  }
+done
 
 mkdir -p "${OUTPUT_DIR}"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ops-agent-release.XXXXXX")"
@@ -77,6 +148,7 @@ install -d -m 0755 \
   "${app_root}/bin" "${app_root}/runtime" "${app_root}/config" \
   "${app_root}/dist" "${app_root}/node_modules" "${app_root}/docs" \
   "${app_root}/scripts" "${app_root}/systemd" "${app_root}/catalog"
+install -d -m 0755 "${app_root}/plugins" "${app_root}/skills"
 
 cp -a "${REPOSITORY_ROOT}/dist/." "${app_root}/dist/"
 cp -a "${REPOSITORY_ROOT}/node_modules/." "${app_root}/node_modules/"
@@ -97,16 +169,20 @@ for config_path in "${REPOSITORY_ROOT}"/config/*; do
 done
 cp -a "${REPOSITORY_ROOT}/docs/." "${app_root}/docs/"
 cp -a "${REPOSITORY_ROOT}/systemd/." "${app_root}/systemd/"
+cp -a "${REPOSITORY_ROOT}/plugins/." "${app_root}/plugins/"
+cp -a "${REPOSITORY_ROOT}/skills/." "${app_root}/skills/"
 "${REPOSITORY_ROOT}/packaging/build-botmux-plugin.sh" "${VERSION}" "${app_root}/catalog"
 "${REPOSITORY_ROOT}/packaging/build-hermes-workload-plugin.sh" "${VERSION}" "${app_root}/catalog"
 "${REPOSITORY_ROOT}/packaging/create-catalog-index.sh" "${app_root}/catalog" "${app_root}/catalog/index.json"
-for script_name in configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh uninstall.sh; do
+for script_name in configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh probe-adapter-linux-runtime.sh setup-botmux.sh uninstall.sh; do
   install -m 0755 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
 done
-for script_name in configure-plugin-credentials.mjs initialize-target-policy.mjs; do
+for script_name in check-root-stores-idle.mjs configure-plugin-credentials.mjs initialize-target-policy.mjs probe-adapter-linux-fixture.mjs probe-adapter-linux-runtime.mjs probe-adapter-linux-socket.mjs; do
   install -m 0644 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
 done
-cp -a "${BIN_DIR}"/ops-* "${app_root}/bin/"
+for binary_name in ops-agent-server ops-root-helper agentd-guardian agentd-client-gateway agentd-pluginctl agentd-approval-submit agentd-json-config-helper; do
+  install -m 0755 "${BIN_DIR}/${binary_name}" "${app_root}/bin/${binary_name}"
+done
 install -m 0755 "${NODE_RUNTIME_DIR}/bin/node" "${app_root}/runtime/node"
 install -m 0755 "${REPOSITORY_ROOT}/scripts/ops-agent.sh" "${app_root}/bin/ops-agent"
 install -m 0755 "${REPOSITORY_ROOT}/scripts/install-release.sh" "${archive_root}/install-release.sh"
@@ -115,6 +191,8 @@ install -m 0644 "${REPOSITORY_ROOT}/package-lock.json" "${app_root}/package-lock
 install -m 0644 "${REPOSITORY_ROOT}/README.md" "${app_root}/README.md"
 install -m 0644 "${REPOSITORY_ROOT}/LICENSE" "${app_root}/LICENSE"
 printf '%s\n' "${VERSION}" >"${archive_root}/payload/VERSION"
+
+find "${archive_root}" -name '._*' -type f -delete
 
 find "${archive_root}" -type d -exec chmod 0755 {} +
 find "${archive_root}" -type f -exec chmod go-w {} +
@@ -135,7 +213,7 @@ Package: ops-agent-all
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Pi Ops Agent maintainers
-Depends: bash, ca-certificates, systemd, bubblewrap, openssl, diffutils
+Depends: bash, ca-certificates, systemd, openssl, diffutils
 Section: admin
 Priority: optional
 Description: Least-privilege Pi operations agent native release payload

@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "id": "workload.hermes",
   "kind": "managed-workload",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "KiritoKing/pi-ops-agent",
   "coreProtocol": 1,
   "description": "Pinned Hermes Agent workload with loopback-only WebUI, durable data, bounded resources, external credential slots, and container-local verification.",

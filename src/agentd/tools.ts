@@ -9,11 +9,19 @@ import {
   type TargetId,
 } from "../shared/domain.js";
 import type { AgentConfig } from "../shared/config.js";
+import {
+  loadActiveSourcePlugin,
+  type ActiveSourcePlugin,
+} from "../shared/source-plugin.js";
 import type { RootOperation } from "../shared/messages.js";
-import { encodeChangeRef } from "../shared/approval.js";
+import { encodeChangeRef, type ChangeRef } from "../shared/approval.js";
 import { deadline } from "../shared/rpc.js";
 import type { InspectionRequest, RemoteCapability } from "../shared/server-protocol.js";
 import type { AuditLog } from "./audit.js";
+import {
+  preparedChangeInstruction,
+  readAuthoritativePreparedChange,
+} from "./change-preparation.js";
 import type { MachineContext, MachineContextStore } from "./machine-context.js";
 import {
   createHttpsOpsServerClient,
@@ -25,6 +33,12 @@ import type { ServerRegistration, ServerRegistry } from "./server-registry.js";
 import type { SessionRecord } from "./session-registry.js";
 
 const MAX_TOOL_OUTPUT_CHARS = 64 * 1024;
+const ALWAYS_MANUAL_PREPARE_KINDS = new Set<RootOperation["kind"]>([
+  "package.install",
+  "plugin.install",
+  "plugin.register",
+  "workload.deploy",
+]);
 
 function output(value: unknown): string {
   const rendered = JSON.stringify(value, null, 2);
@@ -39,6 +53,35 @@ export interface OpsToolRuntime {
   servers: ServerRegistry;
   contexts: MachineContextStore;
   clientFactory?: OpsServerClientFactory;
+  sourcePluginLoader?: (pluginId: string) => Promise<ActiveSourcePlugin>;
+  recordPreparedChange?: (toolCallId: string, changeRef: ChangeRef) => void;
+}
+
+function sameApprovedPlugin(left: ActiveSourcePlugin, right: ActiveSourcePlugin): boolean {
+  return left.pluginId === right.pluginId && left.kind === right.kind && left.version === right.version &&
+    left.publisher === right.publisher && left.digest === right.digest &&
+    left.capabilities.length === right.capabilities.length &&
+    left.capabilities.every((value, index) => value === right.capabilities[index]) &&
+    left.requestedScopes.length === right.requestedScopes.length &&
+    left.requestedScopes.every((value, index) => value === right.requestedScopes[index]);
+}
+
+async function currentBaseWorkload(
+  runtime: OpsToolRuntime,
+  expected: ActiveSourcePlugin | undefined,
+): Promise<ActiveSourcePlugin> {
+  if (expected === undefined || expected.pluginId !== "workload.base" || expected.kind !== "workload" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(expected.digest)) {
+    throw new Error("file.write and service.action require the active workload.base registration");
+  }
+  if (runtime.sourcePluginLoader === undefined) {
+    throw new Error("active source plugin verification is unavailable");
+  }
+  const current = await runtime.sourcePluginLoader("workload.base");
+  if (!sameApprovedPlugin(expected, current)) {
+    throw new Error("workload.base current registration changed; reopen the agent session");
+  }
+  return current;
 }
 
 interface RemoteTarget {
@@ -81,6 +124,8 @@ export function createOpsTools(
   config: AgentConfig,
   audit: AuditLog,
   runtime: OpsToolRuntime,
+  capabilities?: ReadonlySet<string>,
+  baseWorkload?: ActiveSourcePlugin,
 ): ToolDefinition[] {
   const machineList = defineTool({
     name: "ops_machine_list",
@@ -335,7 +380,7 @@ export function createOpsTools(
       kind: Type.Literal("file.write"),
       path: Type.String({ minLength: 2, maxLength: 4096 }),
       content: Type.String({ maxLength: 128 * 1024 }),
-      mode: Type.Optional(Type.String({ pattern: "^0?[0-7]{3,4}$" })),
+      mode: Type.Optional(Type.String({ pattern: "^0?[0246]{3}$" })),
     }),
     Type.Object({
       kind: Type.Literal("plugin.install"),
@@ -344,6 +389,26 @@ export function createOpsTools(
       publisher: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$" }),
       digest: Type.String({ pattern: "^sha256:[a-f0-9]{64}$" }),
       artifactRef: Type.String({ pattern: "^builtin:sha256:[a-f0-9]{64}$" }),
+    }),
+    Type.Object({
+      kind: Type.Literal("plugin.register"),
+      pluginId: Type.String({
+        pattern: "^(adapter|workload)\\.[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$",
+      }),
+      pluginKind: Type.Union([Type.Literal("adapter"), Type.Literal("workload")]),
+      version: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9+.:~_-]{0,127}$" }),
+      publisher: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._/@:-]{0,159}$" }),
+      digest: Type.String({ pattern: "^sha256:[a-f0-9]{64}$" }),
+      capabilities: Type.Array(Type.String({
+        minLength: 1,
+        maxLength: 128,
+        pattern: "^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$",
+      }), { maxItems: 64, uniqueItems: true }),
+      requestedScopes: Type.Array(Type.String({
+        minLength: 1,
+        maxLength: 128,
+        pattern: "^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$",
+      }), { maxItems: 64, uniqueItems: true }),
     }),
     Type.Object({
       kind: Type.Literal("workload.deploy"),
@@ -359,7 +424,7 @@ export function createOpsTools(
     name: "ops_propose_change",
     label: "Propose target-scoped change",
     description:
-      "Stage an immutable change for a registered machine and target. This cannot approve it. Ask the user to approve the returned change reference through the real client.",
+      "Prepare an immutable change for a registered machine and target. An exact standing grant may commit ordinary operations; package/artifact installation, source registration, and workload deployment always remain pending for model-external client approval.",
     parameters: Type.Object({
       machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
       targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
@@ -371,6 +436,19 @@ export function createOpsTools(
           params.operation.artifactRef !== `builtin:${params.operation.digest}`) {
         throw new Error("artifactRef does not match the pinned digest");
       }
+      if (params.operation.kind === "plugin.register") {
+        if (!params.operation.pluginId.startsWith(`${params.operation.pluginKind}.`)) {
+          throw new Error("source plugin ID does not match pluginKind");
+        }
+        const unsorted = (values: string[]): boolean => values.some((value, index, all) => {
+          if (index === 0) return false;
+          const previous = all[index - 1];
+          return previous !== undefined && previous >= value;
+        });
+        if (unsorted(params.operation.capabilities) || unsorted(params.operation.requestedScopes)) {
+          throw new Error("source plugin capabilities and requestedScopes must be sorted and unique");
+        }
+      }
       const remote = await remoteTarget(
         runtime,
         params.machineId,
@@ -378,6 +456,15 @@ export function createOpsTools(
         "change.prepare",
         signal,
       );
+      let operation = params.operation as RootOperation;
+      if (params.operation.kind === "service.action" || params.operation.kind === "file.write") {
+        const base = await currentBaseWorkload(runtime, baseWorkload);
+        operation = {
+          ...params.operation,
+          pluginId: "workload.base",
+          pluginDigest: base.digest,
+        };
+      }
       const requestId = randomUUID();
       const request = {
         version: 1 as const,
@@ -386,33 +473,64 @@ export function createOpsTools(
         machineId: remote.machineId,
         targetId: remote.targetId,
         method: "change.prepare" as const,
-        operation: params.operation as RootOperation,
+        operation,
         policyRevision: remote.context.capabilities.policyRevision,
         capabilityRevision: remote.context.capabilities.revision,
       };
-      const response = await remote.client.prepareChange(request, signal);
-      await audit.append({ type: "tool", toolCallId, tool: "ops_propose_change", request, response });
-      if (!response.ok) throw new Error(response.error ?? "change preparation failed");
-      if (!response.changeId) throw new Error("server prepared a change without a changeId");
-      const changeRef = encodeChangeRef({
+      const prepareResponse = await remote.client.prepareChange(request, signal);
+      await audit.append({
+        type: "tool",
+        toolCallId,
+        tool: "ops_propose_change",
+        request,
+        response: prepareResponse,
+      });
+      if (!prepareResponse.ok) {
+        throw new Error(prepareResponse.error ?? "change preparation failed");
+      }
+      if (!prepareResponse.changeId) throw new Error("server prepared a change without a changeId");
+      const authoritative = await readAuthoritativePreparedChange(remote.client, {
+        machineId: remote.machineId,
+        targetId: remote.targetId,
+        changeId: prepareResponse.changeId,
+      }, signal);
+      await audit.append({
+        type: "tool",
+        phase: "post-prepare-signed-status",
+        toolCallId,
+        tool: "ops_propose_change",
+        request: authoritative.request,
+        response: authoritative.response,
+      });
+      if (ALWAYS_MANUAL_PREPARE_KINDS.has(params.operation.kind)
+        && authoritative.response.state !== "PENDING_APPROVAL") {
+        throw new Error(
+          `${params.operation.kind} violated the mandatory per-change approval boundary`,
+        );
+      }
+      const preparedChange: ChangeRef = {
         version: 1,
         serverId: remote.registration.serverId,
         machineId: remote.machineId,
         targetId: remote.targetId,
-        changeId: response.changeId,
-      });
+        changeId: authoritative.response.changeId,
+      };
+      if (authoritative.response.state === "PENDING_APPROVAL") {
+        runtime.recordPreparedChange?.(toolCallId, preparedChange);
+      }
+      const changeRef = encodeChangeRef(preparedChange);
       return {
         content: [{
           type: "text",
-          text: `${response.summary ?? "Change prepared."}\nmachineId=${remote.machineId}\ntargetId=${remote.targetId}\nchangeRef=${changeRef}\nApproval must come from the real client command, outside the model.`,
+          text: `${authoritative.response.summary ?? prepareResponse.summary ?? "Change prepared."}\nmachineId=${remote.machineId}\ntargetId=${remote.targetId}\nchangeRef=${changeRef}\n${preparedChangeInstruction(authoritative.response.state)}`,
         }],
         details: {
-          auditId: response.auditId,
+          auditId: authoritative.response.auditId,
           machineId: remote.machineId,
           targetId: remote.targetId,
-          changeId: response.changeId,
+          changeId: authoritative.response.changeId,
           changeRef,
-          state: response.state,
+          state: authoritative.response.state,
         },
       };
     },
@@ -451,7 +569,358 @@ export function createOpsTools(
     },
   });
 
-  return config.sandboxEnabled
+  let tools = config.sandboxEnabled
     ? [machineList, machineDescribe, inspect, bash, artifactCatalog, propose, status]
     : [machineList, machineDescribe, inspect, artifactCatalog, propose, status];
+  if (capabilities !== undefined) {
+    const capabilityByTool = new Map<string, string>([
+      ["ops_machine_list", "machine.list"],
+      ["ops_machine_describe", "machine.describe"],
+      ["ops_inspect", "target.inspect"],
+      ["ops_bash", "command.exec.sandbox"],
+      ["ops_artifact_catalog", "artifact.catalog"],
+      ["ops_propose_change", "change.prepare"],
+      ["ops_change_status", "change.status"],
+    ]);
+    tools = tools.filter((tool) => capabilities.has(capabilityByTool.get(tool.name) ?? ""));
+  }
+  return tools;
+}
+
+async function revalidateCurrentPVEPlugin(
+  config: AgentConfig,
+  runtime: OpsToolRuntime,
+  sessionPlugin: ActiveSourcePlugin,
+): Promise<ActiveSourcePlugin> {
+  if (sessionPlugin.kind !== "workload"
+    || !/^workload\.[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/u.test(sessionPlugin.pluginId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(sessionPlugin.digest)) {
+    throw new Error("typed PVE provider requires a valid source-workload caller");
+  }
+  const current = await (runtime.sourcePluginLoader === undefined
+    ? loadActiveSourcePlugin(config, sessionPlugin.pluginId)
+    : runtime.sourcePluginLoader(sessionPlugin.pluginId));
+  if (!sameApprovedPlugin(current, sessionPlugin)) {
+    throw new Error(`${sessionPlugin.pluginId} registration changed; reopen the agent session`);
+  }
+  return current;
+}
+
+export function createPVETypedProviderTools(
+  config: AgentConfig,
+  audit: AuditLog,
+  runtime: OpsToolRuntime,
+  plugin: ActiveSourcePlugin,
+): ToolDefinition[] {
+  if (plugin.kind !== "workload"
+    || !/^workload\.[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/u.test(plugin.pluginId)
+    || !/^sha256:[a-f0-9]{64}$/u.test(plugin.digest)) {
+    throw new Error("typed PVE provider requires a valid source-workload caller");
+  }
+  const pveInspect = defineTool({
+    name: "ops_pve_inspect",
+    label: "Inspect Proxmox VE",
+    description:
+      "Run a digest-approved source workload PVE read operation. PVE output is bounded, typed, and untrusted.",
+    parameters: Type.Union([
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("cluster_status"),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("node_status"),
+        node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("storage_status"),
+        node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+        storage: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("task_status"),
+        node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+        upid: Type.String({
+          minLength: 16,
+          maxLength: 512,
+          pattern: "^UPID:[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Fa-f0-9]+:[A-Fa-f0-9]+:[A-Fa-f0-9]+:[A-Za-z0-9._-]+:[^/:]{0,128}:[^/:]{1,128}:$",
+        }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+        operation: Type.Literal("guest_status"),
+        node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+        guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+        vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      }, { additionalProperties: false }),
+    ]),
+    async execute(toolCallId, params, signal) {
+      const currentPlugin = await revalidateCurrentPVEPlugin(config, runtime, plugin);
+      if (params.operation === "task_status" && !params.upid.startsWith(`UPID:${params.node}:`)) {
+        throw new Error("PVE task UPID is not bound to the selected node");
+      }
+      const capabilityByOperation = {
+        cluster_status: "pve.cluster.status",
+        node_status: "pve.node.status",
+        storage_status: "pve.storage.status",
+        task_status: "pve.task.status",
+        guest_status: "pve.guest.status",
+      } as const satisfies Record<typeof params.operation, RemoteCapability>;
+      const remote = await remoteTarget(
+        runtime,
+        params.machineId,
+        params.targetId,
+        capabilityByOperation[params.operation],
+        signal,
+      );
+      const base = {
+        version: 1 as const,
+        requestId: randomUUID(),
+        deadline: deadline(20),
+        machineId: remote.machineId,
+        targetId: remote.targetId,
+        pluginId: currentPlugin.pluginId,
+        pluginDigest: currentPlugin.digest,
+      };
+      let request: InspectionRequest;
+      switch (params.operation) {
+        case "cluster_status":
+          request = { ...base, method: "pve.cluster.status" };
+          break;
+        case "node_status":
+          request = { ...base, method: "pve.node.status", node: params.node };
+          break;
+        case "storage_status":
+          request = {
+            ...base,
+            method: "pve.storage.status",
+            node: params.node,
+            storage: params.storage,
+          };
+          break;
+        case "task_status":
+          request = { ...base, method: "pve.task.status", node: params.node, upid: params.upid };
+          break;
+        case "guest_status":
+          request = {
+            ...base,
+            method: "pve.guest.status",
+            node: params.node,
+            guestType: params.guestType,
+            vmid: params.vmid,
+          };
+          break;
+      }
+      const response = await remote.client.inspect(request, signal);
+      await audit.append({
+        type: "tool",
+        toolCallId,
+        tool: "ops_pve_inspect",
+        pluginId: currentPlugin.pluginId,
+        pluginDigest: currentPlugin.digest,
+        request,
+        response: {
+          requestId: response.requestId,
+          ok: response.ok,
+          auditId: response.auditId,
+          dataReturned: response.data !== undefined,
+        },
+      });
+      if (!response.ok) throw new Error(response.error ?? "PVE inspection failed");
+      return {
+        content: [{ type: "text", text: output(response.data ?? response.summary) }],
+        details: { auditId: response.auditId, requestId: request.requestId },
+      };
+    },
+  });
+
+  const pveRecoveryParentSchema = Type.Optional(Type.String({
+    pattern: "^pve-change-[a-zA-Z0-9._-]{8,149}$",
+  }));
+  const pveOperationSchema = Type.Union([
+    Type.Object({
+      kind: Type.Literal("pve.guest.action"),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      action: Type.Union([
+        Type.Literal("start"), Type.Literal("shutdown"), Type.Literal("stop"), Type.Literal("reboot"),
+      ]),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Literal("pve.snapshot.create"),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      snapshot: Type.String({ pattern: "^(?!current$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      description: Type.Optional(Type.String({ maxLength: 1024, pattern: "^(?!-)[^\\u0000\\r\\n]*$" })),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Union([Type.Literal("pve.snapshot.delete"), Type.Literal("pve.snapshot.rollback")]),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      snapshot: Type.String({ pattern: "^(?!current$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      backupStorage: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Literal("pve.guest.backup"),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      storage: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Literal("pve.guest.restore"),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      backupVolume: Type.String({
+        minLength: 24,
+        maxLength: 256,
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:backup/vzdump-(qemu|lxc)-[1-9][0-9]{2,8}-[A-Za-z0-9_.:+-]+\\.(vma|tar)(\\.(zst|gz|lzo))?$",
+      }),
+      storage: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Literal("pve.guest.migrate"),
+      recoveryOfChangeId: pveRecoveryParentSchema,
+      node: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      guestType: Type.Union([Type.Literal("qemu"), Type.Literal("lxc")]),
+      vmid: Type.Integer({ minimum: 100, maximum: 999999999 }),
+      targetNode: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }),
+      online: Type.Boolean(),
+      restart: Type.Boolean(),
+      withLocalDisks: Type.Boolean(),
+    }, { additionalProperties: false }),
+  ]);
+
+  const pvePropose = defineTool({
+    name: "ops_pve_propose",
+    label: "Propose Proxmox VE change",
+    description:
+      "Prepare a typed PVE change. The active source workload identity and digest are injected by the harness. recoveryOfChangeId creates a separately reviewed recovery child for the same locked cluster-global VMID and is never standing-authorized.",
+    parameters: Type.Object({
+      machineId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+      targetId: Type.String({ pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9]$" }),
+      operation: pveOperationSchema,
+    }, { additionalProperties: false }),
+    executionMode: "sequential",
+    async execute(toolCallId, params, signal) {
+      const currentPlugin = await revalidateCurrentPVEPlugin(config, runtime, plugin);
+      if (params.operation.kind === "pve.guest.restore"
+        && !params.operation.backupVolume.includes(
+          `/vzdump-${params.operation.guestType}-${params.operation.vmid}-`,
+        )) {
+        throw new Error("PVE backup volume does not match the selected guest type and VMID");
+      }
+      if (params.operation.kind === "pve.guest.migrate") {
+        if (params.operation.node === params.operation.targetNode) {
+          throw new Error("PVE migration target must differ from the source node");
+        }
+        if (params.operation.guestType === "qemu" && params.operation.restart) {
+          throw new Error("QEMU migration cannot request the LXC restart mode");
+        }
+        if (params.operation.guestType === "lxc"
+          && (params.operation.online || params.operation.withLocalDisks)) {
+          throw new Error("LXC migration cannot request QEMU online or local-disk flags");
+        }
+      }
+      const operation = {
+        ...params.operation,
+        pluginId: currentPlugin.pluginId,
+        pluginDigest: currentPlugin.digest,
+      } as RootOperation;
+      const remote = await remoteTarget(
+        runtime,
+        params.machineId,
+        params.targetId,
+        "change.prepare",
+        signal,
+      );
+      const requestId = randomUUID();
+      const request = {
+        version: 1 as const,
+        requestId,
+        deadline: deadline(60),
+        machineId: remote.machineId,
+        targetId: remote.targetId,
+        method: "change.prepare" as const,
+        operation,
+        policyRevision: remote.context.capabilities.policyRevision,
+        capabilityRevision: remote.context.capabilities.revision,
+      };
+      const prepareResponse = await remote.client.prepareChange(request, signal);
+      await audit.append({
+        type: "tool",
+        toolCallId,
+        tool: "ops_pve_propose",
+        pluginId: currentPlugin.pluginId,
+        pluginDigest: currentPlugin.digest,
+        request,
+        response: prepareResponse,
+      });
+      if (!prepareResponse.ok) {
+        throw new Error(prepareResponse.error ?? "PVE change preparation failed");
+      }
+      if (!prepareResponse.changeId) {
+        throw new Error("server prepared a PVE change without a changeId");
+      }
+      const authoritative = await readAuthoritativePreparedChange(remote.client, {
+        machineId: remote.machineId,
+        targetId: remote.targetId,
+        changeId: prepareResponse.changeId,
+      }, signal);
+      await audit.append({
+        type: "tool",
+        phase: "post-prepare-signed-status",
+        toolCallId,
+        tool: "ops_pve_propose",
+        pluginId: currentPlugin.pluginId,
+        pluginDigest: currentPlugin.digest,
+        request: authoritative.request,
+        response: authoritative.response,
+      });
+      const preparedChange: ChangeRef = {
+        version: 1,
+        serverId: remote.registration.serverId,
+        machineId: remote.machineId,
+        targetId: remote.targetId,
+        changeId: authoritative.response.changeId,
+      };
+      if (authoritative.response.state === "PENDING_APPROVAL") {
+        runtime.recordPreparedChange?.(toolCallId, preparedChange);
+      }
+      const changeRef = encodeChangeRef(preparedChange);
+      return {
+        content: [{
+          type: "text",
+          text: `${authoritative.response.summary ?? prepareResponse.summary ?? "PVE change prepared."}\nmachineId=${remote.machineId}\ntargetId=${remote.targetId}\nchangeRef=${changeRef}\n${preparedChangeInstruction(authoritative.response.state)}`,
+        }],
+        details: {
+          auditId: authoritative.response.auditId,
+          machineId: remote.machineId,
+          targetId: remote.targetId,
+          changeId: authoritative.response.changeId,
+          changeRef,
+          state: authoritative.response.state,
+          pluginDigest: currentPlugin.digest,
+        },
+      };
+    },
+  });
+
+  return [pveInspect, pvePropose];
 }
