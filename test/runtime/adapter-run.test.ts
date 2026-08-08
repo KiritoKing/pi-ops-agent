@@ -568,6 +568,14 @@ describe("source adapter runner", () => {
       "",
     ].join("\n"), { mode: 0o500 });
     await chmod(active.entrypoint, 0o500);
+    await chmod(active.dependencies.clientPath, 0o600);
+    await writeFile(active.dependencies.clientPath, [
+      "import fs from 'node:fs';",
+      "fs.readFileSync(5, 'utf8');",
+      "setInterval(() => {}, 1000);",
+      "",
+    ].join("\n"), { mode: 0o400 });
+    await chmod(active.dependencies.clientPath, 0o400);
     let calls = 0;
     active.dependencies.runtimeRecheckMilliseconds = 10;
     active.dependencies.loadActive = async () => {
@@ -599,6 +607,14 @@ describe("source adapter runner", () => {
       "",
     ].join("\n"), { mode: 0o500 });
     await chmod(active.entrypoint, 0o500);
+    await chmod(active.dependencies.clientPath, 0o600);
+    await writeFile(active.dependencies.clientPath, [
+      "import fs from 'node:fs';",
+      "fs.readFileSync(5, 'utf8');",
+      "setInterval(() => {}, 1000);",
+      "",
+    ].join("\n"), { mode: 0o400 });
+    await chmod(active.dependencies.clientPath, 0o400);
     const lost = Promise.withResolvers<never>();
     let released = false;
     active.dependencies.acquireLease = async (expected) => await Promise.resolve({
@@ -630,7 +646,12 @@ describe("source adapter runner", () => {
     await chmod(active.dependencies.clientPath, 0o600);
     await writeFile(
       active.dependencies.clientPath,
-      "setTimeout(() => process.exit(0), 100);\n",
+      [
+        "import fs from 'node:fs';",
+        "fs.readFileSync(5, 'utf8');",
+        "setTimeout(() => process.exit(0), 100);",
+        "",
+      ].join("\n"),
       { mode: 0o400 },
     );
     await chmod(active.dependencies.clientPath, 0o400);
@@ -665,6 +686,7 @@ describe("source adapter runner", () => {
     await chmod(active.dependencies.clientPath, 0o600);
     await writeFile(active.dependencies.clientPath, [
       "import fs from 'node:fs';",
+      "fs.readFileSync(5, 'utf8');",
       `const request = ${JSON.stringify({
         apiVersion: "agentd.adapter-runner-control/v1",
         action: "release-tui-self-update-lease",
@@ -763,6 +785,14 @@ describe("source adapter runner", () => {
         "",
       ].join("\n"), { mode: 0o500 });
       await chmod(active.entrypoint, 0o500);
+      await chmod(active.dependencies.clientPath, 0o600);
+      await writeFile(active.dependencies.clientPath, [
+        "import fs from 'node:fs';",
+        "fs.readFileSync(5, 'utf8');",
+        "fs.readFileSync(4, 'utf8');",
+        "",
+      ].join("\n"), { mode: 0o400 });
+      await chmod(active.dependencies.clientPath, 0o400);
       active.dependencies.bwrapPath = "/usr/bin/bwrap";
 
       await expect(runAdapter(
