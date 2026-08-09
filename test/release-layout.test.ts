@@ -278,6 +278,7 @@ describe("native release layout", () => {
   it("blocks publish on the real Linux Adapter runtime probe", () => {
     const releaseWorkflow = repositoryFile(".github/workflows/release.yml");
     const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
+    const adapterProbe = repositoryFile("scripts/probe-adapter-linux-runtime.sh");
     const probeJobStart = releaseWorkflow.indexOf("  adapter-linux-runtime:\n");
     const buildJobStart = releaseWorkflow.indexOf("\n  build:\n", probeJobStart);
     const publishJobStart = releaseWorkflow.indexOf("\n  publish:\n", buildJobStart);
@@ -300,9 +301,32 @@ describe("native release layout", () => {
       installerStart,
     );
     expect(releaseProbeJob).toContain("needs: validate");
+    expect(releaseProbeJob).toContain(
+      'readonly release_version="${GITHUB_REF_NAME#v}"',
+    );
+    expect(continuousProbeJob).toContain(
+      'readonly release_version="${RELEASE_VERSION}"',
+    );
+    expect(adapterProbe).toContain(
+      'probe_node_override="${OPS_AGENT_ADAPTER_PROBE_NODE_PATH:-}"',
+    );
+    expect(adapterProbe).toContain(
+      'if [[ "${probe_node_override}" != /* ]]',
+    );
+    expect(adapterProbe).toContain(
+      "OPS_AGENT_ADAPTER_PROBE_NODE_PATH must be an absolute test fixture path",
+    );
+    expect(adapterProbe.indexOf('node_path="${probe_node_override}"')).toBeLessThan(
+      adapterProbe.indexOf('elif [[ -x "${REPOSITORY_ROOT}/runtime/node" ]]'),
+    );
+    expect(adapterProbe).toContain(
+      'node_path="$(readlink -f -- "${node_path}")"',
+    );
 
     for (const probeJob of [releaseProbeJob, continuousProbeJob]) {
       expect(probeJob).toContain("runs-on: ubuntu-22.04");
+      expect(probeJob).toContain("node-version: ${{ env.NODE_VERSION }}");
+      expect(probeJob).not.toContain("node-version: 24");
       expect(probeJob).toContain("npm run build");
       expect(probeJob).toContain(
         "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz",
@@ -352,7 +376,113 @@ describe("native release layout", () => {
       );
       expect(probeJob).toContain('test -z "${bwrap_capabilities}"');
       expect(probeJob).toContain("-- '--disable-userns'");
+      expect(probeJob).toContain(
+        "Install the root-owned Adapter Node runtime fixture",
+      );
+      expect(probeJob).toContain(
+        'readonly install_root="/opt/pi-ops-agent"',
+      );
+      expect(probeJob).toContain(
+        'readonly release_root="${install_root}/releases/${release_version}"',
+      );
+      expect(probeJob).toContain(
+        'readonly node_bin="${release_root}/runtime/node"',
+      );
+      expect(probeJob).toContain(
+        'readonly current_link="${install_root}/current"',
+      );
+      expect(probeJob).toContain(
+        'node_source="$(/usr/bin/readlink -f "$(command -v node)")"',
+      );
+      expect(probeJob).toContain(
+        'node_version="$("${node_source}" -p \'process.versions.node\')"',
+      );
+      expect(probeJob).toContain(
+        'test "${node_version}" = "${NODE_VERSION}"',
+      );
+      expect(probeJob).toContain(
+        'node_digest="$(/usr/bin/sha256sum "${node_source}" | /usr/bin/cut -d\' \' -f1)"',
+      );
+      expect(probeJob).toContain(
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+      );
+      expect(probeJob).toContain(
+        "Refusing to reuse a pre-existing /opt/pi-ops-agent fixture",
+      );
+      expect(probeJob).toContain(
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+      );
+      expect(probeJob).toContain(
+        '"${node_source}" "${node_bin}"',
+      );
+      expect(probeJob).toContain(
+        'sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"',
+      );
+      expect(probeJob).toContain(
+        'sudo /usr/bin/chown -h root:root "${current_link}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)" = "root:root"',
+      );
+      expect(probeJob).toContain(
+        'if (( (8#${opt_mode} & 8#022) != 0 ))',
+      );
+      expect(probeJob).toContain(
+        '"${install_root}" "${install_root}/releases" \\',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' "${directory}")" = "root:root:755"',
+      );
+      expect(probeJob).toContain('test -L "${current_link}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G\' "${current_link}")" = "root:root"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink "${current_link}")" = \\',
+      );
+      expect(probeJob).toContain('"releases/${release_version}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${current_link}")" = "${release_root}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${current_link}/runtime/node")" = \\',
+      );
+      expect(probeJob).toContain(
+        'test "$("${node_bin}" -p \'process.versions.node\')" = "${NODE_VERSION}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/sha256sum "${node_bin}" | /usr/bin/cut -d\' \' -f1)" = \\',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${node_bin}")" = "${node_bin}"',
+      );
+      expect(probeJob).toContain('test -f "${node_bin}"');
+      expect(probeJob).toContain('test ! -L "${node_bin}"');
+      expect(probeJob).toContain('test ! -u "${node_bin}"');
+      expect(probeJob).toContain('test ! -g "${node_bin}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a:nlink%h\' "${node_bin}")" = \\',
+      );
+      expect(probeJob).toContain(
+        'node_capabilities="$(/usr/sbin/getcap "${node_bin}")"',
+      );
+      expect(probeJob).toContain('test -z "${node_capabilities}"');
       expect(probeJob).toContain("Create the disposable Adapter identity fixture");
+      expect(probeJob).toContain(
+        'readonly node_bin="/opt/pi-ops-agent/current/runtime/node"',
+      );
+      expect(probeJob).toContain(
+        'readonly node_directory="/opt/pi-ops-agent/current/runtime"',
+      );
+      expect(probeJob).toContain(
+        'setup_node_directory="$(dirname "$(command -v node)")"',
+      );
+      expect(probeJob).toContain(
+        '"OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}"',
+      );
+      expect(probeJob).toContain(
+        '"PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+      );
       expect(probeJob).toContain("npm run test:adapter-linux-runtime");
       expect(probeJob).toContain('probe_status="$?"');
       expect(probeJob).toContain("status 77 is unverified and blocks release");
@@ -379,6 +509,37 @@ describe("native release layout", () => {
         'bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"',
         'test -z "${bwrap_capabilities}"',
         "/usr/bin/bwrap --help",
+        "name: Install the root-owned Adapter Node runtime fixture",
+        'node_source="$(/usr/bin/readlink -f "$(command -v node)")"',
+        'node_version="$("${node_source}" -p \'process.versions.node\')"',
+        'test "${node_version}" = "${NODE_VERSION}"',
+        'node_digest="$(/usr/bin/sha256sum "${node_source}"',
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+        '"${node_source}" "${node_bin}"',
+        'sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"',
+        'sudo /usr/bin/chown -h root:root "${current_link}"',
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)"',
+        'if (( (8#${opt_mode} & 8#022) != 0 ))',
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' "${directory}")"',
+        'test -L "${current_link}"',
+        'test "$(/usr/bin/readlink "${current_link}")"',
+        'test "$(/usr/bin/readlink -f "${current_link}")"',
+        'test "$(/usr/bin/readlink -f "${current_link}/runtime/node")"',
+        'test "$("${node_bin}" -p \'process.versions.node\')"',
+        'test "$(/usr/bin/sha256sum "${node_bin}"',
+        'test "$(/usr/bin/readlink -f "${node_bin}")"',
+        'test -f "${node_bin}"',
+        'test ! -L "${node_bin}"',
+        'test ! -u "${node_bin}"',
+        'test ! -g "${node_bin}"',
+        'test "$(/usr/bin/stat -c \'%U:%G:%a:nlink%h\' "${node_bin}")"',
+        'node_capabilities="$(/usr/sbin/getcap "${node_bin}")"',
+        'test -z "${node_capabilities}"',
+        "name: Create the disposable Adapter identity fixture",
+        'setup_node_directory="$(dirname "$(command -v node)")"',
+        '"OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}"',
+        '"PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
         "npm run test:adapter-linux-runtime",
       ];
       for (let index = 1; index < orderedMilestones.length; index += 1) {

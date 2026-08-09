@@ -46,12 +46,22 @@ if [[ ! -f dist/runtime/adapter-run.js ]]; then
   exit 1
 fi
 
-if [[ -x "${REPOSITORY_ROOT}/runtime/node" ]]; then
+probe_node_override="${OPS_AGENT_ADAPTER_PROBE_NODE_PATH:-}"
+if [[ -n "${probe_node_override}" ]]; then
+  if [[ "${probe_node_override}" != /* ]]; then
+    echo "FAIL: OPS_AGENT_ADAPTER_PROBE_NODE_PATH must be an absolute test fixture path" >&2
+    exit 1
+  fi
+  node_path="${probe_node_override}"
+elif [[ -x "${REPOSITORY_ROOT}/runtime/node" ]]; then
   node_path="${REPOSITORY_ROOT}/runtime/node"
 else
   node_path="$(command -v node)"
 fi
-node_path="$(readlink -f "${node_path}")"
+if ! node_path="$(readlink -f -- "${node_path}")"; then
+  echo "FAIL: fixed Node runtime path cannot be resolved" >&2
+  exit 1
+fi
 if [[ ! -x "${node_path}" ]]; then
   echo "FAIL: fixed Node runtime is unavailable" >&2
   exit 1
