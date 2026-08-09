@@ -166,6 +166,11 @@ properties with `systemctl show`; host-wide `service.d` resets must not turn a w
 pass. Remove the exact probe unit, drop-ins, driver, nonce, and manager state before the installation
 transaction completes or rolls back.
 
+If the real bwrap preflight fails after its unit starts, preserve the installer's bounded probe
+journal and `kernel.apparmor_restrict_unprivileged_userns` diagnostic before interpreting the
+failure. Use the concrete bwrap errno/AppArmor denial as evidence; do not disable a host-wide
+user-namespace restriction or remove namespace/hardening arguments to make initialization pass.
+
 Do not derive standing grants during initialization. If an administrator explicitly enables
 standing `file.write` or `service.action`, require `authorization.baseWorkloadDigest` to equal the
 current approved `workload.base` registration digest. A plugin update must leave the old Target

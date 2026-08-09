@@ -457,6 +457,9 @@ PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init ide
 进程树 completion barrier。preflight 能捕获
 `RestrictNamespaces`、`ProtectHostname`、`ProtectKernelTunables`、nested userns 或 bwrap 参数漂移；它仍不替代
 对真实 Source Workload/provider/lease 的部署验证。
+若真实 probe 进入失败终态，安装器会在删除临时 unit 前输出有界 journal 和
+`kernel.apparmor_restrict_unprivileged_userns` 状态；应以其中的实际 bwrap errno/AppArmor 拒绝为准，
+不能把通用的“user namespace 不可用”摘要当作根因，也不能通过关闭 host-wide 限制制造通过。
 
 ## 安装其他 Source Plugin
 

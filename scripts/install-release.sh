@@ -3336,6 +3336,29 @@ run_bwrap_service_preflight() (
     fi
   }
 
+  print_bwrap_probe_diagnostics() {
+    local diagnostics=""
+    local apparmor_restriction="unavailable"
+    if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+      apparmor_restriction="$(</proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+    fi
+    printf 'bubblewrap probe diagnostics: kernel.apparmor_restrict_unprivileged_userns=%s\n' \
+      "${apparmor_restriction}" >&2
+    if command -v journalctl >/dev/null 2>&1; then
+      diagnostics="$(journalctl --boot --no-pager --quiet --unit="${bwrap_probe_unit}" \
+        --lines=32 --output=cat 2>/dev/null || true)"
+      if ((${#diagnostics} > 8192)); then
+        diagnostics="${diagnostics:0:8192}"
+        diagnostics+=$'\n[probe journal truncated at 8192 bytes]'
+      fi
+    fi
+    if [[ -n "${diagnostics}" ]]; then
+      printf '%s\n' "${diagnostics}" >&2
+    else
+      printf 'bubblewrap probe journal was empty or unavailable.\n' >&2
+    fi
+  }
+
   bwrap_probe_unit_path="$(mktemp /run/systemd/system/ops-agent-bwrap-probe-XXXXXX.service)"
   bwrap_probe_unit="$(basename "${bwrap_probe_unit_path}")"
   trap 'cleanup_bwrap_service_preflight "$?"' EXIT
@@ -3553,6 +3576,7 @@ EOF
   done
 
   if ! systemctl start "${bwrap_probe_unit}"; then
+    print_bwrap_probe_diagnostics
     printf 'Static bubblewrap preflight service could not be started.\n' >&2
     return 1
   fi
@@ -3576,10 +3600,19 @@ EOF
     printf 'Static bubblewrap preflight did not reach a terminal state before its bound.\n' >&2
     return 1
   fi
-  require_pid1_unit_property "${bwrap_probe_unit}" ActiveState inactive
-  require_pid1_unit_property "${bwrap_probe_unit}" SubState dead
-  require_pid1_unit_property "${bwrap_probe_unit}" Result success
-  require_pid1_unit_property "${bwrap_probe_unit}" ExecMainStatus 0
+  local terminal_state_valid=true
+  require_pid1_unit_property "${bwrap_probe_unit}" ActiveState inactive \
+    || terminal_state_valid=false
+  require_pid1_unit_property "${bwrap_probe_unit}" SubState dead \
+    || terminal_state_valid=false
+  require_pid1_unit_property "${bwrap_probe_unit}" Result success \
+    || terminal_state_valid=false
+  require_pid1_unit_property "${bwrap_probe_unit}" ExecMainStatus 0 \
+    || terminal_state_valid=false
+  if [[ "${terminal_state_valid}" != true ]]; then
+    print_bwrap_probe_diagnostics
+    return 1
+  fi
   if [[ "$(stat -c '%U:%G:%a:%h:%s' "${bwrap_probe_nonce}")" \
       != "root:${SERVICE_GROUP}:620:1:${#bwrap_probe_nonce_value}" ]] \
       || [[ "$(<"${bwrap_probe_nonce}")" != "${bwrap_probe_nonce_value}" ]]; then
@@ -3592,7 +3625,12 @@ if [[ "${MODE}" == init ]]; then
   # Bubblewrap's --disable-userns performs the authoritative postcondition:
   # after entering the final user namespace it attempts another CLONE_NEWUSER
   # and fails setup if that succeeds. Do not infer this from a proc sysctl read.
-  if ! run_bwrap_service_preflight; then
+  bwrap_preflight_status=0
+  set +e
+  run_bwrap_service_preflight
+  bwrap_preflight_status=$?
+  set -e
+  if ((bwrap_preflight_status != 0)); then
     printf '%s\n' \
       'bubblewrap cannot run inside the effective ops-agentd systemd boundary; required Source Workloads cannot run.' \
       'Nested containment requires an outer bubblewrap PID 1 lifecycle barrier and an inner Source PID 1 with further user namespaces disabled.' \

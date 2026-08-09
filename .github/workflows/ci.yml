@@ -146,6 +146,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf 'kernel.apparmor_restrict_unprivileged_userns=%s\n' \
+            "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || printf unavailable)"
+          if sudo /usr/bin/test -r /sys/kernel/security/apparmor/profiles; then
+            sudo /usr/bin/awk \
+              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print "loaded-apparmor-profile=" $0 }' \
+              /sys/kernel/security/apparmor/profiles || true
+          else
+            printf 'loaded-apparmor-profile=unavailable\n'
+          fi
           if /usr/bin/getent passwd opsadmin >/dev/null; then
             echo "Disposable runner unexpectedly contains opsadmin" >&2
             exit 1

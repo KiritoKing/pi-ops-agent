@@ -959,12 +959,23 @@ describe("installed client-plane isolation", () => {
       "'/opt/pi-ops-agent/current/runtime/node /opt/pi-ops-agent/current/dist/agentd/index.js'",
     );
     expect(preflight).toContain('systemctl start "${bwrap_probe_unit}"');
+    expect(preflight).toContain("print_bwrap_probe_diagnostics()");
+    expect(preflight).toContain(
+      "kernel.apparmor_restrict_unprivileged_userns",
+    );
+    expect(preflight).toContain("--lines=32 --output=cat");
+    expect(preflight).toContain("[probe journal truncated at 8192 bytes]");
     expect(preflight).toContain(
       'require_pid1_unit_property "${bwrap_probe_unit}" Result success',
     );
     expect(preflight).toContain(
       'require_pid1_unit_property "${bwrap_probe_unit}" ExecMainStatus 0',
     );
+    expect(preflight).toContain("local terminal_state_valid=true");
+    expect(preflight).toContain('if [[ "${terminal_state_valid}" != true ]]');
+    expect(installer).toContain("bwrap_preflight_status=0");
+    expect(installer).toContain("set +e\n  run_bwrap_service_preflight");
+    expect(installer).not.toContain("if ! run_bwrap_service_preflight");
     expect(preflight).toContain('systemctl stop "${bwrap_probe_unit}"');
     expect(preflight).toContain('systemctl reset-failed "${bwrap_probe_unit}"');
     expect(preflight).toContain('rm -f -- "${bwrap_probe_lifecycle_dropin}"');
