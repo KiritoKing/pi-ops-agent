@@ -141,7 +141,7 @@ function validateToolResult(text) {
       break;
     case "inspect":
       if (!text.includes('"uptime"') || !text.includes('"df"') || !text.includes('"free"')) {
-        throw new Error("inspect tool result omitted the signed host snapshot fields");
+        throw new Error("inspect tool result omitted the required host snapshot fields");
       }
       break;
     case "prepare-package":
@@ -154,6 +154,50 @@ function validateToolResult(text) {
     default:
       throw new Error("unreachable scenario");
   }
+}
+
+function preparedChangeRef(text) {
+  if (scenario !== "prepare-package" && scenario !== "prepare-file") return undefined;
+  const matches = text.split("\n")
+    .filter((line) => line.startsWith("changeRef="))
+    .map((line) => line.slice("changeRef=".length));
+  if (matches.length !== 1 || matches[0].length < 24 || matches[0].length > 1024
+      || !/^opschg1_[A-Za-z0-9_-]+$/u.test(matches[0])) {
+    throw new Error("prepare tool result did not contain one bounded canonical changeRef");
+  }
+  const changeRef = matches[0];
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(changeRef.slice("opschg1_".length), "base64url").toString("utf8"));
+  } catch {
+    throw new Error("prepare tool result changeRef was not base64url JSON");
+  }
+  const keys = ["version", "serverId", "machineId", "targetId", "changeId"];
+  if (!isPlainObject(decoded) || Object.keys(decoded).length !== keys.length
+      || !keys.every((key) => Object.hasOwn(decoded, key)) || decoded.version !== 1) {
+    throw new Error("prepare tool result changeRef payload was not an exact v1 record");
+  }
+  const identifier = /^[a-zA-Z0-9](?:[a-zA-Z0-9._:-]{6,158}[a-zA-Z0-9])?$/u;
+  const changeIdentifier = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{6,158}[a-zA-Z0-9])?$/u;
+  const validIdentifier = (value, pattern) => typeof value === "string"
+    && value.length >= 8 && value.length <= 160 && pattern.test(value);
+  if (!validIdentifier(decoded.serverId, identifier)
+      || !validIdentifier(decoded.machineId, identifier)
+      || !validIdentifier(decoded.targetId, identifier)
+      || !validIdentifier(decoded.changeId, changeIdentifier)) {
+    throw new Error("prepare tool result changeRef contained an invalid identifier");
+  }
+  const canonicalPayload = JSON.stringify({
+    version: 1,
+    serverId: decoded.serverId,
+    machineId: decoded.machineId,
+    targetId: decoded.targetId,
+    changeId: decoded.changeId,
+  });
+  if (`opschg1_${Buffer.from(canonicalPayload).toString("base64url")}` !== changeRef) {
+    throw new Error("prepare tool result changeRef was not canonically encoded");
+  }
+  return changeRef;
 }
 
 let requestCount = 0;
@@ -220,12 +264,14 @@ const server = createServer((request, response) => {
           return;
         }
         if (requestCount === 2) {
-          validateToolResult(toolResultText(body));
+          const resultText = toolResultText(body);
+          validateToolResult(resultText);
+          const changeRef = preparedChangeRef(resultText);
           process.stdout.write(`MOCK_TOOL_RESULT_OK scenario=${scenario}\n`);
           writeSse(response, [
             chunk("chatcmpl-ops-agent-e2e-2", {
               role: "assistant",
-              content: `SCRIPTED_MODEL_E2E_${scenario.toUpperCase().replaceAll("-", "_")}_OK nonce=${nonce}`,
+              content: `SCRIPTED_MODEL_E2E_${scenario.toUpperCase().replaceAll("-", "_")}_OK nonce=${nonce}${changeRef === undefined ? "" : ` changeRef=${changeRef}`}`,
             }, null),
             chunk("chatcmpl-ops-agent-e2e-2", {}, "stop"),
           ]);
