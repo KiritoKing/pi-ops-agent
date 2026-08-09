@@ -703,29 +703,31 @@ export async function prepareAdapterLaunch(
     dependencies.clientPath,
     dependencies.expectedOwnerUid,
   );
-  const sourceClientArguments = versionOnly
-    ? ["--version"]
-    : clientArgumentsForSourceAdapter(adapterArguments);
+  const clientArguments = isTUI
+    ? [...adapterArguments]
+    : versionOnly
+      ? ["--version"]
+      : clientArgumentsForSourceAdapter(adapterArguments);
   return {
     plugin,
     descriptor,
     executable: interpreter.executable,
     arguments: [
       ...interpreter.prefix,
-      ...(isTUI ? adapterArguments : sourceClientArguments),
+      ...clientArguments,
     ],
     workingDirectory: isTUI ? "/" : plugin.snapshotPath,
     environment: runtimeEnvironment,
     client: isTUI
       ? {
           executable: interpreter.executable,
-          arguments: [...interpreter.prefix, ...adapterArguments],
+          arguments: [...interpreter.prefix, ...clientArguments],
           workingDirectory: "/",
           environment: clientEnvironment(plugin, descriptor, dependencies),
         }
       : {
           executable: await fixedInterpreter(dependencies.nodePath, dependencies.expectedOwnerUid),
-          arguments: [clientEntrypoint, ...sourceClientArguments],
+          arguments: [clientEntrypoint, ...clientArguments],
           workingDirectory: "/",
           environment: clientEnvironment(plugin, descriptor, dependencies),
         },

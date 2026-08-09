@@ -305,6 +305,28 @@ describe("source adapter runner", () => {
     });
   });
 
+  it("passes initial prompts only to the fixed compiled adapter.tui client", async () => {
+    const active = await tuiFixture();
+    const missingPrompt = `@${join(active.dependencies.pluginRegistryPath, "missing-prompt.txt")}`;
+    for (const prompt of ["Run one read-only diagnostic.", missingPrompt]) {
+      const adapterArguments = ["--session-id", "session-tui-prompt-1234", prompt];
+      const launch = await prepareAdapterLaunch(
+        active.plugin.pluginId,
+        adapterArguments,
+        active.dependencies,
+      );
+      expect(launch.executable).toBe(await realpath(active.dependencies.nodePath));
+      expect(launch.arguments).toEqual([
+        await realpath(active.dependencies.clientPath),
+        ...adapterArguments,
+      ]);
+      expect(launch.client.arguments).toEqual([
+        await realpath(active.dependencies.clientPath),
+        ...adapterArguments,
+      ]);
+    }
+  });
+
   it("explicitly refuses executable adapter.tui source without running it", async () => {
     const active = await tuiFixture();
     const executable = join(active.plugin.snapshotPath, "adapter.mjs");
