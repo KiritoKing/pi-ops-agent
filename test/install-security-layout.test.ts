@@ -448,8 +448,21 @@ describe("installed client-plane isolation", () => {
       expect(gate).toContain("dpkg-query --listfiles apparmor-profiles");
       expect(gate).toContain("dpkg-query --search");
       expect(gate).toContain("dpkg --verify apparmor-profiles");
+      expect(gate).toContain(
+        "--showformat='${Version}' apparmor-profiles",
+      );
+      expect(gate).toContain('[[ "${profile_source}" == /* ]]');
+      expect(gate).toContain('sha256sum "${profile_source}"');
+      expect(gate).toContain("apparmor-profile-package-version=%s");
+      expect(gate).toContain("apparmor-profile-source=%s");
+      expect(gate).toContain("apparmor-profile-source-sha256=%s");
       expect(gate).toContain('"${#profile_sources[@]}" -ne 1');
-      expect(gate).toContain("8#${component_mode} & 0022");
+      expect(gate).toContain(
+        'forbidden_write_mask=0002\n            if [[ "${profile_component}" == "${profile_source}" ]]; then\n              forbidden_write_mask=0022\n            fi',
+      );
+      expect(gate).toContain(
+        "8#${component_mode} & forbidden_write_mask",
+      );
       expect(gate).toContain("'/usr/bin/bwrap ix,'");
       expect(gate).toContain("apparmor_parser --replace");
       expect(gate).toContain("'bwrap (enforce)'");

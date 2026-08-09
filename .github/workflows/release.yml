@@ -111,6 +111,18 @@ jobs:
             = "apparmor-profiles: ${profile_source}"
           package_drift="$(sudo /usr/bin/dpkg --verify apparmor-profiles)"
           test -z "${package_drift}"
+          [[ "${profile_source}" == /* ]]
+          profile_package_version="$(/usr/bin/dpkg-query --show \
+            --showformat='${Version}' apparmor-profiles)"
+          profile_source_sha256="$(/usr/bin/sha256sum "${profile_source}" \
+            | /usr/bin/awk '{ print $1 }')"
+          test -n "${profile_package_version}"
+          [[ "${profile_source_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'apparmor-profile-package-version=%s\n' \
+            "${profile_package_version}"
+          printf 'apparmor-profile-source=%s\n' "${profile_source}"
+          printf 'apparmor-profile-source-sha256=%s\n' \
+            "${profile_source_sha256}"
           /usr/bin/grep -Fq \
             'include if exists <local/bwrap-userns-restrict>' \
             "${profile_source}"
@@ -126,8 +138,12 @@ jobs:
             )
             test "${component_uid}" = 0
             test "${component_gid}" = 0
-            if (( (8#${component_mode} & 0022) != 0 )); then
-              printf 'Package profile path is group/world writable: %s\n' \
+            forbidden_write_mask=0002
+            if [[ "${profile_component}" == "${profile_source}" ]]; then
+              forbidden_write_mask=0022
+            fi
+            if (( (8#${component_mode} & forbidden_write_mask) != 0 )); then
+              printf 'Package profile path has unsafe write permissions: %s\n' \
                 "${profile_component}" >&2
               exit 1
             fi
