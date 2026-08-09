@@ -95,7 +95,7 @@ require_fixed_commands() {
       /usr/bin/chmod /usr/bin/chown /usr/bin/cmp /usr/bin/dpkg \
       /usr/bin/dpkg-query /usr/bin/getent \
       /usr/bin/flock /usr/bin/grep /usr/bin/id /usr/bin/install /usr/bin/ln \
-      /usr/bin/mktemp /usr/bin/readlink /usr/bin/realpath /usr/bin/rm \
+      /usr/bin/journalctl /usr/bin/mktemp /usr/bin/readlink /usr/bin/realpath /usr/bin/rm \
       /usr/bin/rmdir /usr/bin/sha256sum /usr/bin/sleep /usr/bin/stat /usr/bin/systemctl \
       /usr/bin/unshare /usr/sbin/apparmor_parser /usr/sbin/getcap; do
     [[ -x "${command_path}" ]] || fail "required fixed command is unavailable: ${command_path}"
@@ -918,9 +918,12 @@ EOF
   done
   ((attempt < 300)) || fail "AppArmor compatibility smoke exceeded its deadline"
   result="$(/usr/bin/systemctl show "${unit}" -p Result --value)"
-  [[ "${active}" == inactive && "${result}" == success \
-      && "$(/usr/bin/systemctl show "${unit}" -p ExecMainStatus --value)" == 0 ]] \
-    || fail "AppArmor compatibility smoke did not finish successfully"
+  if [[ "${active}" != inactive || "${result}" != success \
+      || "$(/usr/bin/systemctl show "${unit}" -p ExecMainStatus --value)" != 0 ]]; then
+    /usr/bin/systemctl status "${unit}" --no-pager >&2 || true
+    /usr/bin/journalctl --boot -u "${unit}" --no-pager -n 64 -o cat >&2 || true
+    fail "AppArmor compatibility smoke did not finish successfully"
+  fi
   [[ "$(/usr/bin/stat -c '%u:%g:%a:%h:%s' "${nonce}")" \
       == "0:65534:620:1:${#nonce_value}" ]] \
     || fail "AppArmor compatibility smoke nonce metadata is invalid"

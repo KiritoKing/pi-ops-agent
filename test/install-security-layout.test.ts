@@ -587,6 +587,9 @@ describe("installed client-plane isolation", () => {
     expect(helper).toContain("automatic AppArmor policy removal is unavailable");
     expect(helper).toContain("/usr/bin/flock --exclusive --nonblock 8");
     expect(helper).toContain("systemctl list-units --all --plain");
+    expect(helper).toContain(
+      '/usr/bin/journalctl --boot -u "${unit}" --no-pager -n 64 -o cat',
+    );
     expect(helper).toContain("Probe cleanup left an exact artifact path behind");
     expect(helper).toContain('LOCK_DIRECTORY="/etc/apparmor.d"');
     expect(helper.match(/ {2}acquire_helper_lock\n/g)).toHaveLength(3);
