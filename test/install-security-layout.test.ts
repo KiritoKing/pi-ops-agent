@@ -420,6 +420,48 @@ describe("installed client-plane isolation", () => {
     expect(containment).not.toContain('"--new-session"');
   });
 
+  it("keeps restricted Ubuntu user namespaces enabled for real nested-bwrap gates", () => {
+    const workflows = [
+      {
+        source: repositoryFile(".github/workflows/ci.yml"),
+        after: "name: Build the native amd64 release payload",
+      },
+      {
+        source: repositoryFile(".github/workflows/release.yml"),
+        after: "name: Create the disposable Adapter identity fixture",
+      },
+    ];
+
+    for (const { source, after } of workflows) {
+      const start = source.indexOf(
+        "name: Load the distribution nested-bubblewrap AppArmor policy",
+      );
+      const end = source.indexOf(after, start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const gate = source.slice(start, end);
+
+      expect(gate).toContain("apparmor_restrict_unprivileged_userns");
+      expect(gate).toContain('test "$(<"${restriction_path}")" = 1');
+      expect(gate).not.toContain("sysctl");
+      expect(gate).not.toContain("unconfined");
+      expect(gate).toContain("dpkg-query --listfiles apparmor-profiles");
+      expect(gate).toContain("dpkg-query --search");
+      expect(gate).toContain("dpkg --verify apparmor-profiles");
+      expect(gate).toContain('"${#profile_sources[@]}" -ne 1');
+      expect(gate).toContain("8#${component_mode} & 0022");
+      expect(gate).toContain("'/usr/bin/bwrap ix,'");
+      expect(gate).toContain("apparmor_parser --replace");
+      expect(gate).toContain("'bwrap (enforce)'");
+      expect(gate).toContain("'unpriv_bwrap (enforce)'");
+      expect(gate).toContain('[[ "${current_label}" == *unpriv_bwrap* ]]');
+      expect(gate).toContain("CapInh CapPrm CapEff CapBnd CapAmb");
+      expect(gate).toContain("--as-pid-1 --disable-userns --cap-drop ALL");
+      expect(gate).toContain("unshare --user --map-root-user");
+      expect(gate).toContain("Source obtained nested bubblewrap authority");
+    }
+  });
+
   it("runs the BotMux Adapter probe inside its exact systemd namespace boundary", () => {
     const botmuxDropIn = repositoryFile("config/botmux-systemd-dropin.conf");
     const probe = repositoryFile("scripts/probe-adapter-linux-runtime.sh");
