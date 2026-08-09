@@ -295,11 +295,11 @@ export function wrapWithBubblewrapProcessReaper(
     "--cap-drop", "ALL",
     "--bind", "/", "/",
     "--dev", "/dev",
+    "--proc", "/proc",
     // Keep outer bubblewrap as PID 1 so it reaps the complete inner sandbox
-    // process tree. It inherits only the service's already-protected procfs
-    // view while it starts the fixed inner bwrap; the inner sandbox mounts
-    // the private procfs visible to Source and owns the final nested-userns
-    // denial after creating its own namespaces.
+    // process tree. Both PID namespaces receive their own procfs view; the
+    // inner sandbox remains the only layer that executes untrusted Source and
+    // owns the final nested-userns denial after creating its namespaces.
     "--",
     bwrapPath,
     ...innerArguments,

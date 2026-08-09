@@ -139,7 +139,6 @@ probe_dropin_owned=1
     'Environment=PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
     'UMask=0077' \
     'NoNewPrivileges=yes' \
-    'AppArmorProfile=-bwrap' \
     'ProtectSystem=strict' \
     'ProtectHome=yes' \
     'ProtectKernelTunables=yes' \
@@ -214,7 +213,7 @@ require_effective_word_member() {
   exit 1
 }
 
-require_effective_apparmor_profile() {
+require_effective_empty_apparmor_profile() {
   local object_payload object_path profile_payload
   object_payload="$(/usr/bin/busctl --json=short call org.freedesktop.systemd1 \
     /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
@@ -234,9 +233,9 @@ require_effective_apparmor_profile() {
   "${node_path}" -e '
     const value = JSON.parse(process.argv[1]);
     if (value?.type !== "(bs)" || !Array.isArray(value.data)
-        || value.data.length !== 2 || value.data[0] !== true
-        || value.data[1] !== "bwrap") {
-      throw new Error("effective AppArmorProfile is not exact ignore-missing bwrap");
+        || value.data.length !== 2 || value.data[0] !== false
+        || value.data[1] !== "") {
+      throw new Error("effective AppArmorProfile is not exact empty/non-ignore");
     }
   ' "${profile_payload}"
 }
@@ -253,7 +252,6 @@ probe_unit_owned=1
   --property="SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
   --property=UMask=0077 \
   --property=NoNewPrivileges=yes \
-  --property=AppArmorProfile=-bwrap \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=ProtectKernelTunables=yes \
@@ -281,7 +279,7 @@ require_effective_word_set Environment \
   PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 require_effective_property UMask 0077
 require_effective_property NoNewPrivileges yes
-require_effective_apparmor_profile
+require_effective_empty_apparmor_profile
 require_effective_property ProtectSystem strict
 require_effective_property ProtectHome yes
 require_effective_property ProtectKernelTunables yes
@@ -330,7 +328,6 @@ fi
   --property="SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
   --property=UMask=0077 \
   --property=NoNewPrivileges=yes \
-  --property=AppArmorProfile=-bwrap \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=ProtectKernelTunables=yes \

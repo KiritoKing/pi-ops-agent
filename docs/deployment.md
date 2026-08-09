@@ -91,8 +91,10 @@ Bootstrap：
 2. 下载当前架构 archive 与 `checksums.txt`；
 3. 解包前验证 SHA-256；
 4. 若存在 `gh`，执行 `gh attestation verify`；
-5. 将控制交给同一 Release 内的 `ops-agent-bootstrap`：`host-policy` 只路由到相邻的
-   AppArmor helper，`init`/`join` 只路由到相邻的 `install-release.sh`；两者不会互相隐式调用。
+5. 将控制交给同一 Release 内的 `ops-agent-bootstrap`：`init`/`join` 只路由到相邻的
+   `install-release.sh`；保留的 `host-policy` 路由只服务 legacy helper，其中 `inspect/install`
+   立即 unsupported，`status` 只做 strict exact legacy inventory 且永不返回 `0`；它不能解锁当前 Noble
+   restricted-userns controller，也不会由 `init`/`join` 隐式调用。
 
 没有 `gh` 时只验证了 GitHub HTTPS + 同一 Release checksum，不能声称完成独立 provenance
 验证。高价值环境应在管理机验证 attestation 后，将 archive 放入受控镜像，并通过
@@ -100,7 +102,8 @@ Bootstrap：
 
 Release installer 自身不调用 apt/dnf/yum 等包管理器。所有模式都要求 systemd、OpenSSL、diffutils
 等基础命令已由管理员或 image 提供；`init` 还要求固定 `/usr/bin/bwrap`、`sudo`/`visudo` 与 util-linux。
-缺失项在账号、unit 或 policy mutation 前 fail closed。Noble 的额外 AppArmor package 与精确版本见下文。
+缺失项在账号、unit 或 policy mutation 前 fail closed。Noble restricted-userns controller 的
+unsupported guard 同样必须在任何持久 mutation 前执行。
 
 Release 使用固定的受支持 Go toolchain，以 `CGO_ENABLED=0 -trimpath` 只生成当前七个 Go
 artifact；旧 `ops-systemd-helper` 即使源码仍用于迁移测试，也不会进入 release binary 集合。
@@ -121,15 +124,12 @@ Publish 下载两组 artifact 后、生成 manifest 或 attestation 前再次运
 
 ```bash
 sudo dpkg -i ops-agent-all_X.Y.Z_amd64.deb
-sudo ops-agent-bootstrap host-policy inspect
-sudo ops-agent-bootstrap host-policy install
-sudo ops-agent-bootstrap host-policy status
 sudo ops-agent-bootstrap init --admin-user "$USER"
 ```
 
-前三条只适用于下面所述的 Noble restricted-userns 主机，并且必须在管理员已单独安装固定前置包后
-执行；其他主机直接运行 `init`。Debian package 不把 AppArmor/bwrap 包列为强依赖，因为同一包也用于
-不运行 Source Plugin 的 `join` endpoint，不能为 server-only 节点静默扩大宿主策略面。
+若该主机是 Noble restricted-userns + AppArmor controller，最后一条会在持久 mutation 前明确拒绝；
+不要先运行 `host-policy install`。Debian package 不把 AppArmor/bwrap 包列为强依赖，因为同一包也
+用于不运行 Source Plugin 的 `join` endpoint，不能为 server-only 节点扩大宿主策略面。
 
 发布阻断验收还包括真实 Linux Adapter runtime 探针。Release workflow 在独立 disposable
 Ubuntu job 中只创建 `ops-agent-botmux` 专用系统账号及其两个专用组和工作目录，不修改 runner 默认
@@ -157,22 +157,10 @@ artifact。不得把 driver 平铺到 runtime root 后意外导入宿主源码�
 
 ## `init`
 
-Ubuntu 24.04 Noble 且 `kernel.apparmor_restrict_unprivileged_userns=1` 时，先由管理员安装 helper 的
-明确前置包，再通过固定到同一个 tag 的 Raw bootstrap 运行独立 host-policy 阶段；Agent 和
-`init`/`join` 不会替用户静默执行：
-
-```bash
-sudo apt-get update
-sudo apt-get install --yes --no-install-recommends \
-  apparmor apparmor-profiles bubblewrap ca-certificates diffutils libcap2-bin \
-  openssl sudo util-linux
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy inspect
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy install
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy status
-```
+Ubuntu 24.04 Noble 且 `kernel.apparmor_restrict_unprivileged_userns=1`、AppArmor enabled 时，本
+Release 不支持 controller `init`。installer 必须在账号、unit、plugin、sudoers、AppArmor policy
+或任何其他持久 mutation 前 fail closed；不存在需先执行的 `host-policy install` 解锁步骤。
+server/core/PVE-only `join` 不运行 Source Plugin，不受该 controller 限制，也不管理 host policy。
 
 Raw bootstrap 对 `host-policy`、`init` 和 `join` 都拒绝 `latest`，并核对 archive 的 `payload/VERSION`，
 避免多次调用跨 Release 漂移。离线 tar 不能从用户或 Agent 可写的 checkout/解包目录通过 `sudo` 直接
@@ -182,23 +170,18 @@ Raw bootstrap 对 `host-policy`、`init` 和 `join` 都拒绝 `latest`，并核�
 release_stage="$(sudo mktemp -d /var/tmp/ops-agent-release.XXXXXX)"
 sudo install -d -o root -g root -m 0700 "${release_stage}/root"
 sudo tar -xzf /path/to/verified/ops-agent-linux-amd64.tar.gz -C "${release_stage}/root"
-sudo "${release_stage}/root/ops-agent-bootstrap" host-policy inspect
-sudo "${release_stage}/root/ops-agent-bootstrap" host-policy install
-sudo "${release_stage}/root/ops-agent-bootstrap" host-policy status
+sudo "${release_stage}/root/ops-agent-bootstrap" init --admin-user alice
 ```
 
 wrapper 在 root 执行时会拒绝 symlink、自身整棵 release tree 的非 root owner 或 group/world write，
-并拒绝不具 sticky 保护的可写祖先；因此普通用户目录下的 tar extraction 会 fail closed。`.deb` 使用
-`sudo ops-agent-bootstrap host-policy ...`。三种入口最终都执行 archive/deb versioned release-root 中的
-同一 wrapper 和逐字相同 helper，release verifier 会检查 exact mode、wrapper 审计 hash、tar/deb parity、
-Debian control/postinst bytes 及固定 launcher 路由。完成 `status` 的 `verified-now` 证据后，再用同一个
-`vX.Y.Z` 单独运行 `init`。
+并拒绝不具 sticky 保护的可写祖先；因此普通用户目录下的 tar extraction 会 fail closed。Raw、tar
+与 deb 入口都执行 archive/deb versioned release-root 中的同一 wrapper，release verifier 会检查 exact
+mode、wrapper 审计 hash、tar/deb parity、Debian control/postinst bytes 及固定 launcher 路由。
 
-`inspect` 只在 `/etc/apparmor.d` 的同一独占目录锁内核对 eligibility，不创建 probe。`status` 不修改
-持久 AppArmor policy，但在 `managed:enforce` 时会持有同一把锁，创建并清理一个新的短生命周期
-`/run/systemd/system` static authority smoke；只有这次实时探针通过才返回 `0` 并输出
-`apparmor-managed-state=verified-now`。`3` 表示安全地不存在，`1` 表示 drift、partial、实时探针失败
-或证据不可访问。当前 Release 只接受
+保留的 `host-policy inspect/install` 立即返回 unsupported；`status` 只做 strict exact legacy
+inventory：永不返回 `0`，`3` 仅表示 safely absent，`1` 表示 managed、drift 或 inaccessible，且
+后两类可在状态正文前失败。它不修改持久 policy，也不能把当前 Noble restricted-userns controller
+判为 supported。历史 helper 曾 pin
 `apparmor-profiles` 版本 `4.0.1really4.0.1-0ubuntu0.24.04.7` 中 SHA-256
 `11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9` 的发行版 profile，并管理：
 
@@ -207,49 +190,28 @@ Debian control/postinst bytes 及固定 launcher 路由。完成 `status` 的 `v
 /etc/apparmor.d/local/bwrap-userns-restrict  # exact: /usr/bin/bwrap ix,
 ```
 
-source SHA 只是一项输入，不是 approval digest。canonical v1 approval digest 同时绑定
-`package=apparmor-profiles`、exact version、上述 source SHA、exact local-rule bytes，以及批准前完整
-展示的 authority summary；该 summary 的 SHA-256 是
-`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`，当前 approval digest 为
-`sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef`。helper 必须先展示
-host-wide argv-blind `ix`、长期 Core setup-profile authority、BotMux 不支持和不自动移除这四项
-residual，再由 root 从真实 `/dev/tty` 读取 exact
-`INSTALL NOBLE BWRAP APPARMOR sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef`。
-CI/外部变更系统已经完成等价模型外审批时才可传同一 `--approve-digest`；这不是 Agent 自批。
-helper 不 apt/install package、不改 sysctl、不启用 SUID/unconfined，也拒绝 disable/force-complain、
-partial、symlink 或既有内容 drift。AppArmor exact exec rule 只绑定 `/usr/bin/bwrap` path，不绑定本项目
-argv，因此属于 host-wide authority 扩张；发行版 version/hash 变化必须由新 Release 重新 pin、重新
-批准，不能现场放宽。
+这份 exact exec rule 只绑定 `/usr/bin/bwrap` path、不绑定项目 argv，属于 host-wide authority
+扩张。当前文档不再提供或推荐 `host-policy install` 命令；旧 approval digest、旧 `verified-now`
+结果和 exact files 都只是历史证据，不能解锁 `init`。
 
-fresh `install` 在可能已经 load kernel profile 后失败时绝不调用 `apparmor_parser --remove`，否则会
-让 active task 失去 confinement。只有权威 kernel evidence 明确证明 `bwrap` 与 `unpriv_bwrap`
-两者均 absent，helper 才删除本轮新建的 exact managed files；loaded、partial 或 unreadable evidence
-一律保留 files 与 kernel state、报告 `INCOMPLETE`，交由单独主机恢复流程处理。
-若 managed files 已经 exact、kernel profiles 为 absent，重新 load 或后续 smoke 失败也必须保留这些
-既有 files 与任何 kernel evidence；这不是 fresh mutation，不能为了恢复 `absent` 外观而删除证据。
+已存在的 managed files、loaded/partial kernel profiles 或不可读 evidence 必须原样保留并报告，
+不能调用 `apparmor_parser --remove` 或自动删除 files 来制造 absent 外观。默认卸载同样保留；本
+Release 的 helper `remove` 永远 fail closed。任何移除都必须走另行设计和审计、能处理 active task/
+active-label 竞态的主机维护流程。
 
-批准界面还必须说明 `AppArmorProfile=-bwrap` 的长期 residual：`ops-agentd` Node 本体会一直处于
-bwrap setup profile。非 root UID、`NoNewPrivileges=yes` 与空 `CapabilityBoundingSet` 继续阻止它
-取得宿主 capability，但被攻陷 Core 可直接尝试该 profile 允许的 userns/mount/network setup
-syscall；AppArmor 不把这份 authority 限定到固定 runner argv。首次 non-bwrap Source exec 才 stack
-`unpriv_bwrap`。接受 canonical digest 即同时接受这份扩大面；将来需要独立 typed spawn supervisor
-才能把 setup authority 收窄到短生命周期。
+旧 `AppArmorProfile=-bwrap` 方案还有长期 residual：`ops-agentd` Node 本体处于 argv-blind bwrap
+setup profile。即使非 root UID、`NoNewPrivileges=yes` 与空 `CapabilityBoundingSet` 阻止它取得宿主
+capability，被攻陷 Core 仍可直接尝试 profile 允许的 setup syscall。这也是不能继续推荐该方案的
+原因；真正支持需要独立 typed spawn supervisor 把 authority 收窄到固定、短生命周期 request。
 
-`ops-agentd.service` 使用 typed ignore-missing `AppArmorProfile=-bwrap`。helper 的 root-owned
-`NoNewPrivileges=yes` static-unit smoke 必须闭世界核对 exact FragmentPath/DropInPaths、唯一且无
-flags 的 `ExecStart`、空 hooks/environment/groups/capabilities，以及完整 PID 1 effective
-security/lifecycle vector；它还必须证明 effective profile、outer→fixed inner、最终
-Source PID 1 label 包含 `unpriv_bwrap`、五组 capability 全零，并且后续 `unshare --user` 与 nested
-bwrap 均失败。GitHub-hosted exact static unit 已证明 outer `--proc /proc` 在
-`ProtectProc=invisible` 下返回 `EPERM`；outer 继承 service proc、inner 保留私有 proc 的修正形状
-仍待 hosted gate 复验，完成前不能发布或宣称 production 支持。这条兼容只
-覆盖直接 Node 的 `ops-agentd`/mandatory `workload.base`，且 host-policy helper 仍只支持 Noble。
-BotMux guard 以实际状态而非发行版标签为准：任何 host 只要读到 restricted-userns=`1` 且
-AppArmor=`Y/y`，都在 wrapper/config mutation、hardener 或 restart 前拒绝；Noble 上 restriction
-evidence 缺失/不可读也拒绝，其他 host 只有该 sysctl 安全不存在时才可跳过。BotMux main→pi wrapper
-若 attach 会先落入 `unpriv_bwrap`、阻断后续 sandbox setup；Adapter direct-Node probe 不能当作
-BotMux production 证据。无法管理宿主 policy 的 LXC/OrbStack 没有降级路径。`join` 不承载 Source
-runtime，永远不安装、更新或删除该宿主 policy。
+hosted static-unit 证据已经给出最终结论。正确的 outer `--proc /proc` 在
+`ProtectProc=invisible` 下返回 `EPERM`；随后只移除 outer proc 的候选在 GitHub Actions run
+[`31319405888`](https://github.com/KiritoKing/pi-ops-agent/actions/runs/31319405888)，commit
+`7091ecfbc28ae6410f06d4e2b64462c96dd83726`、job `93259846767`，让 fixed inner 返回
+`bwrap: open /proc/3/ns/ns failed: No such file or directory`。因此本 Release 必须恢复两层各自的
+`--proc /proc` contract，并对 Noble restricted-userns controller 持久 mutation 前 fail closed。
+BotMux 按实际 restriction/AppArmor evidence 同样在 mutation 前拒绝；无法管理宿主 policy 的
+LXC/OrbStack 没有降级路径。`join` 不承载 Source runtime，永远不安装、更新或删除该宿主 policy。
 
 交互式安装：
 
@@ -557,11 +519,10 @@ Debian merged-/usr 上 `/bin`、`/sbin`、`/lib*` 可能是 symlink。部署 smo
 和非 merged layout，保证 bubblewrap 的只读 bind 不把 symlink target 遮蔽或制造不存在路径。
 安装器的 preflight 在唯一、root-owned、位于 `/run/systemd/system` 的短生命周期 static unit 中
 复制最终 security drop-in、核验 PID 1 的 effective 配置，并运行真实双层 bwrap；结束后必须精确清理
-unit、drop-in、driver 与 nonce。outer 仍创建 PID namespace 并保留默认 PID 1 reaper，只启动固定
-inner bwrap；它不使用 `--proc` 重挂 procfs，而继承该 static unit 已受 `ProtectProc=invisible`
-保护的 service proc 视图。inner 才使用 `--proc /proc` 建立私有 procfs、以 `/bin/sh` 为 PID 1 并
-禁止继续嵌套 userns；最终 Source 只会看到 inner 视图。省略 outer proc remount 不会删除 outer
-PID namespace/reaper，也不能缩短 runtime completion barrier；runtime 另以 outer
+unit、drop-in、driver 与 nonce。outer 仍创建 PID namespace并保留默认 PID 1 reaper，只启动固定
+inner bwrap；outer 与 inner 都使用 `--proc /proc`，让各自 procfs 与 PID namespace 一致，inner 以
+`/bin/sh` 为 PID 1 并禁止继续嵌套 userns，最终 Source 只会看到 inner 视图。不能省略 outer proc
+mount：fixed inner 需要从 outer 的一致 procfs 解析 namespace FD。runtime 另以 outer
 PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init identity 消失作为完整
 进程树 completion barrier。preflight 能捕获
 `RestrictNamespaces`、`ProtectHostname`、`ProtectKernelTunables`、nested userns 或 bwrap 参数漂移；它仍不替代
@@ -570,13 +531,11 @@ PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init ide
 `kernel.apparmor_restrict_unprivileged_userns` 状态；应以其中的实际 bwrap errno/AppArmor 拒绝为准，
 不能把通用的“user namespace 不可用”摘要当作根因，也不能通过关闭 host-wide 限制制造通过。
 尤其不能把普通 shell 下成功的 direct bwrap smoke 当作这个 unit-bound proof。GitHub-hosted Noble
-exact NNP static unit 已证明 outer 的 `--proc /proc` 在 `ProtectProc=invisible` 下返回 `EPERM`；
-上述仅移除 outer proc remount、保留 outer PID containment 与 inner 私有 procfs 的形状仍待 hosted
-复验，当前不能称为成功。Noble helper 必须
-先在自己的 root-owned `NoNewPrivileges=yes` static unit 中核对 typed `AppArmorProfile=-bwrap`
-effective attachment，再证明最终 `unpriv_bwrap`/zero-cap/nested-userns deny；installer 随后仍运行
-自己的完整 preflight。该证据边界只覆盖直接 Node 的 `ops-agentd`/base Workload，不覆盖未 attach
-的真实 BotMux main→pi wrapper chain。
+exact NNP static unit 已证明 outer 的 `--proc /proc` 在 `ProtectProc=invisible` 下返回 `EPERM`；run
+`31319405888` 又证明移除 outer proc 会让 inner 以 `open /proc/3/ns/ns failed` 失败。该组合在本
+Release 明确 unsupported，installer 必须在持久 mutation 前拒绝。不得通过关闭 sysctl、SUID bwrap、
+单层 fallback、降低 `ProtectProc`/其他 systemd hardening 或 unconfined profile 规避；支持它需要
+后续独立 typed spawn supervisor。
 
 ## 安装其他 Source Plugin
 
@@ -633,8 +592,8 @@ BotMux setup 先读取 host evidence，而不是仅按 Ubuntu Noble 标签判断
 restricted-userns=`1` 且 AppArmor=`Y/y`，wrapper 就必须在 config mutation、digest-approved hardener
 或 restart 前拒绝；Noble 缺少或无法读取 restriction evidence 也拒绝，其他 host 只有该 sysctl 安全
 不存在时才可继续。managed BotMux 的 `NoNewPrivileges=yes` main→pi wrapper 链不能安全取得后续
-bwrap setup profile；不要复制 `ops-agentd` 的 `AppArmorProfile=-bwrap`，否则 wrapper 会过早落入
-`unpriv_bwrap`。Noble helper 仍只解锁 direct Node core/base；direct Adapter CI probe 不能作为
+bwrap setup profile；不要给 BotMux 或 `ops-agentd` 重新引入旧 `AppArmorProfile=-bwrap`，否则会
+恢复已否决的长期 setup authority，且 wrapper 会过早落入 `unpriv_bwrap`。旧 Noble helper 不再解锁 direct Node core/base；direct Adapter CI probe 不能作为
 BotMux production 证据。runtime 也必须保持 fail closed，等待单独经过真实 main→wrapper→sandbox
 链验证的 profile 设计。
 
@@ -701,10 +660,9 @@ Source Plugin registration；显式 `systemctl status` 仍用于补充查看 uni
 12. PID 1 已对当前 mode 的完整 managed service 集合加载 exact release unit 与 unit-specific final
     security drop-in，并通过 lifecycle/security effective-vector 核验；`init` 与 `join` 的集合不能
     取并集，非 PVE host 不应残留 managed PVE unit/drop-in。
-13. 若 Noble restricted-userns 开启，helper 的 exact managed state、typed ops-agentd profile、
-    `NoNewPrivileges=yes` authority smoke 与 installer preflight 必须全部通过；direct smoke 不能
-    替代它。BotMux 则按实际 evidence 判断：任何 host 的 restricted-userns=`1` + AppArmor enabled
-    都必须在 setup mutation 前报告 unsupported/fail closed；Noble evidence 缺失也拒绝。`join` 不应
-    出现任何项目管理的 AppArmor profile/local rule surface。
+13. 若 Noble restricted-userns=`1` 且 AppArmor enabled，controller `init` 必须在任何持久 mutation
+    前报告 unsupported/fail closed；direct smoke、旧 managed state 与 `host-policy install` 都不能
+    替代该结论。`join`/PVE endpoint 不运行 Source Plugin，可继续安装，但不应出现任何项目管理的
+    AppArmor profile/local rule surface。
 
 使用仓库 Skill 执行这套流程：[`agentd-init`](../skills/agentd-init/SKILL.md)。

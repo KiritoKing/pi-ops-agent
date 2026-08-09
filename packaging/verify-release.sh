@@ -7,7 +7,7 @@ NODE_VERSION=""
 ARCHIVE=""
 DEBIAN_PACKAGE=""
 NO_PAYLOAD_EXECUTION=false
-readonly EXPECTED_RELEASE_BOOTSTRAP_SHA256="6742fa80c494ff17c2558240dc31d64dbcaca18cb1884d0508165773280ed966"
+readonly EXPECTED_RELEASE_BOOTSTRAP_SHA256="cb87da6d9d39b5d1155383d88b227087dcb6038b7dd40a018f180a69c8b2ff76"
 
 usage() {
   cat <<'EOF'
@@ -191,11 +191,9 @@ cat >"${expected_deb_postinst}" <<'EOF'
 set -e
 printf '%s\n' \
   'Pi Ops Agent payload installed but not initialized.' \
-  'If Ubuntu 24.04 restricted-userns applies, install the documented packages, then run:' \
-  '  sudo ops-agent-bootstrap host-policy inspect' \
-  '  sudo ops-agent-bootstrap host-policy install' \
-  '  sudo ops-agent-bootstrap host-policy status' \
-  'Run: sudo ops-agent-bootstrap init --admin-user <non-root-user>'
+  'Controller init fails closed where AppArmor restricted-userns is enabled.' \
+  'host-policy inspect/install are unavailable and never mutate host policy.' \
+  'Run init on a supported controller host, or use join for a server-only endpoint.'
 exit 0
 EOF
 cmp -s "${expected_deb_postinst}" "${deb_control_root}/postinst" || {

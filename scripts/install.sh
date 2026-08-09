@@ -11,14 +11,13 @@ readonly RELEASE_VERSION="${OPS_AGENT_VERSION:-latest}"
 usage() {
   cat <<'EOF'
 Usage:
-  # Ubuntu 24.04 restricted-userns host policy is a separate, model-external stage.
+  # Legacy Ubuntu 24.04 restricted-userns policy inventory is read-only.
   curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy ACTION
+    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy status
 
-  ACTION is one of:
-    inspect
-    install [--approve-digest sha256:...]
-    status
+  status is strict, read-only legacy inventory. Historical inspect/install
+  routes remain accepted only to return a deterministic fail-closed error;
+  they are not setup or recovery commands.
 
   curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
     | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init \
@@ -53,7 +52,7 @@ case "$mode" in
   init|join) ;;
   host-policy)
     if [ "$#" -eq 0 ]; then
-      printf 'host-policy requires inspect, install, or status.\n' >&2
+      printf 'host-policy requires status.\n' >&2
       usage >&2
       exit 2
     fi

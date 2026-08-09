@@ -87,15 +87,6 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             apparmor apparmor-profiles bubblewrap coreutils diffutils grep \
             libcap2-bin util-linux
-      - name: Install and verify the pinned nested-bubblewrap AppArmor policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          readonly policy_digest="sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef"
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh inspect
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh install \
-            --approve-digest "${policy_digest}"
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh status
       - name: Create the disposable Adapter identity fixture
         shell: bash
         run: |

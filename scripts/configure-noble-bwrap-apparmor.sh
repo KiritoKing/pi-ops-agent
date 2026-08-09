@@ -34,8 +34,8 @@ LOCK_HELD=false
 
 print_authority_summary() {
   /bin/cat <<'EOF'
-AUTHORITY SUMMARY (non-secret)
-- This installs a host-wide, argv-blind AppArmor rule: /usr/bin/bwrap ix,
+LEGACY AUTHORITY SUMMARY (non-secret; not installable by this release)
+- The withdrawn design installed a host-wide, argv-blind AppArmor rule: /usr/bin/bwrap ix,
   The rule matches only the executable path; it cannot distinguish or constrain
   bwrap arguments for a process already running in the bwrap setup profile.
 - ops-agentd's direct bundled Node process stays in the bwrap setup profile for
@@ -53,28 +53,15 @@ EOF
 
 usage() {
   /bin/cat <<'EOF'
-Usage: configure-noble-bwrap-apparmor.sh inspect|status
-       configure-noble-bwrap-apparmor.sh install [--approve-digest sha256:...]
-       configure-noble-bwrap-apparmor.sh remove
+Usage: configure-noble-bwrap-apparmor.sh status
 
-Installs only the pinned Ubuntu 24.04 apparmor-profiles bwrap policy and the
-exact /usr/bin/bwrap ix compatibility rule required by Pi Ops Agent's fixed
-outer-to-inner bubblewrap transition. It never installs packages, changes a
-sysctl, enables SUID bubblewrap, or loads an unconfined profile.
+Status is strict, read-only legacy inventory: it
+returns 3 for a safely absent policy and 1 for managed, drifted, partial, or
+inaccessible legacy state. It never represents production support.
 
-The approval digest binds the package name, exact package version, reviewed
-source digest, exact local-rule bytes, and the complete authority summary shown
-before confirmation. Automatic removal is deliberately unavailable in this
-release because a process can acquire the setup label between userspace scans;
-uninstall therefore preserves the host policy. Failure handling never unloads a
-kernel profile and deletes fresh files only when both managed profile names are
-proven absent from kernel state.
-
-status returns 0 only after exact managed files, both expected enforcing profile
-identities, and a newly completed-and-cleaned static NNP authority smoke all pass.
-It returns 3 for a safely absent policy and 1 for drift, partial state, smoke
-failure, or inaccessible evidence. Kernel name/mode evidence alone is not a
-policy digest or completion proof.
+Historical inspect/install/remove routes remain accepted only to return a
+deterministic fail-closed error before any policy mutation. They are not setup,
+approval, recovery, or removal commands.
 EOF
 }
 
@@ -813,7 +800,7 @@ while read -r status_key status_value rest; do
   case "\${status_key}" in NoNewPrivs:) no_new_privileges="\${status_value}" ;; esac
 done </proc/self/status
 [ "\${no_new_privileges}" = 1 ]
-exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${nonce} ${nonce} --proc /proc --dev /dev --clearenv --setenv OPS_AGENT_APPARMOR_NONCE_PATH ${nonce} --setenv OPS_AGENT_APPARMOR_NONCE_VALUE ${nonce_value} -- /bin/bash ${source_script}
+exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev --proc /proc -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${nonce} ${nonce} --proc /proc --dev /dev --clearenv --setenv OPS_AGENT_APPARMOR_NONCE_PATH ${nonce} --setenv OPS_AGENT_APPARMOR_NONCE_VALUE ${nonce_value} -- /bin/bash ${source_script}
 EOF
   /usr/bin/chown root:root "${driver}"
   /usr/bin/chmod 0755 "${driver}"
@@ -1036,60 +1023,7 @@ handle_exit() {
 
 do_install() {
   require_root
-  require_fixed_commands
-  validate_noble_host
-  validate_bwrap_binary
-  validate_approval_digest_binding
-  acquire_helper_lock
-  [[ "${LOCK_HELD}" == true ]] || fail "AppArmor helper lock was not retained"
-  inspect_pinned_package
-  inspect_target_state
-  inspect_kernel_state
-  validate_consistent_state
-  print_state
-  confirm_action INSTALL
-
-  if [[ "${TARGET_STATE}" == absent ]]; then
-    FRESH_MUTATION=true
-    trap handle_exit EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if [[ ! -e /etc/apparmor.d/local && ! -L /etc/apparmor.d/local ]]; then
-      /usr/bin/install -d -o root -g root -m 0755 /etc/apparmor.d/local
-      CREATED_LOCAL_DIRECTORY=true
-    fi
-    validate_policy_directory /etc/apparmor.d/local
-    atomic_install_copy "${PROFILE_SOURCE}" "${MANAGED_PROFILE}"
-    atomic_install_local_rule
-    managed_profile_is_exact && managed_local_rule_is_exact \
-      || fail "fresh managed AppArmor files failed exact verification"
-  fi
-
-  # Approval is not a lease on package or destination bytes. Re-observe every
-  # digest-bound input immediately before asking the kernel to load policy.
-  inspect_pinned_package
-  inspect_target_state
-  inspect_kernel_state
-  [[ "${TARGET_STATE}" == managed ]] \
-    || fail "managed policy disappeared before kernel load"
-  validate_consistent_state
-  /usr/sbin/apparmor_parser --config-file /dev/null \
-    --skip-read-cache --skip-cache --replace "${MANAGED_PROFILE}"
-  inspect_kernel_state
-  [[ "${KERNEL_STATE}" == enforce ]] \
-    || fail "AppArmor parser did not load both profiles in enforce mode"
-  [[ "$(<"${RESTRICTION_PATH}")" == 1 ]] \
-    || fail "restricted-userns sysctl changed during profile load"
-  run_authoritative_systemd_smoke
-  inspect_pinned_package
-  inspect_target_state
-  inspect_kernel_state
-  [[ "${TARGET_STATE}" == managed && "${KERNEL_STATE}" == enforce ]] \
-    || fail "AppArmor profiles changed after the authoritative smoke"
-  FRESH_MUTATION=false
-  trap - EXIT HUP INT TERM
-  printf 'apparmor-managed-state=installed-and-verified\n'
+  fail "host-policy install is unsupported; no AppArmor policy was changed"
 }
 
 do_remove() {
@@ -1098,18 +1032,7 @@ do_remove() {
 
 do_inspect() {
   require_root
-  require_fixed_commands
-  validate_noble_host
-  validate_bwrap_binary
-  validate_approval_digest_binding
-  acquire_helper_lock
-  [[ "${LOCK_HELD}" == true ]] || fail "AppArmor helper lock was not retained"
-  inspect_pinned_package
-  inspect_target_state
-  inspect_kernel_state
-  validate_consistent_state
-  print_state
-  printf 'apparmor-inspect=eligible\n'
+  fail "host-policy inspect is unsupported; no AppArmor policy was changed"
 }
 
 do_status() {
@@ -1117,7 +1040,6 @@ do_status() {
   require_fixed_commands
   validate_noble_host
   validate_bwrap_binary
-  validate_approval_digest_binding
   acquire_helper_lock
   [[ "${LOCK_HELD}" == true ]] || fail "AppArmor helper lock was not retained"
   inspect_pinned_package
@@ -1126,16 +1048,8 @@ do_status() {
   print_state
   case "${TARGET_STATE}:${KERNEL_STATE}" in
     managed:enforce)
-      run_authoritative_systemd_smoke
-      inspect_pinned_package
-      inspect_target_state
-      inspect_kernel_state
-      [[ "${TARGET_STATE}" == managed && "${KERNEL_STATE}" == enforce ]] \
-        || fail "AppArmor profiles changed after the status smoke"
-      [[ "$(<"${RESTRICTION_PATH}")" == 1 ]] \
-        || fail "restricted-userns sysctl changed during the status smoke"
-      printf 'apparmor-managed-state=verified-now\n'
-      return 0
+      printf 'apparmor-managed-state=legacy-unsupported\n'
+      return 1
       ;;
     absent:absent)
       printf 'apparmor-managed-state=absent\n'

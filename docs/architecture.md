@@ -234,47 +234,37 @@ deny 的证明，非 root agentd 仍无权修改宿主 sysctl。为让该路径�
 非 PID procfs 全局元数据仍可见；后者除上述精确 sysctl 例外外保持只读。这不是 procfs
 confidentiality boundary，`PrivateDevices=yes` 与 `ProtectKernelTunables=yes` 仍必须保留。
 
-outer 的 procfs 视图与它创建的 PID namespace 不是同一个安全属性。outer 仍创建独立 PID namespace、
-保留默认 PID 1 reaper，并继续提供 sync/info/exact-identity completion barrier；但它不再用
-`--proc /proc` 重挂 procfs，而只继承 `ops-agentd` 已受 `ProtectProc=invisible` 保护的 service proc
-视图，用来启动同一个固定 inner bwrap。inner 仍使用 `--proc /proc`，因此最终 Source PID 1 只看见
-与 inner PID namespace 对应的私有 procfs。这个形状没有删除 outer PID namespace 或缩短 lease
-settlement，不能被表述为以降低 PID 隔离换取兼容。
+outer 与 inner 的 procfs 必须分别匹配各自 PID namespace。outer 创建独立 PID namespace、保留默认
+PID 1 reaper 与 sync/info/exact-identity completion barrier，并用 `--proc /proc` 建立 outer 视图；
+fixed inner 再创建自己的 PID namespace 与私有 procfs，最终 Source PID 1 只看见 inner 视图。不能让
+outer 继承 service proc 视图：GitHub-hosted run `31319405888`（commit
+`7091ecfbc28ae6410f06d4e2b64462c96dd83726`，job `93259846767`）验证该候选会让 inner 返回
+`bwrap: open /proc/3/ns/ns failed: No such file or directory`。因此 outer proc mount 不是可省略的
+兼容细节，也不能以单层 bwrap、移除 PID namespace 或缩短 lease settlement 代替。
 
-Ubuntu 24.04 Noble 的 AppArmor restricted-userns 是这条 runtime contract 之外的宿主前置，而不是
-Core 可以静默修改的 sandbox 参数。独立 `configure-noble-bwrap-apparmor.sh` 只管理发行版
-`bwrap-userns-restrict` exact copy 与 local `/usr/bin/bwrap ix,`；`ops-agentd.service` 再用 typed
-ignore-missing `AppArmorProfile=-bwrap` 进入 setup profile。`inspect` 只在 policy directory 独占锁内
-做 eligibility 检查；`status` 不改变持久 policy，但对 `managed:enforce` 会在同一把锁内创建并清理
-新的 root-owned `NoNewPrivileges=yes` static unit，只有本次实时探针成功才输出 `verified-now`。该
-static unit 闭世界核对 exact fragment/drop-in closure、唯一无 flags ExecStart、空 hook/environment/
-group/capability 与完整 PID 1 effective vector，并验证同一双层结构；最终 Source 必须
-仍处于包含 `unpriv_bwrap` 的 label、五组 capability 全零，且再次 `unshare` 或启动 nested bwrap
-均失败。GitHub-hosted Noble exact helper-bound static unit 已实际执行，但 outer 自己的
-`--proc /proc` 在 `ProtectProc=invisible` 下返回 `EPERM`，所以 authority smoke 尚未完成。仅移除
-outer proc remount、保留 outer PID namespace/reaper/completion barrier 和 inner 私有 procfs 的
-形状仍待同一 hosted gate 复验；成功前不能把候选设计或本地静态检查扩大为 production 证据。
+Ubuntu 24.04 Noble 在 restricted-userns=`1` 且 AppArmor enabled 时，本 Release 的 controller
+架构明确 unsupported。带 `ProtectProc=invisible` 的 exact `NoNewPrivileges=yes` static boundary
+已经证明正确的 outer `--proc /proc` 会返回 `EPERM`，而省略 outer proc 又破坏 inner namespace
+解析；两条 hosted 证据共同排除了当前 AppArmor setup-profile 方案。controller `init` 必须在账号、
+unit、plugin、sudoers、host policy 或任何其他持久 mutation 前拒绝，不得把 direct smoke、
+`host-policy install` 或旧 managed state 当作 support signal。
 
-exact exec rule 是 host-wide、只绑定 executable path 而不绑定 argv，会扩大宿主执行授权；helper
-`install` 因而只能在 `init` 前由管理员经模型外本地逐次确认运行，并 pin 发行版 profile
-package/version/source hash/local-rule bytes 以及批准前完整展示的 authority-summary hash 的
-canonical digest。Agent、sudoers 与 `join` 都不能调用；它不安装 package、不修改 sysctl，也不启用
-SUID/unconfined 或改变双层结构。此 attachment 只覆盖直接 Node 的 `ops-agentd`/mandatory
-`workload.base`；helper 的平台范围仍只有 Noble。BotMux setup guard 则以事实优先：任何 host 只要
-实际读到 restricted-userns=`1` 且 AppArmor=`Y/y`，都在 wrapper/config mutation、hardener 或 restart
-前拒绝。Noble 缺少/无法读取 restriction evidence 也拒绝；其他 host 只有该 sysctl 安全不存在时才
-跳过。BotMux main service 若 attach，会让 pi wrapper 过早进入 `unpriv_bwrap`、阻断后续 sandbox
-setup；Adapter direct probe 不是 BotMux production chain。无法管理宿主 AppArmor 的 LXC/OrbStack
-也继续 fail closed。
+不能通过关闭 restricted-userns sysctl、启用 SUID bwrap、删除任一 bwrap 层、降低
+`ProtectProc`/systemd hardening、使用 unconfined profile 或扩大 host-wide exec authority 来制造
+成功。真正支持这类 host 需要独立、typed、短生命周期 spawn supervisor，把 setup authority 与
+固定 launch request 绑定；当前长期 Node Core 不能承担该角色。
 
-这里还有一个不能被 smoke 隐藏的 residual：`AppArmorProfile=-bwrap` 会让长期运行的
-`ops-agentd` Node 本体处于发行版 bwrap setup profile。`User=ops-agent`、`NoNewPrivileges=yes` 与空
-`CapabilityBoundingSet` 仍阻止它取得宿主 capability，但若 Core 被攻陷，它可以直接尝试该 profile
-允许的 userns/mount/network setup syscall；AppArmor 没有把这份 setup authority 限定到 runner 的
-固定 argv。outer/inner bwrap 的 `ix` 继续继承 setup profile，只有首次 non-bwrap Source exec 才
-stack `unpriv_bwrap`。管理员的模型外 host-policy 批准接受的就是这份扩大面，而不只是 local rule
-文件本身。要把 setup authority 收回到短窗口，需要后续独立、typed、短生命周期 spawn supervisor；
-当前架构不得声称已经做到。
+早期候选可能已留下 exact managed AppArmor files 或 loaded kernel profiles。它们包含诊断/恢复
+证据，默认卸载保留，helper `remove` 继续 fail closed；`inspect/install` 立即返回 unsupported，
+`status` 只做 strict exact legacy inventory：永不返回 `0`，`3` 仅表示 safely absent，`1` 表示
+managed、drift 或 inaccessible，且后两类可在状态正文前失败；它不会把 host 升级为 supported。
+任何移除必须走另行设计、
+能处理 active-label 竞态的主机维护流程。BotMux setup 继续按实际 restriction/AppArmor evidence
+在 mutation 前拒绝。无法管理宿主 policy 的 LXC/OrbStack 同样没有降级路径。
+
+`join` endpoint 不安装 agentd、Adapter 或 Workload Source runtime，只部署 server/core broker，且
+按 signed enrollment 与本机 `/usr/bin/pvesh` 条件部署 PVE broker；因此它不受 controller 的 Noble
+限制，也永远不得安装、更新或删除上述 host policy。
 
 `workload.base`、PVE、
 Hermes/BotMux 运维都走这条 Source host 路径；旧 `.opspkg` catalog 和 OCI

@@ -41,10 +41,10 @@ the fixed peer-authenticated lease broker socket and retain an exact-digest shar
 for the complete runtime; it must never open the broker-only lock directory. Both the descriptor probe and the main source
 entrypoint must launch through their own fixed, nested bubblewrap PID namespaces. The outer fixed
 bwrap keeps its default PID 1 reaper and may execute only the same fixed root-owned inner bwrap. It
-must not mount a fresh procfs: it inherits the systemd-protected service proc view only to launch
-that fixed inner. The inner must retain `--proc /proc`, so untrusted Source sees only the inner PID
-namespace's private procfs. Omitting outer `--proc` does not omit its PID namespace, reaper, or
-completion barrier and must not be described as weaker PID containment. The outer must not use
+must retain `--proc /proc` so its procfs matches the outer PID namespace; the fixed inner also
+retains `--proc /proc`, so untrusted Source sees only the inner PID namespace's private procfs.
+Omitting outer `--proc` breaks the inner namespace-FD lookup and is not a supported fallback. The
+outer must not use
 `--as-pid-1` or `--disable-userns`. The inner bwrap uses
 `--unshare-user --unshare-pid --as-pid-1 --die-with-parent --disable-userns`, makes Source PID 1,
 and denies further nesting. Outer bwrap must also retain a runner-observed `--sync-fd` that only its
@@ -84,32 +84,18 @@ typed channel; positional argv and `@file` prompts are forbidden. Exit status
 `77` means the Linux/root/systemd/account/bwrap prerequisites were absent and is not a passing result. Never
 replace this check with a fake bwrap or a mocked effective UID/GID.
 
-Do not hide Ubuntu Noble AppArmor failures inside an Adapter change. With
-`kernel.apparmor_restrict_unprivileged_userns=1`, the version/hash-pinned host helper and exact
-host-wide `/usr/bin/bwrap ix,` are an administrator-approved `init` prerequisite only for direct
-Node `ops-agentd`/mandatory `workload.base`. The approval digest must bind the exact package/version/
-source/rule plus the complete pre-confirm authority-summary hash; for this Release they are
-`sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef` and
-`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`. Its closed-world
-`NoNewPrivileges=yes` static smoke and the direct
-Adapter CI probe can prove the underlying outer→inner mechanism, final `unpriv_bwrap` label, zero
-capabilities, and nested-userns deny; they do not prove an arbitrary Adapter service chain.
-In particular, attaching the real BotMux main service makes its pi wrapper enter `unpriv_bwrap` too
-early and prevents the later sandbox setup. Treat observed host state as authoritative: every host
-with readable restricted-userns=`1` and AppArmor=`Y/y` refuses BotMux before setup mutation;
-Noble also refuses missing/unreadable restriction evidence, while another host may continue only
-when that sysctl is safely absent. This remains fail closed even if the direct Adapter probe passes.
-Never claim otherwise or change Adapter bwrap arguments, use SUID/unconfined, modify the sysctl, or
-remove either layer. The host-policy helper itself remains Noble-only.
-Require the helper to disclose the argv-blind host rule, long-lived Core setup-profile authority,
-BotMux unsupported state, and lack of automatic removal before approval. Host-policy management
-never belongs in Adapter source, lifecycle hooks, requested scopes, Agent
-tools, sudoers, or `join`. It requires model-external local approval of the exact Release/profile
-digest, reapproval after version/hash/rule/authority-summary drift, and default-uninstall
-preservation. The exact GitHub-hosted Noble NNP static unit has already shown outer
-`--proc /proc` failing with `EPERM` under `ProtectProc=invisible`. Removing only that outer proc
-remount while retaining outer PID containment and the inner private procfs remains a candidate
-pending the same hosted gate; local/static validation is not production evidence.
+Do not hide Ubuntu Noble AppArmor failures inside an Adapter change. When
+`kernel.apparmor_restrict_unprivileged_userns=1` and AppArmor is enabled, this Release does not
+support controller `init`; it must fail before any persistent mutation. The hardened hosted unit
+proved the required outer `--proc /proc` returns `EPERM`, while GitHub Actions run `31319405888`
+(commit `7091ecfbc28ae6410f06d4e2b64462c96dd83726`, job `93259846767`) proved that omitting it makes
+the fixed inner fail with `open /proc/3/ns/ns failed`. Do not recommend `host-policy install`, cite
+old managed state as support, modify the sysctl, use SUID/unconfined bwrap, remove a layer, or lower
+`ProtectProc`/systemd hardening. Real support needs an independent typed short-lived spawn
+supervisor. Preserve any existing managed files/kernel profiles as evidence; automatic removal is
+not safe. BotMux remains fact-first fail closed on observed restricted-userns + AppArmor. A
+server/core/PVE-only `join` endpoint does not run Source plugins and is outside this controller
+restriction; Adapter code must never manage host policy.
 
 `adapter.tui` is instead a non-executable profile: the runner starts the compiled Client directly
 to preserve host sudo/PAM, and that Client independently holds the exact TUI digest lease until it

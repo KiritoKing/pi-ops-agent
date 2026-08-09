@@ -48,13 +48,13 @@ verify_root_release_tree() {
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./ops-agent-bootstrap host-policy inspect
-  sudo ./ops-agent-bootstrap host-policy install [--approve-digest sha256:...]
   sudo ./ops-agent-bootstrap host-policy status
   sudo ./ops-agent-bootstrap init [INSTALLER OPTIONS]
   sudo ./ops-agent-bootstrap join [INSTALLER OPTIONS]
 
-The host-policy stage is explicit and never runs as part of init or join.
+Host-policy never runs as part of init or join. Status is strict, read-only
+legacy inventory. Historical inspect/install routes are hidden compatibility
+entrypoints that only return a deterministic fail-closed error.
 EOF
 }
 
@@ -68,7 +68,7 @@ shift
 case "${mode}" in
   host-policy)
     if (($# == 0)); then
-      printf 'host-policy requires inspect, install, or status.\n' >&2
+      printf 'host-policy requires status.\n' >&2
       usage >&2
       exit 2
     fi

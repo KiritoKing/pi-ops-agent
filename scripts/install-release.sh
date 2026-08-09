@@ -699,6 +699,74 @@ without overwriting identity, policy, TLS, or broker receipt keys.
 EOF
 }
 
+reject_unsupported_restricted_userns_controller_host() {
+  local apparmor_enabled restriction noble=false line
+  local os_bytes=0 os_lines=0 os_id_count=0 os_version_count=0
+  [[ "${MODE}" == init ]] || return 0
+  if [[ -r /etc/os-release ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      ((os_lines += 1))
+      ((os_bytes += ${#line} + 1))
+      if ((os_lines > 256 || os_bytes > 16384)) || [[ "${line}" == *$'\r'* ]]; then
+        os_id_count=0
+        os_version_count=0
+        break
+      fi
+      case "${line}" in
+        ID=ubuntu|'ID="ubuntu"') ((os_id_count += 1)) ;;
+        VERSION_ID=24.04|'VERSION_ID="24.04"') ((os_version_count += 1)) ;;
+      esac
+    done </etc/os-release
+  fi
+  if ((os_id_count == 1 && os_version_count == 1)); then
+    noble=true
+  fi
+  if [[ ! -r /sys/module/apparmor/parameters/enabled ]] \
+      || ! IFS= read -r apparmor_enabled </sys/module/apparmor/parameters/enabled; then
+    [[ "${noble}" != true ]] || {
+      printf 'Controller init refuses Ubuntu 24.04 because AppArmor state is unavailable.\n' >&2
+      return 1
+    }
+    return 0
+  fi
+  case "${apparmor_enabled}" in
+    Y|y) ;;
+    N|n) return 0 ;;
+    *)
+      [[ "${noble}" != true ]] || {
+        printf 'Controller init refuses Ubuntu 24.04 because AppArmor state is invalid.\n' >&2
+        return 1
+      }
+      return 0
+      ;;
+  esac
+  if [[ ! -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
+      || ! IFS= read -r restriction \
+        </proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+    [[ "${noble}" != true ]] || {
+      printf 'Controller init refuses Ubuntu 24.04 because restricted-userns state is unavailable.\n' >&2
+      return 1
+    }
+    return 0
+  fi
+  case "${restriction}" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      [[ "${noble}" != true ]] || {
+        printf 'Controller init refuses Ubuntu 24.04 because restricted-userns state is invalid.\n' >&2
+        return 1
+      }
+      return 0
+      ;;
+  esac
+  printf '%s\n' \
+    'Controller init is unsupported while AppArmor restricted unprivileged user namespaces are enabled.' \
+    'No controller account, unit, plugin, release, or host AppArmor policy was changed.' \
+    'Server-only join remains available; controller support requires a typed short-lived spawn supervisor.' >&2
+  return 1
+}
+
 if (($# == 0)); then
   usage >&2
   exit 2
@@ -796,6 +864,7 @@ if [[ "${MODE}" == init ]]; then
     exit 1
   fi
 fi
+reject_unsupported_restricted_userns_controller_host
 if [[ "${MODE}" == init ]] && ((${#ENABLED_ARTIFACTS[@]} > 0)); then
   if [[ -f "${CONFIG_ROOT}/targets.json" ]]; then
     printf '%s\n' '--enable-artifact is only valid for a fresh target policy; review existing policy changes explicitly.' >&2
@@ -2755,11 +2824,9 @@ verify_effective_security_dropin() {
         fi
         ;;
       AppArmorProfile)
-        [[ "${expected}" == -bwrap ]] || {
-          printf 'Unsupported AppArmorProfile in release policy for %s.\n' "${unit}" >&2
-          return 1
-        }
-        require_installed_unit_apparmor_profile "${unit}" true bwrap
+        printf 'Release policy must not attach an AppArmorProfile to %s.\n' \
+          "${unit}" >&2
+        return 1
         ;;
       *) require_installed_unit_property "${unit}" "${property}" "${expected}" ;;
     esac
@@ -2774,6 +2841,12 @@ verify_effective_security_dropin() {
     # SupplementaryGroups is additive authority. Units whose release policy
     # omits it must not inherit arbitrary local groups from another drop-in.
     require_installed_unit_word_set "${unit}" SupplementaryGroups ''
+  fi
+  if [[ -z "${seen[AppArmorProfile]:-}" ]]; then
+    # AppArmorProfile is scalar execution authority and can be injected by a
+    # host-wide drop-in. Units that do not request a profile must prove the
+    # exact empty/non-ignore D-Bus value.
+    require_installed_unit_apparmor_profile "${unit}" false ''
   fi
   # Every additional loaded service drop-in must either be an exact managed
   # policy file or a root-owned host-wide compatibility reset whose complete
@@ -3397,7 +3470,7 @@ run_bwrap_service_preflight() (
   # expansion between the driver and the inner shell.
   cat >"${bwrap_probe_driver}" <<EOF
 #!/bin/sh
-exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv -- ${SANDBOX_PRLIMIT} --as=1073741824:1073741824 --core=0:0 --cpu=5:5 --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/sh -ceu '[ "\$\$" -eq 1 ]; /bin/sleep 300 & printf %s ${bwrap_probe_nonce_value} > ${bwrap_probe_nonce}'
+exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev --proc /proc -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv -- ${SANDBOX_PRLIMIT} --as=1073741824:1073741824 --core=0:0 --cpu=5:5 --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/sh -ceu '[ "\$\$" -eq 1 ]; /bin/sleep 300 & printf %s ${bwrap_probe_nonce_value} > ${bwrap_probe_nonce}'
 EOF
   chown root:root "${bwrap_probe_driver}"
   chmod 0755 "${bwrap_probe_driver}"
@@ -3524,8 +3597,8 @@ EOF
     require_pid1_unit_property ops-agentd.service "${property}" "${expected}"
     require_pid1_unit_property "${bwrap_probe_unit}" "${property}" "${expected}"
   done
-  require_installed_unit_apparmor_profile ops-agentd.service true bwrap
-  require_installed_unit_apparmor_profile "${bwrap_probe_unit}" true bwrap
+  require_installed_unit_apparmor_profile ops-agentd.service false ''
+  require_installed_unit_apparmor_profile "${bwrap_probe_unit}" false ''
   for expectation in "${fixed_effective_word_sets[@]}"; do
     property="${expectation%%=*}"
     expected="${expectation#*=}"

@@ -70,15 +70,6 @@ jobs:
             apparmor apparmor-profiles binutils bubblewrap ca-certificates \
             coreutils curl diffutils dpkg \
             findutils gawk grep gzip libcap2-bin openssl sudo tar util-linux xz-utils
-      - name: Install and verify the pinned nested-bubblewrap AppArmor policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          readonly policy_digest="sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef"
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh inspect
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh install \
-            --approve-digest "${policy_digest}"
-          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh status
       - name: Build the native amd64 release payload
         shell: bash
         run: |
@@ -140,16 +131,6 @@ jobs:
           test -x "${install_fixture}/configure-noble-bwrap-apparmor.sh"
           cmp -s "${install_fixture}/configure-noble-bwrap-apparmor.sh" \
             "${install_fixture}/payload/app/scripts/configure-noble-bwrap-apparmor.sh"
-          root_bootstrap_fixture="$(sudo mktemp -d /var/tmp/ops-agent-bootstrap-ci.XXXXXX)"
-          case "${root_bootstrap_fixture}" in
-            /var/tmp/ops-agent-bootstrap-ci.*) ;;
-            *) echo "mktemp returned an unsafe bootstrap fixture" >&2; exit 1 ;;
-          esac
-          sudo tar -xzf release/ops-agent-linux-amd64.tar.gz \
-            -C "${root_bootstrap_fixture}"
-          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" host-policy status
-          sudo find "${root_bootstrap_fixture}" -xdev -mindepth 1 -depth -delete
-          sudo rmdir "${root_bootstrap_fixture}"
           (
             cd release
             sha256sum ops-agent-linux-amd64.tar.gz \
@@ -166,19 +147,29 @@ jobs:
           retention-days: 1
           compression-level: 0
           overwrite: true
-      - name: Prepare the disposable bare-host fixture
+      - name: Prepare the disposable restricted-userns host fixture
         shell: bash
         run: |
           set -euo pipefail
-          printf 'kernel.apparmor_restrict_unprivileged_userns=%s\n' \
-            "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || printf unavailable)"
+          grep -Eq '^ID=(ubuntu|"ubuntu")$' /etc/os-release
+          grep -Eq '^VERSION_ID=(24\.04|"24\.04")$' /etc/os-release
+          grep -Eq '^[Yy]$' /sys/module/apparmor/parameters/enabled
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
           if sudo /usr/bin/test -r /sys/kernel/security/apparmor/profiles; then
             sudo /usr/bin/awk \
-              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print "loaded-apparmor-profile=" $0 }' \
-              /sys/kernel/security/apparmor/profiles || true
+              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print }' \
+              /sys/kernel/security/apparmor/profiles \
+              >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-before"
           else
-            printf 'loaded-apparmor-profile=unavailable\n'
+            printf 'unavailable\n' >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-before"
           fi
+          for path in /etc/apparmor.d/bwrap-userns-restrict \
+              /etc/apparmor.d/local/bwrap-userns-restrict; do
+            if sudo /usr/bin/test -e "${path}" || sudo /usr/bin/test -L "${path}"; then
+              echo "Disposable runner unexpectedly has managed host policy ${path}" >&2
+              exit 1
+            fi
+          done
           if /usr/bin/getent passwd opsadmin >/dev/null; then
             echo "Disposable runner unexpectedly contains opsadmin" >&2
             exit 1
@@ -205,71 +196,64 @@ jobs:
             exit 1
           fi
 
-          # This early type-wide reset models host policy such as an LXC
-          # service.d drop-in. The release's later name-specific policy must
-          # restore every property used by the real nested-bwrap preflight.
-          cat >"${RUNNER_TEMP}/10-ci-weak-reset.conf" <<'EOF'
-          [Service]
-          ProcSubset=all
-          ProtectProc=default
-          ProtectControlGroups=no
-          ProtectKernelTunables=no
-          NoNewPrivileges=no
-          LoadCredential=
-          PrivateNetwork=no
-          ProtectHome=no
-          ProtectSystem=no
-          PrivateDevices=no
-          PrivateTmp=no
-          ProtectKernelLogs=no
-          ProtectKernelModules=no
-          ReadWritePaths=
-          ReadOnlyPaths=
-          ImportCredential=
-          EOF
-          sudo /usr/bin/install -d -o root -g root -m 0755 \
-            /run/systemd/system/service.d
-          sudo /usr/bin/install -o root -g root -m 0644 \
-            "${RUNNER_TEMP}/10-ci-weak-reset.conf" \
-            /run/systemd/system/service.d/10-ci-weak-reset.conf
-
-          # This later unit-specific override must win over the release policy.
-          # The first init is expected to reject it based on PID 1's effective
-          # properties, then restore all transaction-owned state.
-          cat >"${RUNNER_TEMP}/zzzzzz-ci-weaken.conf" <<'EOF'
-          [Service]
-          PrivateDevices=no
-          EOF
-          sudo /usr/bin/install -d -o root -g root -m 0755 \
-            /etc/systemd/system/ops-agentd.service.d
-          sudo /usr/bin/install -o root -g root -m 0644 \
-            "${RUNNER_TEMP}/zzzzzz-ci-weaken.conf" \
-            /etc/systemd/system/ops-agentd.service.d/zzzzzz-ci-weaken.conf
-          sudo /usr/bin/systemctl daemon-reload
-      - name: Prove an effective-policy downgrade fails and fully rolls back
+      - name: Reject host policy and controller init before persistent mutation
         shell: bash
         run: |
           set -euo pipefail
-          install_fixture="${RUNNER_TEMP}/ops-agent-install-fixture"
-          first_log="${RUNNER_TEMP}/ops-agent-first-init.log"
+          root_bootstrap_fixture="$(sudo mktemp -d /var/tmp/ops-agent-bootstrap-ci.XXXXXX)"
+          case "${root_bootstrap_fixture}" in
+            /var/tmp/ops-agent-bootstrap-ci.*) ;;
+            *) echo "mktemp returned an unsafe bootstrap fixture" >&2; exit 1 ;;
+          esac
+          sudo tar -xzf release/ops-agent-linux-amd64.tar.gz \
+            -C "${root_bootstrap_fixture}"
+
+          inspect_log="${RUNNER_TEMP}/ops-agent-host-policy-inspect.log"
           set +e
-          sudo /usr/bin/env \
-            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
-            "${install_fixture}/install-release.sh" init \
-              --admin-user opsadmin \
-              --approve-required-plugins \
-              --no-start 2>&1 | tee "${first_log}"
-          first_status="${PIPESTATUS[0]}"
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" \
+            host-policy inspect >"${inspect_log}" 2>&1
+          inspect_status="$?"
           set -e
-          if [[ "${first_status}" -eq 0 ]]; then
-            echo "Installer accepted a late PrivateDevices downgrade" >&2
+          if [[ "${inspect_status}" -eq 0 ]]; then
+            echo "Unsupported host-policy inspect unexpectedly succeeded" >&2
             exit 1
           fi
-          grep -Fq 'PrivateDevices' "${first_log}"
-          grep -Fq 'Installation failed; all managed paths, identities and unit state were restored.' \
-            "${first_log}"
-          if grep -Fq 'rollback was incomplete' "${first_log}"; then
-            echo "Installer reported an incomplete rollback" >&2
+          grep -Fq 'host-policy inspect is unsupported; no AppArmor policy was changed' \
+            "${inspect_log}"
+
+          install_log="${RUNNER_TEMP}/ops-agent-host-policy-install.log"
+          set +e
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" \
+            host-policy install \
+            --approve-digest sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef \
+            >"${install_log}" 2>&1
+          install_status="$?"
+          set -e
+          if [[ "${install_status}" -eq 0 ]]; then
+            echo "Unsupported host-policy install unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'host-policy install is unsupported; no AppArmor policy was changed' \
+            "${install_log}"
+
+          init_log="${RUNNER_TEMP}/ops-agent-early-init.log"
+          set +e
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" init \
+            --admin-user opsadmin \
+            --approve-required-plugins \
+            --no-start >"${init_log}" 2>&1
+          init_status="$?"
+          set -e
+          if [[ "${init_status}" -eq 0 ]]; then
+            echo "Restricted-userns controller init unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'Controller init is unsupported while AppArmor restricted unprivileged user namespaces are enabled.' \
+            "${init_log}"
+          grep -Fq 'No controller account, unit, plugin, release, or host AppArmor policy was changed.' \
+            "${init_log}"
+          if grep -Fq 'Installation failed;' "${init_log}"; then
+            echo "Restricted-userns rejection started an install transaction" >&2
             exit 1
           fi
 
@@ -287,6 +271,7 @@ jobs:
             /etc/systemd/system/ops-agent.target
             /etc/systemd/system/ops-agent.target.wants
             /etc/systemd/system/ops-agentd.service
+            /etc/systemd/system/ops-agentd.service.d
             /etc/systemd/system/agentd-client-gateway.service
             /etc/systemd/system/agentd-client-gateway.service.d
             /etc/systemd/system/agentd-guardian.service
@@ -307,229 +292,54 @@ jobs:
           )
           for path in "${managed_absent[@]}"; do
             if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
-              echo "Rollback retained managed path ${path}" >&2
+              echo "Early rejection created managed path ${path}" >&2
               exit 1
             fi
           done
           for identity in ops-agent ops-agent-server ops-agent-reviewer ops-agent-botmux ops-agent-lease; do
             if /usr/bin/getent passwd "${identity}" >/dev/null \
                 || /usr/bin/getent group "${identity}" >/dev/null; then
-              echo "Rollback retained managed identity ${identity}" >&2
+              echo "Early rejection created managed identity ${identity}" >&2
               exit 1
             fi
           done
           if /usr/bin/getent group ops-agent-client >/dev/null; then
-            echo "Rollback retained ops-agent-client" >&2
+            echo "Early rejection created ops-agent-client" >&2
             exit 1
           fi
           test "$(id -nG opsadmin)" = opsadmin
-          test -f /etc/systemd/system/ops-agentd.service.d/zzzzzz-ci-weaken.conf
-          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/zzzzzz-ci-weaken.conf" \
-            /etc/systemd/system/ops-agentd.service.d/zzzzzz-ci-weaken.conf
-          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
-            /etc/systemd/system/ops-agentd.service.d/zzzzzz-ci-weaken.conf)" = root:root:644:1
-          test "$(find /etc/systemd/system/ops-agentd.service.d -mindepth 1 -maxdepth 1 \
-            -printf '%f\n')" = zzzzzz-ci-weaken.conf
+          for path in /etc/apparmor.d/bwrap-userns-restrict \
+              /etc/apparmor.d/local/bwrap-userns-restrict; do
+            if sudo /usr/bin/test -e "${path}" || sudo /usr/bin/test -L "${path}"; then
+              echo "Unsupported path created host policy ${path}" >&2
+              exit 1
+            fi
+          done
+          if sudo /usr/bin/test -r /sys/kernel/security/apparmor/profiles; then
+            sudo /usr/bin/awk \
+              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print }' \
+              /sys/kernel/security/apparmor/profiles \
+              >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
+          else
+            printf 'unavailable\n' >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
+          fi
+          cmp -s "${RUNNER_TEMP}/ops-agent-bwrap-profiles-before" \
+            "${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
           if find /run/systemd/system -maxdepth 2 \
               -name 'ops-agent-bwrap-probe-*' -print -quit | grep -q .; then
-            echo "Failed preflight retained a static unit, drop-in, or driver" >&2
+            echo "Early rejection created a static sandbox probe" >&2
             exit 1
           fi
           if find /var/tmp -maxdepth 1 \
               -name 'ops-agent-install.*' -print -quit | grep -q .; then
-            echo "Failed init retained transaction scratch" >&2
+            echo "Early rejection created transaction scratch" >&2
             exit 1
           fi
           test -z "$(systemctl list-units --all --plain --no-legend \
             'ops-agent-bwrap-probe-*.service')"
 
-      - name: Install successfully under the restored effective policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          install_fixture="${RUNNER_TEMP}/ops-agent-install-fixture"
-          sudo /usr/bin/rm -f -- \
-            /etc/systemd/system/ops-agentd.service.d/zzzzzz-ci-weaken.conf
-          sudo /usr/bin/rmdir -- /etc/systemd/system/ops-agentd.service.d
-          sudo /usr/bin/systemctl daemon-reload
-          sudo /usr/bin/env \
-            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
-            "${install_fixture}/install-release.sh" init \
-              --admin-user opsadmin \
-              --approve-required-plugins \
-              --no-start
-          release_identity="$(sudo /usr/bin/stat -c '%d:%i' \
-            "/opt/pi-ops-agent/releases/${RELEASE_VERSION}")"
-          sudo /usr/bin/env \
-            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
-            "${install_fixture}/install-release.sh" init \
-              --admin-user opsadmin \
-              --no-start
-          test "$(sudo /usr/bin/stat -c '%d:%i' \
-            "/opt/pi-ops-agent/releases/${RELEASE_VERSION}")" = "${release_identity}"
-
-          test "$(systemctl is-enabled ops-agent.target)" = enabled
-          test "$(systemctl is-enabled ops-agent-healthcheck.timer)" = enabled
-          inactive_units=(
-            ops-agent.target
-            ops-agentd.service
-            agentd-client-gateway.service
-            agentd-guardian.service
-            agentd-approval-reviewer.service
-            agentd-plugin-lease-broker.service
-            ops-agent-server.service
-            ops-root-helper.service
-            ops-pve-root-helper.service
-            ops-agent-healthcheck.service
-            ops-agent-healthcheck.timer
-          )
-          for unit in "${inactive_units[@]}"; do
-            if systemctl is-active --quiet "${unit}"; then
-              echo "--no-start left ${unit} active" >&2
-              exit 1
-            fi
-          done
-          if sudo /usr/bin/test -e /etc/ops-agent/credentials/deepseek_api_key.cred; then
-            echo "--no-start unexpectedly created a model credential" >&2
-            exit 1
-          fi
-          test ! -e /etc/systemd/system/ops-pve-root-helper.service
-          test ! -e /etc/systemd/system/ops-pve-root-helper.service.d
-
-          installed_units=(
-            /etc/systemd/system/ops-agent.target
-            /etc/systemd/system/ops-agentd.service
-            /etc/systemd/system/agentd-client-gateway.service
-            /etc/systemd/system/agentd-guardian.service
-            /etc/systemd/system/agentd-approval-reviewer.service
-            /etc/systemd/system/agentd-plugin-lease-broker.service
-            /etc/systemd/system/ops-agent-server.service
-            /etc/systemd/system/ops-root-helper.service
-            /etc/systemd/system/ops-agent-healthcheck.service
-            /etc/systemd/system/ops-agent-healthcheck.timer
-          )
-          sudo /usr/bin/systemd-analyze verify "${installed_units[@]}"
-
-          for kind_and_plugin in adapter:adapter.tui workload:workload.base; do
-            plugin_kind="${kind_and_plugin%%:*}"
-            expected_plugin="${kind_and_plugin#*:}"
-            active_file="${RUNNER_TEMP}/active-${plugin_kind}.json"
-            sudo /opt/pi-ops-agent/current/bin/agentd-pluginctl list \
-              --root /var/lib/ops-agent/plugins \
-              --kind "${plugin_kind}" >"${active_file}"
-            EXPECTED_PLUGIN="${expected_plugin}" node -e '
-              const fs = require("node:fs");
-              const active = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-              if (!Array.isArray(active) || active.length !== 1
-                  || active[0]?.pluginId !== process.env.EXPECTED_PLUGIN) {
-                throw new Error("active plugin set is not exactly the mandatory plugin");
-              }
-            ' "${active_file}"
-          done
-
-          for plugin_id in adapter.tui workload.base; do
-            current_file="${RUNNER_TEMP}/current-${plugin_id}.json"
-            inspection_file="${RUNNER_TEMP}/inspection-${plugin_id}.json"
-            case "${plugin_id}" in
-              adapter.tui) bundled_source=/opt/pi-ops-agent/current/plugins/adapter-tui ;;
-              workload.base) bundled_source=/opt/pi-ops-agent/current/plugins/workload-base ;;
-              *) exit 1 ;;
-            esac
-            sudo /opt/pi-ops-agent/current/bin/agentd-pluginctl current \
-              --root /var/lib/ops-agent/plugins \
-              --plugin-id "${plugin_id}" >"${current_file}"
-            sudo /opt/pi-ops-agent/current/bin/agentd-pluginctl inspect \
-              --root /var/lib/ops-agent/plugins \
-              --source "${bundled_source}" >"${inspection_file}"
-            CURRENT_PLUGIN_ID="${plugin_id}" node -e '
-              const fs = require("node:fs");
-              const current = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-              const inspection = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-              const manifest = inspection.manifest;
-              const expected = {
-                pluginId: manifest.id,
-                kind: manifest.kind,
-                version: manifest.version,
-                publisher: manifest.publisher,
-                digest: inspection.digest,
-                capabilities: manifest.capabilities,
-                requestedScopes: manifest.requestedScopes,
-              };
-              for (const [key, value] of Object.entries(expected)) {
-                if (JSON.stringify(current[key]) !== JSON.stringify(value)) {
-                  throw new Error(`mandatory plugin ${key} differs from bundled source`);
-                }
-              }
-              if (current.pluginId !== process.env.CURRENT_PLUGIN_ID
-                  || !/^sha256:[a-f0-9]{64}$/u.test(current.digest ?? "")) {
-                throw new Error("mandatory plugin current identity is invalid");
-              }
-            ' "${current_file}" "${inspection_file}"
-          done
-          for plugin_id in adapter.botmux workload.pve workload.hermes-ops workload.botmux-ops; do
-            sudo /usr/bin/test -d "/var/lib/ops-agent/plugin-sources/${plugin_id}"
-          done
-
-          secured_units=(
-            ops-agentd.service
-            agentd-client-gateway.service
-            agentd-guardian.service
-            agentd-approval-reviewer.service
-            agentd-plugin-lease-broker.service
-            ops-agent-server.service
-            ops-root-helper.service
-            ops-agent-healthcheck.service
-          )
-          for unit in "${secured_units[@]}"; do
-            dropins=" $(systemctl show --no-pager --property=DropInPaths --value "${unit}") "
-            case "${dropins}" in
-              *" /run/systemd/system/service.d/10-ci-weak-reset.conf "*) ;;
-              *) echo "PID 1 did not load the global weak reset for ${unit}" >&2; exit 1 ;;
-            esac
-            security_dropin="/etc/systemd/system/${unit}.d/zzzz-ops-agent-security.conf"
-            case "${dropins}" in
-              *" ${security_dropin} "*) ;;
-              *) echo "PID 1 did not load the final policy for ${unit}" >&2; exit 1 ;;
-            esac
-            test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' "${security_dropin}")" = root:root:644:1
-            for property in NoNewPrivileges PrivateTmp PrivateDevices ProtectKernelTunables; do
-              test "$(systemctl show --no-pager --property="${property}" --value "${unit}")" = yes
-            done
-          done
-          for unit in ops-agentd.service agentd-client-gateway.service agentd-guardian.service \
-              agentd-approval-reviewer.service agentd-plugin-lease-broker.service \
-              ops-agent-server.service; do
-            test "$(systemctl show --no-pager --property=ProtectProc --value "${unit}")" = invisible
-          done
-          test "$(systemctl show --no-pager --property=ProcSubset --value \
-            ops-agentd.service)" = all
-          for unit in agentd-client-gateway.service agentd-guardian.service \
-              agentd-plugin-lease-broker.service ops-agent-server.service; do
-            test "$(systemctl show --no-pager --property=ProcSubset --value "${unit}")" = pid
-          done
-          test "$(systemctl show --no-pager --property=TasksMax --value \
-            agentd-client-gateway.service)" = 128
-          test "$(systemctl show --no-pager --property=LimitNOFILE --value \
-            agentd-client-gateway.service)" = 512
-          test "$(systemctl show --no-pager --property=LimitNOFILESoft --value \
-            agentd-client-gateway.service)" = 512
-          test "$(systemctl show --no-pager --property=MemoryMax --value \
-            agentd-client-gateway.service)" = 268435456
-          for unit in agentd-guardian.service ops-agent-server.service \
-              ops-root-helper.service ops-agent-healthcheck.service; do
-            test -z "$(systemctl show --no-pager --property=ReadWritePaths --value "${unit}")"
-          done
-          for unit in agentd-approval-reviewer.service ops-agent-server.service \
-              ops-root-helper.service ops-agent-healthcheck.service; do
-            test -z "$(systemctl show --no-pager --property=SupplementaryGroups --value "${unit}")"
-          done
-          if find /run/systemd/system -maxdepth 2 \
-              -name 'ops-agent-bwrap-probe-*' -print -quit | grep -q .; then
-            echo "Successful preflight retained a static unit, drop-in, or driver" >&2
-            exit 1
-          fi
-          test -z "$(systemctl list-units --all --plain --no-legend \
-            'ops-agent-bwrap-probe-*.service')"
+          sudo find "${root_bootstrap_fixture}" -xdev -mindepth 1 -depth -delete
+          sudo rmdir "${root_bootstrap_fixture}"
   join-installer-runtime:
     needs: installer-runtime
     runs-on: ubuntu-24.04

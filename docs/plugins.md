@@ -109,10 +109,9 @@ cgroup/UTS namespace。`ops-agentd` 的
 `/proc/sys/user/max_user_namespaces` 的唯一可写 mount 只供固定 outer 建立 inner user namespace、
 再由 inner `--disable-userns` 设置 namespaced quota，并由 bwrap 自己验证下一次
 `CLONE_NEWUSER` 失败；不能用最终 procfs 显示的数值代替该 postcondition。
-outer 不使用 `--proc` 重挂 procfs，而继承 systemd 已保护的 service proc 视图，仅用来启动固定
-inner；它仍有独立 PID namespace、默认 PID 1 reaper 和完整 completion barrier。inner 必须继续
-使用 `--proc /proc`，最终 Source 只看见 inner PID namespace 的私有 procfs。这个差异不构成单层
-fallback，也不能描述成放宽 PID containment。
+outer 与 inner 都必须使用 `--proc /proc`，让各自 procfs 与 PID namespace 一致；outer 仍保留
+默认 PID 1 reaper 和完整 completion barrier，inner 最终只向 Source 暴露自己的私有 procfs。
+省略 outer proc mount 会使 fixed inner 无法解析其 namespace FD，不是可接受的兼容 fallback。
 unit 必须同时固定 `ProtectProc=invisible` 与 `ProcSubset=all`；`all` 使该 sysctl 路径存在，
 `invisible` 只隐藏其他 UID 的 PID 目录。same-UID PID 与未被其他 mount hardening 屏蔽的只读非 PID
 procfs 元数据仍可见，不能声称完整隐藏 `/proc`。除精确 sysctl 例外外继续保留
@@ -120,6 +119,12 @@ procfs 元数据仍可见，不能声称完整隐藏 `/proc`。除精确 sysctl 
 DAC/capability。Node permission mode 不开放 child process。
 它的 namespace 同时是无网络/只读 CAS sandbox；Adapter 的 PID namespace 只解决进程树生命周期，
 不代表 Adapter 没有网络或宿主用户权限。
+
+Ubuntu 24.04 Noble 若 restricted-userns=`1` 且 AppArmor enabled，本 Release 的 controller/`init`
+在任何持久 mutation 前明确 fail closed。正确 outer proc mount 在 hardened static boundary 返回
+`EPERM`，省略它又在 hosted run `31319405888` 让 inner 以 `open /proc/3/ns/ns failed` 失败；不得
+通过 sysctl/SUID/single-layer/降低 `ProtectProc`/unconfined 绕过。真正支持需要 typed spawn
+supervisor。server/core/PVE-only `join` 不执行 Source Plugin，不受这项 controller 限制。
 
 ## canonical digest
 

@@ -94,7 +94,7 @@ describe("exact-digest BotMux setup runner", () => {
       "approved BotMux configuration hardener:/usr/bin/bwrap:" + [
         "--die-with-parent", "--sync-fd", "8", "--info-fd", "9",
         "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
-        "--bind", "/", "/", "--dev", "/dev", "--", "/usr/bin/bwrap",
+        "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "/usr/bin/bwrap",
         "--die-with-parent", "--unshare-user", "--unshare-pid", "--as-pid-1", "--disable-userns",
         "--cap-drop", "ALL", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--chdir", SNAPSHOT, "--", dependencies.nodePath,

@@ -179,15 +179,16 @@ describe("native release layout", () => {
     );
   });
 
-  it("exposes host policy as an explicit verified pre-init artifact stage", () => {
+  it("keeps the verified host-policy artifact as a fail-closed compatibility stage", () => {
     const bootstrap = repositoryFile("scripts/install.sh");
     const releaseBootstrap = repositoryFile("scripts/ops-agent-bootstrap.sh");
     const packager = repositoryFile("packaging/build-release.sh");
     const verifier = repositoryFile("packaging/verify-release.sh");
     const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
 
-    expect(bootstrap).toContain("host-policy ACTION");
-    expect(bootstrap).toContain("host-policy requires inspect, install, or status");
+    expect(bootstrap).toContain("host-policy status");
+    expect(bootstrap).not.toContain("host-policy ACTION");
+    expect(bootstrap).toContain("host-policy requires status");
     expect(bootstrap).toContain(
       "The Raw bootstrap requires an explicit OPS_AGENT_VERSION=vX.Y.Z",
     );
@@ -216,7 +217,9 @@ describe("native release layout", () => {
     expect(packager).toContain(
       'exec "/usr/lib/ops-agent-payload/${VERSION}/ops-agent-bootstrap" "\\$@"',
     );
-    expect(packager).toContain("sudo ops-agent-bootstrap host-policy install");
+    expect(packager).toContain(
+      "host-policy inspect/install are unavailable and never mutate host policy",
+    );
     expect(verifier).toContain("Archive is missing its executable pre-init host-policy helper");
     expect(verifier).toContain("Outer and installed host-policy helpers differ");
     expect(verifier).toContain("Archive is missing its executable release bootstrap");
@@ -241,8 +244,10 @@ describe("native release layout", () => {
     expect(continuousIntegration).toContain(
       "/var/tmp/ops-agent-bootstrap-ci.XXXXXX",
     );
+    expect(continuousIntegration).toContain("host-policy inspect");
+    expect(continuousIntegration).toContain("host-policy install");
     expect(continuousIntegration).toContain(
-      '"${root_bootstrap_fixture}/ops-agent-bootstrap" host-policy status',
+      "Unsupported host-policy install unexpectedly succeeded",
     );
   });
 
@@ -308,6 +313,13 @@ describe("native release layout", () => {
     expect(installerJob).toContain("ops-agent-linux-amd64.tar.gz.sha256");
     expect(installerJob).toContain("if-no-files-found: error");
     expect(installerJob).toContain("overwrite: true");
+    expect(installerJob).toContain(
+      "Reject host policy and controller init before persistent mutation",
+    );
+    expect(installerJob).toContain("Early rejection created managed path");
+    expect(installerJob).not.toContain(
+      "Install successfully under the restored effective policy",
+    );
 
     const joinJob = workflow.slice(joinStart);
     expect(joinJob).toContain("needs: installer-runtime");

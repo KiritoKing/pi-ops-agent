@@ -83,6 +83,7 @@ describe("bubblewrap process-tree containment", () => {
         "--cap-drop", "ALL",
         "--bind", "/", "/",
         "--dev", "/dev",
+        "--proc", "/proc",
         "--",
         "/usr/bin/bwrap",
         ...innerArguments,
@@ -93,7 +94,7 @@ describe("bubblewrap process-tree containment", () => {
     expect(outerArguments).not.toContain("--new-session");
     expect(outerArguments).not.toContain("--as-pid-1");
     expect(outerArguments).not.toContain("--disable-userns");
-    expect(outerArguments).not.toContain("--proc");
+    expect(outerArguments).toContain("--proc");
     expect(innerArguments).toContain("--proc");
     expect(outerArguments.filter((argument) => argument === "--sync-fd")).toHaveLength(1);
     expect(outerArguments.filter((argument) => argument === "--info-fd")).toHaveLength(1);
@@ -137,7 +138,7 @@ describe("bubblewrap process-tree containment", () => {
       expect(outerArguments).not.toContain("--new-session");
       expect(outerArguments).not.toContain("--as-pid-1");
       expect(outerArguments).not.toContain("--disable-userns");
-      expect(outerArguments).not.toContain("--proc");
+      expect(outerArguments).toContain("--proc");
       expect(outerArguments).toContain("--sync-fd");
       expect(outerArguments).toContain("--info-fd");
       expect(innerArguments).not.toContain("--sync-fd");

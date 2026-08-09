@@ -138,25 +138,16 @@ flowchart LR
 仅支持 systemd Linux。Raw bootstrap 下载匹配架构的 Release、校验 checksum，并在可用时
 通过 GitHub CLI 验证 attestation；主机修改由 Release 内的版本化安装器完成。
 
-Ubuntu 24.04 且 `kernel.apparmor_restrict_unprivileged_userns=1` 时，初始化前必须先完成独立、
-模型外的 host-policy 阶段；它不会由 Agent 或 `init` 静默批准，也不会替你安装系统包：
+Ubuntu 24.04 且 `kernel.apparmor_restrict_unprivileged_userns=1`、AppArmor enabled 时，当前版本
+不支持 controller/`init`；安装器会在任何持久主机修改前 fail closed。不要运行
+`host-policy install` 尝试解锁，也不要关闭该 sysctl、启用 SUID bwrap、改成单层 sandbox、降低
+`ProtectProc` 或使用 unconfined profile。真正支持这一组合需要独立、typed、短生命周期 spawn
+supervisor。若旧版本已经留下 managed AppArmor files 或 loaded profiles，应保留为诊断证据，默认
+卸载不会自动删除。只运行 server/core/PVE broker 的 `join` endpoint 不执行 Source Plugin，因此
+不受这项 controller 限制，也不会管理 host policy。
 
-```bash
-sudo apt-get update
-sudo apt-get install --yes --no-install-recommends \
-  apparmor apparmor-profiles bubblewrap ca-certificates diffutils libcap2-bin \
-  openssl sudo util-linux
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy inspect
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy install
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
-  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy status
-```
-
-helper 会展示 host-wide AppArmor authority 与长期 residual，并从真实 TTY 读取 exact digest 确认；
-成功后再单独运行 `init`。生产环境应把上述 Raw URL 和 `OPS_AGENT_VERSION` 一起固定到同一 tag。
-Release installer 不调用 apt/dnf 等包管理器；任一 native command 缺失都会在主机变更前 fail closed。
+生产环境应把 Raw URL 和 `OPS_AGENT_VERSION` 一起固定到同一 tag。Release installer 不调用
+apt/dnf 等包管理器；任一 native command 缺失都会在主机变更前 fail closed。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
