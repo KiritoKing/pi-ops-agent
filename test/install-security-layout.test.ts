@@ -453,16 +453,28 @@ describe("installed client-plane isolation", () => {
       );
       expect(gate).toContain('[[ "${profile_source}" == /* ]]');
       expect(gate).toContain('sha256sum "${profile_source}"');
+      expect(gate).toContain(
+        'test "$(/usr/bin/realpath -e -- "${profile_source}")"',
+      );
+      expect(gate).toContain('= "${profile_source}"');
       expect(gate).toContain("apparmor-profile-package-version=%s");
       expect(gate).toContain("apparmor-profile-source=%s");
       expect(gate).toContain("apparmor-profile-source-sha256=%s");
+      expect(gate).toContain("copied_profile_sha256=");
+      expect(gate).toContain(
+        'test "${copied_profile_sha256}" = "${profile_source_sha256}"',
+      );
       expect(gate).toContain('"${#profile_sources[@]}" -ne 1');
       expect(gate).toContain(
-        'forbidden_write_mask=0002\n            if [[ "${profile_component}" == "${profile_source}" ]]; then\n              forbidden_write_mask=0022\n            fi',
+        "IFS=: read -r source_uid source_gid source_mode",
       );
+      expect(gate).toContain('test "${source_uid}" = 0');
+      expect(gate).toContain('test "${source_gid}" = 0');
       expect(gate).toContain(
-        "8#${component_mode} & forbidden_write_mask",
+        "8#${source_mode} & 0022",
       );
+      expect(gate).not.toContain("profile_component=");
+      expect(gate).not.toContain("forbidden_write_mask=");
       expect(gate).toContain("'/usr/bin/bwrap ix,'");
       expect(gate).toContain("apparmor_parser --replace");
       expect(gate).toContain("'bwrap (enforce)'");

@@ -90,6 +90,8 @@ jobs:
           profile_source="${profile_sources[0]}"
           test -f "${profile_source}"
           test ! -L "${profile_source}"
+          test "$(/usr/bin/realpath -e -- "${profile_source}")" \
+            = "${profile_source}"
           test "$(/usr/bin/dpkg-query --search "${profile_source}")" \
             = "apparmor-profiles: ${profile_source}"
           package_drift="$(sudo /usr/bin/dpkg --verify apparmor-profiles)"
@@ -113,26 +115,22 @@ jobs:
             "${profile_source}"
           /usr/bin/grep -Eq '^profile unpriv_bwrap ' "${profile_source}"
 
-          profile_component="${profile_source}"
-          while :; do
-            test ! -L "${profile_component}"
-            IFS=: read -r component_uid component_gid component_mode < <(
-              /usr/bin/stat -c '%u:%g:%a' "${profile_component}"
-            )
-            test "${component_uid}" = 0
-            test "${component_gid}" = 0
-            forbidden_write_mask=0002
-            if [[ "${profile_component}" == "${profile_source}" ]]; then
-              forbidden_write_mask=0022
-            fi
-            if (( (8#${component_mode} & forbidden_write_mask) != 0 )); then
-              printf 'Package profile path has unsafe write permissions: %s\n' \
-                "${profile_component}" >&2
-              exit 1
-            fi
-            [[ "${profile_component}" == / ]] && break
-            profile_component="$(/usr/bin/dirname -- "${profile_component}")"
-          done
+          # GitHub's hosted runner deliberately makes /usr/share writable by
+          # the passwordless-sudo runner account. That account is already part
+          # of the trusted job substrate, so ancestor DAC cannot authenticate
+          # package content here. Bind this disposable gate to dpkg's verified
+          # file, its canonical non-symlink path, and the root-only source file;
+          # the loaded copy is then installed under root-owned /etc.
+          IFS=: read -r source_uid source_gid source_mode < <(
+            /usr/bin/stat -c '%u:%g:%a' "${profile_source}"
+          )
+          test "${source_uid}" = 0
+          test "${source_gid}" = 0
+          if (( (8#${source_mode} & 0022) != 0 )); then
+            printf 'Package profile source is group/world writable: %s\n' \
+              "${profile_source}" >&2
+            exit 1
+          fi
 
           local_rule="${RUNNER_TEMP}/bwrap-userns-restrict.local"
           printf '%s\n' '/usr/bin/bwrap ix,' >"${local_rule}"
@@ -156,6 +154,10 @@ jobs:
             "${local_rule}" /etc/apparmor.d/local/bwrap-userns-restrict
           sudo /usr/bin/cmp --silent \
             "${profile_source}" /etc/apparmor.d/bwrap-userns-restrict
+          copied_profile_sha256="$(sudo /usr/bin/sha256sum \
+            /etc/apparmor.d/bwrap-userns-restrict \
+            | /usr/bin/awk '{ print $1 }')"
+          test "${copied_profile_sha256}" = "${profile_source_sha256}"
           test "$(sudo /usr/bin/cat /etc/apparmor.d/local/bwrap-userns-restrict)" \
             = '/usr/bin/bwrap ix,'
           test "$(sudo /usr/bin/stat -c '%U:%G:%a' \
