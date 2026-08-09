@@ -578,6 +578,12 @@ describe("installed client-plane isolation", () => {
     expect(helper).toContain("user-namespace, mount, and network-namespace");
     expect(helper).toContain("BotMux remains unsupported and fail-closed");
     expect(helper).toContain("print_authority_summary >&9");
+    expect(helper).toContain(
+      'local verb="$1"\n  local confirmation="${verb} NOBLE BWRAP APPARMOR ${APPROVAL_DIGEST}"',
+    );
+    expect(helper).not.toContain(
+      'local verb="$1" confirmation="${verb} NOBLE BWRAP APPARMOR ${APPROVAL_DIGEST}"',
+    );
     expect(helper).toContain("automatic AppArmor policy removal is unavailable");
     expect(helper).toContain("/usr/bin/flock --exclusive --nonblock 8");
     expect(helper).toContain("systemctl list-units --all --plain");

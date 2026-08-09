@@ -373,7 +373,9 @@ validate_consistent_state() {
 }
 
 confirm_action() {
-  local verb="$1" confirmation="${verb} NOBLE BWRAP APPARMOR ${APPROVAL_DIGEST}" answer
+  local verb="$1"
+  local confirmation="${verb} NOBLE BWRAP APPARMOR ${APPROVAL_DIGEST}"
+  local answer
   if [[ -n "${APPROVE_DIGEST}" ]]; then
     print_authority_summary >&2
     [[ "${APPROVE_DIGEST}" == "${APPROVAL_DIGEST}" ]] \
