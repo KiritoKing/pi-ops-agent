@@ -42,7 +42,7 @@ const changeOperation = union(
     action: Object.freeze({ type: "string", enum: ["restart", "reload", "start", "stop"] }),
   }),
   object(
-    { kind: literal("file.write"), path: absolutePath, content: string({ maxLength: 131072 }), mode: string({ pattern: "^0?[0246]{3}$", maxLength: 4 }) },
+    { kind: literal("file.write"), path: absolutePath, content: string({ maxLength: 131072 }), mode: string({ pattern: "^0{0,1}[0246]{3}$", maxLength: 4 }) },
     ["kind", "path", "content"],
   ),
   object({

@@ -275,6 +275,29 @@ function collectTypeScript(directory: URL): string {
 }
 
 describe("source-owned standard workload profiles", () => {
+  it("loads the shipped base descriptor with its bounded file mode schema", async () => {
+    const base = await loadWorkload("workload-base");
+    const propose = base.descriptor.tools.find((tool) => tool.name === "ops_propose_change");
+    if (propose === undefined) throw new Error("base change tool is missing");
+    const fileWrite = {
+      machineId: "machine-12345678",
+      targetId: "target-12345678",
+      operation: {
+        kind: "file.write",
+        path: "/etc/example.conf",
+        content: "fixture\n",
+      },
+    };
+    expect(Check(propose.parameters, { ...fileWrite, operation: { ...fileWrite.operation, mode: "644" } }))
+      .toBe(true);
+    expect(Check(propose.parameters, { ...fileWrite, operation: { ...fileWrite.operation, mode: "0644" } }))
+      .toBe(true);
+    for (const mode of ["1644", "0645", "00644", ""] as const) {
+      expect(Check(propose.parameters, { ...fileWrite, operation: { ...fileWrite.operation, mode } }), mode)
+        .toBe(false);
+    }
+  });
+
   it("keeps business identities and validation rules in digest-approved source", async () => {
     for (const [directory, id] of [
       ["workload-hermes-ops", "workload.hermes-ops"],
