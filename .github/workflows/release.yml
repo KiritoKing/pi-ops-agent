@@ -142,6 +142,11 @@ jobs:
           node_version="$("${node_source}" -p 'process.versions.node')"
           test "${node_version}" = "${NODE_VERSION}"
           node_digest="$(/usr/bin/sha256sum "${node_source}" | /usr/bin/cut -d' ' -f1)"
+          test -d /opt
+          test ! -L /opt
+          test "$(/usr/bin/stat -c '%U:%G' /opt)" = "root:root"
+          sudo /usr/bin/chmod 0755 /opt
+          test "$(/usr/bin/stat -c '%U:%G:%a' /opt)" = "root:root:755"
           if [[ -e "${install_root}" || -L "${install_root}" ]]; then
             echo "Refusing to reuse a pre-existing /opt/pi-ops-agent fixture" >&2
             exit 1
@@ -153,14 +158,6 @@ jobs:
             "${node_source}" "${node_bin}"
           sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"
           sudo /usr/bin/chown -h root:root "${current_link}"
-          test -d /opt
-          test ! -L /opt
-          test "$(/usr/bin/stat -c '%U:%G' /opt)" = "root:root"
-          opt_mode="$(/usr/bin/stat -c '%a' /opt)"
-          if (( (8#${opt_mode} & 8#022) != 0 )); then
-            echo "Refusing a group/world-writable /opt ancestor" >&2
-            exit 1
-          fi
           for directory in \
             "${install_root}" "${install_root}/releases" \
             "${release_root}" "${release_root}/runtime"; do

@@ -425,8 +425,41 @@ describe("native release layout", () => {
         'test "$(/usr/bin/stat -c \'%U:%G\' /opt)" = "root:root"',
       );
       expect(probeJob).toContain(
-        'if (( (8#${opt_mode} & 8#022) != 0 ))',
+        "sudo /usr/bin/chmod 0755 /opt",
       );
+      expect(probeJob).not.toContain("chmod 777");
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)" = "root:root:755"',
+      );
+      const optDirectoryCheck = probeJob.indexOf("test -d /opt");
+      const optSymlinkCheck = probeJob.indexOf("test ! -L /opt", optDirectoryCheck);
+      const optOwnerCheck = probeJob.indexOf(
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)" = "root:root"',
+        optSymlinkCheck,
+      );
+      const optChmod = probeJob.indexOf(
+        "sudo /usr/bin/chmod 0755 /opt",
+        optOwnerCheck,
+      );
+      const optExactCheck = probeJob.indexOf(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)" = "root:root:755"',
+        optChmod,
+      );
+      const installRootReuseCheck = probeJob.indexOf(
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+        optExactCheck,
+      );
+      const installRootCreation = probeJob.indexOf(
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+        installRootReuseCheck,
+      );
+      expect(optDirectoryCheck).toBeGreaterThan(0);
+      expect(optSymlinkCheck).toBeGreaterThan(optDirectoryCheck);
+      expect(optOwnerCheck).toBeGreaterThan(optSymlinkCheck);
+      expect(optChmod).toBeGreaterThan(optOwnerCheck);
+      expect(optExactCheck).toBeGreaterThan(optChmod);
+      expect(installRootReuseCheck).toBeGreaterThan(optExactCheck);
+      expect(installRootCreation).toBeGreaterThan(installRootReuseCheck);
       expect(probeJob).toContain(
         '"${install_root}" "${install_root}/releases" \\',
       );
@@ -514,13 +547,16 @@ describe("native release layout", () => {
         'node_version="$("${node_source}" -p \'process.versions.node\')"',
         'test "${node_version}" = "${NODE_VERSION}"',
         'node_digest="$(/usr/bin/sha256sum "${node_source}"',
+        "test -d /opt",
+        "test ! -L /opt",
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)"',
+        "sudo /usr/bin/chmod 0755 /opt",
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)"',
         'if [[ -e "${install_root}" || -L "${install_root}" ]]',
         "sudo /usr/bin/install -d -o root -g root -m 0755",
         '"${node_source}" "${node_bin}"',
         'sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"',
         'sudo /usr/bin/chown -h root:root "${current_link}"',
-        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)"',
-        'if (( (8#${opt_mode} & 8#022) != 0 ))',
         'test "$(/usr/bin/stat -c \'%U:%G:%a\' "${directory}")"',
         'test -L "${current_link}"',
         'test "$(/usr/bin/readlink "${current_link}")"',
