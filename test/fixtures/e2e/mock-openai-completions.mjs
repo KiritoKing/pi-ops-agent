@@ -6,6 +6,8 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const TOKEN = "fixture-only-not-a-secret-0001";
 const MODEL = "fixture-model";
 const SCENARIOS = new Set(["sandbox", "inspect", "prepare-package", "prepare-file"]);
+const PENDING_CHANGE_INSTRUCTION =
+  "This change is pending model-external local review and exact client approval.";
 
 function fail(message) {
   process.stderr.write(`mock-openai: ${message}\n`);
@@ -146,8 +148,8 @@ function validateToolResult(text) {
       break;
     case "prepare-package":
     case "prepare-file":
-      if (!text.includes("changeRef=opschg1_") || !text.includes("PENDING_APPROVAL")
-          || !text.includes("model-external")) {
+      if (!text.includes("changeRef=opschg1_")
+          || text.split("\n").filter((line) => line === PENDING_CHANGE_INSTRUCTION).length !== 1) {
         throw new Error("prepare tool result omitted the signed pending-approval evidence");
       }
       break;
