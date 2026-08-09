@@ -9,6 +9,10 @@ const PROVIDER_PATTERN = /^[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*$/u;
 const capturedExit = process.exit.bind(process);
 const capturedWrite = process.stdout.write.bind(process.stdout);
 
+export function workloadStdoutWriteSucceeded(error: Error | null | undefined): boolean {
+  return error === undefined || error === null;
+}
+
 interface CoreRequest {
   version: 1;
   type: "describe" | "invoke";
@@ -88,7 +92,7 @@ async function writeFrame(value: unknown): Promise<void> {
   frame.writeUInt32BE(payload.length, 0);
   payload.copy(frame, 4);
   await new Promise<void>((resolve, reject) => {
-    capturedWrite(frame, (error) => error === undefined
+    capturedWrite(frame, (error) => workloadStdoutWriteSucceeded(error)
       ? resolve()
       : reject(error instanceof Error ? error : new Error("workload host stdout write failed")));
   });
@@ -228,18 +232,20 @@ async function main(): Promise<void> {
   await writeFrame({ version: 1, type: "result", invocationId: request.invocationId, result });
 }
 
-void main().then(
-  () => capturedExit(0),
-  async (error: unknown) => {
-    try {
-      await writeFrame({
-        version: 1,
-        type: "error",
-        invocationId: "runtime-error",
-        error: safeError(error),
-      });
-    } finally {
-      capturedExit(1);
-    }
-  },
-);
+if (process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  void main().then(
+    () => capturedExit(0),
+    async (error: unknown) => {
+      try {
+        await writeFrame({
+          version: 1,
+          type: "error",
+          invocationId: "runtime-error",
+          error: safeError(error),
+        });
+      } finally {
+        capturedExit(1);
+      }
+    },
+  );
+}
