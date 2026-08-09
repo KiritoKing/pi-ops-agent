@@ -41,10 +41,13 @@ const sandboxCommand = String.raw`set -eu
 test "$$" -eq 1
 test -w /workspace
 test ! -w /usr
-cap_eff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
+cap_eff=
+while read -r field value _; do
+  if test "$field" = "CapEff:"; then cap_eff=$value; break; fi
+done < /proc/self/status
 test "$cap_eff" = 0000000000000000
-test "$(readlink /proc/1/ns/pid)" = "$(readlink /proc/self/ns/pid)"
-if timeout 2 /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/7443' 2>/dev/null; then exit 91; fi
+test "$(/usr/bin/readlink /proc/1/ns/pid)" = "$(/usr/bin/readlink /proc/self/ns/pid)"
+if /usr/bin/timeout 2 /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/7443' 2>/dev/null; then exit 91; fi
 printf '%s\n' '${nonce}' > /workspace/model-source-e2e.txt
 printf 'MODEL_E2E_SANDBOX_OK nonce=%s pid=%s cap=%s usr_readonly=yes loopback_blocked=yes\n' '${nonce}' "$$" "$cap_eff"`;
 
