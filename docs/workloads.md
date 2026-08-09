@@ -81,7 +81,7 @@ PASSWD sudo 与真实 `/dev/tty` 逐次审批，不能由 Agent、Adapter、revi
 批准。它不是普通 Workload 的免审 root provider，PVE broker 不接受它，且所有 capsule 都明确
 没有自动 rollback。
 
-`ops_bash` 的安全来源是 UID、双层 bubblewrap namespace、PID 1 lifecycle FD + exact process identity barrier、只读 bind、无网络与 workspace 隔离；
+`ops_bash` 的安全来源是 UID、双层 bubblewrap namespace、PID 1 lifecycle FD + exact process identity barrier、只读 bind、无网络与 workspace 隔离；outer 仍创建 PID namespace 并保留默认 reaper，但不重挂 procfs，只继承 systemd-protected service proc 视图来启动固定 inner；inner 继续用 `--proc /proc`，因此最终 Source 只看见 inner 私有 procfs。这个形状没有削弱双层 PID containment；
 host 还必须固定 root-owned `bwrap`/`bash`/`prlimit`，清空 namespace capabilities、禁止再创建
 嵌套 user namespace，并限制 CPU、地址空间、进程数、文件大小和 fd。agentd service 固定
 `ProtectProc=invisible + ProcSubset=all`：它隐藏其他 UID 的 PID 目录，但为双层 bwrap 保留非 PID

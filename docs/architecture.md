@@ -234,6 +234,13 @@ deny 的证明，非 root agentd 仍无权修改宿主 sysctl。为让该路径�
 非 PID procfs 全局元数据仍可见；后者除上述精确 sysctl 例外外保持只读。这不是 procfs
 confidentiality boundary，`PrivateDevices=yes` 与 `ProtectKernelTunables=yes` 仍必须保留。
 
+outer 的 procfs 视图与它创建的 PID namespace 不是同一个安全属性。outer 仍创建独立 PID namespace、
+保留默认 PID 1 reaper，并继续提供 sync/info/exact-identity completion barrier；但它不再用
+`--proc /proc` 重挂 procfs，而只继承 `ops-agentd` 已受 `ProtectProc=invisible` 保护的 service proc
+视图，用来启动同一个固定 inner bwrap。inner 仍使用 `--proc /proc`，因此最终 Source PID 1 只看见
+与 inner PID namespace 对应的私有 procfs。这个形状没有删除 outer PID namespace 或缩短 lease
+settlement，不能被表述为以降低 PID 隔离换取兼容。
+
 Ubuntu 24.04 Noble 的 AppArmor restricted-userns 是这条 runtime contract 之外的宿主前置，而不是
 Core 可以静默修改的 sandbox 参数。独立 `configure-noble-bwrap-apparmor.sh` 只管理发行版
 `bwrap-userns-restrict` exact copy 与 local `/usr/bin/bwrap ix,`；`ops-agentd.service` 再用 typed
@@ -243,8 +250,10 @@ ignore-missing `AppArmorProfile=-bwrap` 进入 setup profile。`inspect` 只在 
 static unit 闭世界核对 exact fragment/drop-in closure、唯一无 flags ExecStart、空 hook/environment/
 group/capability 与完整 PID 1 effective vector，并验证同一双层结构；最终 Source 必须
 仍处于包含 `unpriv_bwrap` 的 label、五组 capability 全零，且再次 `unshare` 或启动 nested bwrap
-均失败。hosted runner 尚未完成这份 helper-bound smoke，因此发布前不能把本地静态检查扩大为
-production 证据。
+均失败。GitHub-hosted Noble exact helper-bound static unit 已实际执行，但 outer 自己的
+`--proc /proc` 在 `ProtectProc=invisible` 下返回 `EPERM`，所以 authority smoke 尚未完成。仅移除
+outer proc remount、保留 outer PID namespace/reaper/completion barrier 和 inner 私有 procfs 的
+形状仍待同一 hosted gate 复验；成功前不能把候选设计或本地静态检查扩大为 production 证据。
 
 exact exec rule 是 host-wide、只绑定 executable path 而不绑定 argv，会扩大宿主执行授权；helper
 `install` 因而只能在 `init` 前由管理员经模型外本地逐次确认运行，并 pin 发行版 profile

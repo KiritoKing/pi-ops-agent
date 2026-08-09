@@ -61,13 +61,16 @@ CAS 与 strict `agentd.adapter/v1` descriptor，并强制非 root、sanitized en
 取得 registry shared invocation lease，并持有到 Source 与 compiled Client 两个 sibling
 子进程都退出；同一 plugin 的更新只能在旧 runtime 结束后取得 exclusive lease。可执行 Source
 Adapter 的 descriptor 探测和正式入口都会进入各自的双层 bubblewrap PID namespace。outer 保留
-bwrap 默认 PID 1 reaper且只启动固定 inner bwrap；inner 使用 `--as-pid-1 --disable-userns`，让
+bwrap 默认 PID 1 reaper 且只启动固定 inner bwrap。outer 不使用 `--proc` 重挂 procfs，只继承
+systemd 已保护的 service proc 视图；inner 使用 `--proc /proc --as-pid-1 --disable-userns`，让
 Source 成为 PID 1 并禁止继续嵌套。outer 的 `--sync-fd` 在 initial child 中关闭、只随 outer PID 1
 生命周期持有；该 init 无论经正常 `ECHILD` 收拢还是 parent-death cleanup 终止，runner 都要在
 sync EOF 后继续等待有界 `--info-fd` 返回的 exact `child-pid` + start identity 消失，而不是只等
 monitor status；sync error 仍先等 identity
 disappearance，初始 stat 不可读则只接受该 PID 后续 ENOENT，info 无法给出 PID 时保持 fail-stop，
-因此 managed settlement 的摘要 lease 不会落在进程树清理窗口之前释放。bwrap 自己通过
+因此 managed settlement 的摘要 lease 不会落在进程树清理窗口之前释放。最终 Source 只看见
+inner PID namespace 的私有 procfs；outer 仍有独立 PID namespace/reaper，省略 outer proc remount
+不是 PID containment 降级。bwrap 自己通过
 `--dev /dev` 构造只含 `/dev/null` 等基础节点的最小 synthetic device view；不得改成把宿主
 `/dev` 重新 `--dev-bind` 进去。该 namespace 保留 Adapter 的网络、宿主用户权限与
 controlling TTY，所以这里只声称生命周期收拢，不声称像 Workload host 一样无网络或只读隔离。

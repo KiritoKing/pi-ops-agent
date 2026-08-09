@@ -415,7 +415,7 @@ describe("installed client-plane isolation", () => {
     expect(containment).toContain('outerArguments.push("--unshare-pid")');
     expect(containment).toContain('"--bind", "/", "/"');
     expect(containment).toContain('"--dev", "/dev"');
-    expect(containment).toContain('"--proc", "/proc"');
+    expect(containment).not.toContain('"--proc", "/proc"');
     expect(containment).not.toContain('"--as-pid-1"');
     expect(containment).not.toContain('"--disable-userns"');
     expect(containment).not.toContain('"--new-session"');
@@ -566,6 +566,7 @@ describe("installed client-plane isolation", () => {
     expect(helper).toContain("ProtectProc=invisible");
     expect(helper).toContain("ProcSubset=all");
     expect(helper).toContain("CapInh CapPrm CapEff CapBnd CapAmb");
+    expect(helper).toContain("[ \"\\${current_label}\" = 'bwrap (enforce)' ]");
     expect(helper).toContain("declare -A capability_values=()");
     expect(helper).toContain('[[ "${current_label}" == *unpriv_bwrap* ]]');
     expect(helper).toContain("--as-pid-1 --disable-userns --cap-drop ALL");
@@ -1069,7 +1070,8 @@ describe("installed client-plane isolation", () => {
       "--unshare-user --unshare-ipc --unshare-pid --unshare-net",
     );
     expect(preflight).toContain("--die-with-parent --sync-fd 1");
-    expect(preflight).toContain("--cap-drop ALL --bind / / --proc /proc --dev /dev");
+    expect(preflight).toContain("--cap-drop ALL --bind / / --dev /dev");
+    expect(preflight).not.toContain("--cap-drop ALL --bind / / --proc /proc --dev /dev");
     expect(preflight).toContain("--as-pid-1 --disable-userns --cap-drop ALL");
     expect(preflight).toContain(
       "--ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv",

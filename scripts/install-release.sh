@@ -3397,7 +3397,7 @@ run_bwrap_service_preflight() (
   # expansion between the driver and the inner shell.
   cat >"${bwrap_probe_driver}" <<EOF
 #!/bin/sh
-exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --proc /proc --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv -- ${SANDBOX_PRLIMIT} --as=1073741824:1073741824 --core=0:0 --cpu=5:5 --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/sh -ceu '[ "\$\$" -eq 1 ]; /bin/sleep 300 & printf %s ${bwrap_probe_nonce_value} > ${bwrap_probe_nonce}'
+exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv -- ${SANDBOX_PRLIMIT} --as=1073741824:1073741824 --core=0:0 --cpu=5:5 --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/sh -ceu '[ "\$\$" -eq 1 ]; /bin/sleep 300 & printf %s ${bwrap_probe_nonce_value} > ${bwrap_probe_nonce}'
 EOF
   chown root:root "${bwrap_probe_driver}"
   chmod 0755 "${bwrap_probe_driver}"

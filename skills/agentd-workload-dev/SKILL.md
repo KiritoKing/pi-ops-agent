@@ -87,8 +87,10 @@ automatic removal. `ops-agentd` then uses typed `AppArmorProfile=-bwrap`. Requir
 root-owned, closed-world `NoNewPrivileges=yes` static smoke plus the installer preflight to prove
 outer→fixed inner, final Source PID 1 under `unpriv_bwrap`, all capability sets zero, and no further
 userns/nested bwrap.
-The hosted helper-bound gate is still pending for this candidate, so keep `init` fail closed unless
-those exact checks succeed; local/static validation is not production evidence.
+The exact GitHub-hosted Noble helper-bound static unit has shown outer `--proc /proc` failing with
+`EPERM` under `ProtectProc=invisible`; the outer-inherited/inner-private proc shape described below
+still awaits the same gate. Keep `init` fail closed unless those exact checks succeed; local/static
+validation is not production evidence.
 
 This Noble-only compatibility covers direct Node `ops-agentd` and mandatory `workload.base`; it does
 not authorize a workload, provider, or Adapter to manage host policy. BotMux guard decisions are
@@ -113,6 +115,14 @@ read-only non-PID procfs metadata so the namespaced sysctl exists; `invisible` h
 PID directories, not same-UID PIDs or that metadata. Update the unique, root-owned, short-lived
 static install probe under `/run/systemd/system` whenever these arguments or hardening properties
 change, and keep its exact cleanup contract synchronized.
+
+Keep the procfs boundary explicit: outer still creates its PID namespace and owns the default PID 1
+reaper, but does not use `--proc`; it inherits the systemd-protected service proc view solely to
+launch the fixed inner. Inner retains `--proc /proc`, so final Source sees its private PID namespace
+procfs. This is not a single-layer fallback and does not weaken the sync/info/exact-identity lease
+settlement barrier. The exact GitHub-hosted Noble NNP static unit previously failed with `EPERM`
+when outer also mounted procfs; this revised shape is still pending hosted validation and is not yet
+production evidence.
 
 The `ops-agentd` drop-in is one member of the installer-wide managed service contract, not a special
 file whose presence alone proves safety. If a workload/provider change alters any managed service

@@ -147,8 +147,12 @@ the PVE candidates before the conditional enrollment decision.
 The preflight must execute the real nested bwrap structure inside a unique, root-owned,
 short-lived static unit under `/run/systemd/system` that copies the final `ops-agentd` security
 drop-in and verifies PID 1's effective configuration, not only under the same UID. It must prove the outer default PID 1
-reaper can create only the exact `user/ipc/pid/net/mnt` set and start the fixed inner bwrap, the
-inner Source is PID 1 and denies later userns, and `ProtectHostname=yes` plus the narrowly writable
+reaper can create only the exact `user/ipc/pid/net/mnt` set and start the fixed inner bwrap. Outer
+does not mount procfs; it inherits the systemd-protected service proc view only for that fixed
+launch. Inner retains `--proc /proc`, so final Source sees only its private PID namespace procfs.
+This keeps the outer PID namespace, reaper, sync/info, and exact-identity completion barrier intact;
+never describe it as reduced PID isolation. The inner Source is PID 1 and denies later userns, and
+`ProtectHostname=yes` plus the narrowly writable
 namespaced `/proc/sys/user/max_user_namespaces` path work together. Require
 `PrivateDevices=yes`, `ProtectKernelTunables=yes`, `ProtectProc=invisible`, and `ProcSubset=all` in
 the effective service vector. `ProcSubset=all` is required for that sysctl path and exposes the
@@ -222,8 +226,10 @@ supervisor is needed to reduce setup authority to a short-lived process.
 Require the helper's root-owned `NoNewPrivileges=yes` static-unit smoke to verify PID 1's typed
 `AppArmorProfile=-bwrap`, outer→fixed inner, final Source PID 1 under `unpriv_bwrap`, all five
 capability sets zero, and later userns/nested-bwrap denial. Then require the installer preflight too.
-The hosted helper-bound gate is still pending for this candidate, so do not claim production
-validation from local `bash -n` or the earlier direct smoke. The helper's supported scope is
+The exact GitHub-hosted Noble helper-bound NNP static unit has shown outer `--proc /proc` failing
+with `EPERM` under `ProtectProc=invisible`. Removing only the outer proc remount while retaining
+outer PID containment and inner private procfs is still pending a successful run of the same gate,
+so do not claim production validation from local `bash -n` or the earlier direct smoke. The helper's supported scope is
 deliberately narrow: Noble direct Node `ops-agentd` and mandatory `workload.base` only. Apply the
 BotMux guard from observed host facts instead of the distro label: any host with readable
 restricted-userns=`1` and AppArmor=`Y/y` refuses before wrapper/config mutation, hardener, or restart;

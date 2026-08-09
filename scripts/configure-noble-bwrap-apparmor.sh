@@ -804,13 +804,16 @@ SOURCE
 #!/bin/sh
 set -eu
 IFS= read -r current_label </proc/self/attr/current
-case "\${current_label}" in bwrap*) ;; *) exit 81 ;; esac
+[ "\${current_label}" = 'bwrap (enforce)' ] || {
+  printf 'unexpected outer setup label: %s\n' "\${current_label}" >&2
+  exit 81
+}
 no_new_privileges=
 while read -r status_key status_value rest; do
   case "\${status_key}" in NoNewPrivs:) no_new_privileges="\${status_value}" ;; esac
 done </proc/self/status
 [ "\${no_new_privileges}" = 1 ]
-exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --proc /proc --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${nonce} ${nonce} --proc /proc --dev /dev --clearenv --setenv OPS_AGENT_APPARMOR_NONCE_PATH ${nonce} --setenv OPS_AGENT_APPARMOR_NONCE_VALUE ${nonce_value} -- /bin/bash ${source_script}
+exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${nonce} ${nonce} --proc /proc --dev /dev --clearenv --setenv OPS_AGENT_APPARMOR_NONCE_PATH ${nonce} --setenv OPS_AGENT_APPARMOR_NONCE_VALUE ${nonce_value} -- /bin/bash ${source_script}
 EOF
   /usr/bin/chown root:root "${driver}"
   /usr/bin/chmod 0755 "${driver}"

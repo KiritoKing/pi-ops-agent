@@ -20,7 +20,7 @@ const realBubblewrapContainmentAvailable = process.platform === "linux"
   && spawnSync("/usr/bin/bwrap", [
     "--die-with-parent", "--sync-fd", "8", "--info-fd", "9",
     "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
-    "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "/usr/bin/bwrap",
+    "--bind", "/", "/", "--dev", "/dev", "--", "/usr/bin/bwrap",
     "--die-with-parent", "--unshare-user", "--unshare-pid", "--as-pid-1", "--disable-userns",
     "--cap-drop", "ALL", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
     "--", "/usr/bin/true",
@@ -348,7 +348,6 @@ describe("source adapter runner", () => {
       "--cap-drop", "ALL",
       "--bind", "/", "/",
       "--dev", "/dev",
-      "--proc", "/proc",
       "--",
       await realpath(dependencies.bwrapPath),
       "--die-with-parent",

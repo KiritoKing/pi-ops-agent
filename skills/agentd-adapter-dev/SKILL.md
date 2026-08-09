@@ -40,8 +40,12 @@ the caller's non-root UID and a sanitized environment. The runner must connect a
 the fixed peer-authenticated lease broker socket and retain an exact-digest shared registry lease
 for the complete runtime; it must never open the broker-only lock directory. Both the descriptor probe and the main source
 entrypoint must launch through their own fixed, nested bubblewrap PID namespaces. The outer fixed
-bwrap keeps its default PID 1 reaper and may execute only the same fixed root-owned inner bwrap; it
-must not use `--as-pid-1` or `--disable-userns`. The inner bwrap uses
+bwrap keeps its default PID 1 reaper and may execute only the same fixed root-owned inner bwrap. It
+must not mount a fresh procfs: it inherits the systemd-protected service proc view only to launch
+that fixed inner. The inner must retain `--proc /proc`, so untrusted Source sees only the inner PID
+namespace's private procfs. Omitting outer `--proc` does not omit its PID namespace, reaper, or
+completion barrier and must not be described as weaker PID containment. The outer must not use
+`--as-pid-1` or `--disable-userns`. The inner bwrap uses
 `--unshare-user --unshare-pid --as-pid-1 --die-with-parent --disable-userns`, makes Source PID 1,
 and denies further nesting. Outer bwrap must also retain a runner-observed `--sync-fd` that only its
 PID 1 owns after launch and emit one bounded `--info-fd` `child-pid`; bind that PID's start identity.
@@ -102,8 +106,10 @@ BotMux unsupported state, and lack of automatic removal before approval. Host-po
 never belongs in Adapter source, lifecycle hooks, requested scopes, Agent
 tools, sudoers, or `join`. It requires model-external local approval of the exact Release/profile
 digest, reapproval after version/hash/rule/authority-summary drift, and default-uninstall
-preservation. The helper-bound
-hosted gate is still pending for this candidate; local/static validation is not production evidence.
+preservation. The exact GitHub-hosted Noble NNP static unit has already shown outer
+`--proc /proc` failing with `EPERM` under `ProtectProc=invisible`. Removing only that outer proc
+remount while retaining outer PID containment and the inner private procfs remains a candidate
+pending the same hosted gate; local/static validation is not production evidence.
 
 `adapter.tui` is instead a non-executable profile: the runner starts the compiled Client directly
 to preserve host sudo/PAM, and that Client independently holds the exact TUI digest lease until it

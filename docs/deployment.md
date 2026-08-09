@@ -240,7 +240,9 @@ syscall；AppArmor 不把这份 authority 限定到固定 runner argv。首次 n
 flags 的 `ExecStart`、空 hooks/environment/groups/capabilities，以及完整 PID 1 effective
 security/lifecycle vector；它还必须证明 effective profile、outer→fixed inner、最终
 Source PID 1 label 包含 `unpriv_bwrap`、五组 capability 全零，并且后续 `unshare --user` 与 nested
-bwrap 均失败；hosted gate 未完成这份 exact smoke 前不能发布或宣称 production 支持。这条兼容只
+bwrap 均失败。GitHub-hosted exact static unit 已证明 outer `--proc /proc` 在
+`ProtectProc=invisible` 下返回 `EPERM`；outer 继承 service proc、inner 保留私有 proc 的修正形状
+仍待 hosted gate 复验，完成前不能发布或宣称 production 支持。这条兼容只
 覆盖直接 Node 的 `ops-agentd`/mandatory `workload.base`，且 host-policy helper 仍只支持 Noble。
 BotMux guard 以实际状态而非发行版标签为准：任何 host 只要读到 restricted-userns=`1` 且
 AppArmor=`Y/y`，都在 wrapper/config mutation、hardener 或 restart 前拒绝；Noble 上 restriction
@@ -555,8 +557,11 @@ Debian merged-/usr 上 `/bin`、`/sbin`、`/lib*` 可能是 symlink。部署 smo
 和非 merged layout，保证 bubblewrap 的只读 bind 不把 symlink target 遮蔽或制造不存在路径。
 安装器的 preflight 在唯一、root-owned、位于 `/run/systemd/system` 的短生命周期 static unit 中
 复制最终 security drop-in、核验 PID 1 的 effective 配置，并运行真实双层 bwrap；结束后必须精确清理
-unit、drop-in、driver 与 nonce。outer 默认 PID 1 reaper
-只启动固定 inner bwrap，inner 以 `/bin/sh` 为 PID 1 并禁止继续嵌套 userns；runtime 另以 outer
+unit、drop-in、driver 与 nonce。outer 仍创建 PID namespace 并保留默认 PID 1 reaper，只启动固定
+inner bwrap；它不使用 `--proc` 重挂 procfs，而继承该 static unit 已受 `ProtectProc=invisible`
+保护的 service proc 视图。inner 才使用 `--proc /proc` 建立私有 procfs、以 `/bin/sh` 为 PID 1 并
+禁止继续嵌套 userns；最终 Source 只会看到 inner 视图。省略 outer proc remount 不会删除 outer
+PID namespace/reaper，也不能缩短 runtime completion barrier；runtime 另以 outer
 PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init identity 消失作为完整
 进程树 completion barrier。preflight 能捕获
 `RestrictNamespaces`、`ProtectHostname`、`ProtectKernelTunables`、nested userns 或 bwrap 参数漂移；它仍不替代
@@ -564,7 +569,10 @@ PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init ide
 若真实 probe 进入失败终态，安装器会在删除临时 unit 前输出有界 journal 和
 `kernel.apparmor_restrict_unprivileged_userns` 状态；应以其中的实际 bwrap errno/AppArmor 拒绝为准，
 不能把通用的“user namespace 不可用”摘要当作根因，也不能通过关闭 host-wide 限制制造通过。
-尤其不能把普通 shell 下成功的 direct bwrap smoke 当作这个 unit-bound proof。Noble helper 必须
+尤其不能把普通 shell 下成功的 direct bwrap smoke 当作这个 unit-bound proof。GitHub-hosted Noble
+exact NNP static unit 已证明 outer 的 `--proc /proc` 在 `ProtectProc=invisible` 下返回 `EPERM`；
+上述仅移除 outer proc remount、保留 outer PID containment 与 inner 私有 procfs 的形状仍待 hosted
+复验，当前不能称为成功。Noble helper 必须
 先在自己的 root-owned `NoNewPrivileges=yes` static unit 中核对 typed `AppArmorProfile=-bwrap`
 effective attachment，再证明最终 `unpriv_bwrap`/zero-cap/nested-userns deny；installer 随后仍运行
 自己的完整 preflight。该证据边界只覆盖直接 Node 的 `ops-agentd`/base Workload，不覆盖未 attach

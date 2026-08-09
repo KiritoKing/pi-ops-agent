@@ -524,6 +524,11 @@ Ubuntu Noble restricted-userns 的 AppArmor profile 不是普通 release 文件�
 package/version/source hash/local-rule bytes、批准前完整展示的 authority-summary hash 与当前 host
 exact 匹配，管理员按 canonical approval digest 在模型外重新确认 `install`，helper 的
 `NoNewPrivileges=yes` authority smoke 和 installer preflight 都通过，才可把 core/base 视为支持。
+当前 GitHub-hosted Noble exact static unit 已证明 outer 的 `--proc /proc` 在
+`ProtectProc=invisible` 下返回 `EPERM`。修正候选只移除 outer proc remount：outer 仍保留
+user/ipc/pid/net/mnt namespace、默认 PID 1 reaper、sync/info/exact-identity completion barrier，
+并继承 systemd-protected service proc 视图来启动固定 inner；inner 仍用 `--proc /proc`，最终 Source
+只看见 inner 私有 procfs。这不是 PID containment 降级，但在同一 hosted gate 成功前仍不得称为支持。
 任一 version/hash/rule 漂移都必须随新 Release 重新审阅、重新批准；不能用旧 helper 静默覆盖。Agent、
 sudoers 与 `join` 永远不能触发这项宿主 policy 维护，也不能以改 sysctl、SUID/unconfined 或单层
 bwrap 规避失败。该合同不改变事实优先 BotMux guard：任何 host 实际读到 restricted-userns=`1` 且
