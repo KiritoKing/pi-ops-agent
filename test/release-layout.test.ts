@@ -276,27 +276,128 @@ describe("native release layout", () => {
   });
 
   it("blocks publish on the real Linux Adapter runtime probe", () => {
-    const workflow = repositoryFile(".github/workflows/release.yml");
-    const probeJobStart = workflow.indexOf("  adapter-linux-runtime:\n");
-    const buildJobStart = workflow.indexOf("\n  build:\n", probeJobStart);
-    const publishJobStart = workflow.indexOf("\n  publish:\n", buildJobStart);
+    const releaseWorkflow = repositoryFile(".github/workflows/release.yml");
+    const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
+    const probeJobStart = releaseWorkflow.indexOf("  adapter-linux-runtime:\n");
+    const buildJobStart = releaseWorkflow.indexOf("\n  build:\n", probeJobStart);
+    const publishJobStart = releaseWorkflow.indexOf("\n  publish:\n", buildJobStart);
+    const continuousProbeStart = continuousIntegration.indexOf(
+      "  adapter-linux-runtime:\n",
+    );
+    const installerStart = continuousIntegration.indexOf(
+      "\n  installer-runtime:\n",
+      continuousProbeStart,
+    );
 
     expect(probeJobStart).toBeGreaterThan(0);
     expect(buildJobStart).toBeGreaterThan(probeJobStart);
     expect(publishJobStart).toBeGreaterThan(buildJobStart);
-    const probeJob = workflow.slice(probeJobStart, buildJobStart);
-    expect(probeJob).toContain("needs: validate");
-    expect(probeJob).toContain("runs-on: ubuntu-24.04");
-    expect(probeJob).toContain("npm run build");
-    expect(probeJob).toContain("npm run test:adapter-linux-runtime");
-    expect(probeJob).toContain('probe_status="$?"');
-    expect(probeJob).toContain("status 77 is unverified and blocks release");
-    expect(probeJob).not.toContain("continue-on-error");
+    expect(continuousProbeStart).toBeGreaterThan(0);
+    expect(installerStart).toBeGreaterThan(continuousProbeStart);
+    const releaseProbeJob = releaseWorkflow.slice(probeJobStart, buildJobStart);
+    const continuousProbeJob = continuousIntegration.slice(
+      continuousProbeStart,
+      installerStart,
+    );
+    expect(releaseProbeJob).toContain("needs: validate");
 
-    const publishJob = workflow.slice(publishJobStart);
+    for (const probeJob of [releaseProbeJob, continuousProbeJob]) {
+      expect(probeJob).toContain("runs-on: ubuntu-22.04");
+      expect(probeJob).toContain("npm run build");
+      expect(probeJob).toContain(
+        "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz",
+      );
+      expect(probeJob).toContain(
+        'readonly bwrap_sha256="c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1"',
+      );
+      expect(probeJob).toContain("sha256sum --check --strict");
+      expect(probeJob).toContain(
+        "build-essential ca-certificates curl libcap-dev libcap2-bin \\",
+      );
+      expect(probeJob).toContain("meson ninja-build pkg-config xz-utils");
+      for (const buildOption of [
+        "-Dtests=false",
+        "-Dman=disabled",
+        "-Dselinux=disabled",
+        "-Dbash_completion=disabled",
+        "-Dzsh_completion=disabled",
+      ]) {
+        expect(probeJob).toContain(buildOption);
+      }
+      expect(probeJob).toContain(
+        "if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]",
+      );
+      expect(probeJob).toContain(
+        "Refusing to replace a pre-existing /usr/bin/bwrap",
+      );
+      expect(probeJob).toContain(
+        "sudo /usr/bin/install -o root -g root -m 0755",
+      );
+      expect(probeJob).toContain(
+        "test \"$(/usr/bin/bwrap --version)\" = \"bubblewrap ${bwrap_version}\"",
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f /usr/bin/bwrap)" = "/usr/bin/bwrap"',
+      );
+      expect(probeJob).toContain("test -f /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -L /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -u /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -g /usr/bin/bwrap");
+      expect(probeJob).toContain(
+        "test \"$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)\" = \\",
+      );
+      expect(probeJob).toContain('"root:root:755:nlink1"');
+      expect(probeJob).toContain(
+        'bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"',
+      );
+      expect(probeJob).toContain('test -z "${bwrap_capabilities}"');
+      expect(probeJob).toContain("-- '--disable-userns'");
+      expect(probeJob).toContain("Create the disposable Adapter identity fixture");
+      expect(probeJob).toContain("npm run test:adapter-linux-runtime");
+      expect(probeJob).toContain('probe_status="$?"');
+      expect(probeJob).toContain("status 77 is unverified and blocks release");
+      expect(probeJob).not.toContain("continue-on-error");
+      expect(probeJob).not.toContain("apparmor_parser");
+      expect(probeJob).not.toContain("apparmor-profiles");
+      expect(probeJob).not.toContain("sysctl");
+      expect(probeJob).not.toContain("setcap");
+
+      const orderedMilestones = [
+        "sha256sum --check --strict",
+        'tar -xJf "${bwrap_archive}"',
+        'meson setup "${bwrap_build}"',
+        'meson compile -C "${bwrap_build}" bwrap',
+        "if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]",
+        "sudo /usr/bin/install -o root -g root -m 0755",
+        'test "$(/usr/bin/bwrap --version)"',
+        'test "$(/usr/bin/readlink -f /usr/bin/bwrap)"',
+        "test -f /usr/bin/bwrap",
+        "test ! -L /usr/bin/bwrap",
+        "test ! -u /usr/bin/bwrap",
+        "test ! -g /usr/bin/bwrap",
+        "test \"$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)\"",
+        'bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"',
+        'test -z "${bwrap_capabilities}"',
+        "/usr/bin/bwrap --help",
+        "npm run test:adapter-linux-runtime",
+      ];
+      for (let index = 1; index < orderedMilestones.length; index += 1) {
+        const previous = orderedMilestones[index - 1];
+        const current = orderedMilestones[index];
+        if (previous === undefined || current === undefined) {
+          throw new Error("ordered Adapter gate milestone is missing");
+        }
+        expect(probeJob.indexOf(previous)).toBeGreaterThanOrEqual(0);
+        expect(probeJob.indexOf(previous)).toBeLessThan(probeJob.indexOf(current));
+      }
+    }
+
+    expect(continuousIntegration).toContain("workflow_call:");
+    const publishJob = releaseWorkflow.slice(publishJobStart);
     expect(publishJob).toMatch(
       /needs:\n\s+- build\n\s+- adapter-linux-runtime\n/u,
     );
+    expect(publishJob).toContain("- ci-release-gates");
   });
 
   it("gates releases on a disposable signed non-PVE join and rollback", () => {

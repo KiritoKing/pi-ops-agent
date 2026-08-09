@@ -69,7 +69,7 @@ jobs:
 
   adapter-linux-runtime:
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,14 +79,54 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
       - run: npm run build
-      - name: Install the real Adapter sandbox dependency
+      - name: Install the pinned Adapter sandbox build dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            apparmor apparmor-profiles bubblewrap coreutils diffutils grep \
-            libcap2-bin util-linux
+            build-essential ca-certificates curl libcap-dev libcap2-bin \
+            meson ninja-build pkg-config xz-utils
+      - name: Build and install the pinned unprivileged bubblewrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly bwrap_version="0.9.0"
+          readonly bwrap_sha256="c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1"
+          readonly bwrap_archive="${RUNNER_TEMP}/bubblewrap-${bwrap_version}.tar.xz"
+          readonly bwrap_source="${RUNNER_TEMP}/bubblewrap-${bwrap_version}"
+          readonly bwrap_build="${RUNNER_TEMP}/bubblewrap-build"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz" \
+            --output "${bwrap_archive}"
+          printf '%s  %s\n' "${bwrap_sha256}" "${bwrap_archive}" \
+            | sha256sum --check --strict
+          tar -xJf "${bwrap_archive}" -C "${RUNNER_TEMP}"
+          meson setup "${bwrap_build}" "${bwrap_source}" \
+            --buildtype=release \
+            -Dtests=false \
+            -Dman=disabled \
+            -Dselinux=disabled \
+            -Dbash_completion=disabled \
+            -Dzsh_completion=disabled
+          meson compile -C "${bwrap_build}" bwrap
+          if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]; then
+            echo "Refusing to replace a pre-existing /usr/bin/bwrap" >&2
+            exit 1
+          fi
+          sudo /usr/bin/install -o root -g root -m 0755 \
+            "${bwrap_build}/bwrap" /usr/bin/bwrap
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap ${bwrap_version}"
+          test "$(/usr/bin/readlink -f /usr/bin/bwrap)" = "/usr/bin/bwrap"
+          test -f /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test ! -u /usr/bin/bwrap
+          test ! -g /usr/bin/bwrap
+          test "$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)" = \
+            "root:root:755:nlink1"
+          bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"
+          test -z "${bwrap_capabilities}"
+          /usr/bin/bwrap --help | /usr/bin/grep -F -- '--disable-userns' >/dev/null
       - name: Create the disposable Adapter identity fixture
         shell: bash
         run: |
