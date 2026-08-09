@@ -371,6 +371,10 @@ mode；Target allowlist 不能取消这些拒绝。此类管理只能新增专�
 解析这个 root anchor 时拒绝 symlink 与 magic-link，但允许抵达该精确挂载点；取得 fd 以后，所有
 root 内部相对解析继续强制 `RESOLVE_NO_XDEV`，所以嵌套挂载不能扩大 policy。prepare/execute/verify
 仍绑定 parent 与 target 的 device/inode；允许 root 自身跨 mount 不等于允许授权路径在审批后漂移。
+Debian 12/systemd 252 的 `RestrictSUIDSGID=yes` 可让 `openat2` 返回 `ENOSYS`；broker 只对这个精确错误
+回退到逐 component、fd-relative、`O_NOFOLLOW` 的目录打开，并用 `statx(AT_EMPTY_PATH,
+STATX_MNT_ID)` 的非零 mount ID 保持相同 `NO_XDEV` 边界。其他 `openat2` 错误、statx 失败或缺失
+mount ID 一律 fail closed；不能通过移除 `RestrictSUIDSGID` 或放宽 unit hardening 取得兼容性。
 
 Service workload policy 必须把实际 source caller 的 plugin ID 和精确 digest 绑定到 Target
 account、`system|user` manager、完整 unit allowlist 与 `reload|reset-failed|restart|start|stop` 集合；Core 不维护

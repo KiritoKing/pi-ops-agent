@@ -271,7 +271,10 @@ Use the current artifact names from the architecture document. Verify all applic
   `../dist/...` import cannot resolve outside the copied artifact or to a nonexistent path.
 - Exercise `file.write` with a root-owned allowed root that is itself a dedicated filesystem or bind
   mount. The exact policy root may cross that mount boundary, but a symlink root, a nested mount below
-  it, a writable parent, or parent/target device-and-inode drift must still fail closed.
+  it, a writable parent, or parent/target device-and-inode drift must still fail closed. On Debian 12/
+  systemd 252, also exercise the exact `RestrictSUIDSGID=yes` `openat2=ENOSYS` compatibility path: only
+  `ENOSYS` may enter the fd-relative per-component no-follow fallback, every `NO_XDEV` step requires a
+  nonzero `statx(AT_EMPTY_PATH, STATX_MNT_ID)` identity, and no test may remove or weaken the unit hardening.
 - Prove the installer validated the complete mode-specific managed service set against PID 1 after
   daemon reload. Check exact `FragmentPath` and final security `DropInPaths`, one release ExecStart,
   empty pre/post/reload/stop hooks, exact typed Conditions/Asserts/credential vectors,

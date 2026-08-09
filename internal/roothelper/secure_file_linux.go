@@ -19,6 +19,100 @@ const fileWriteRootResolveFlags = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLI
 
 const fileWriteResolveFlags = fileWriteRootResolveFlags | unix.RESOLVE_NO_XDEV
 
+// These package-private syscall seams let Linux tests exercise the exact
+// fallback/error paths without changing the release binary's policy surface.
+var (
+	secureFileOpenat2 = unix.Openat2
+	secureFileOpenat  = unix.Openat
+	secureFileStatx   = unix.Statx
+)
+
+func fileWriteRelativeComponents(relative string) ([]string, error) {
+	if relative == "" || filepath.IsAbs(relative) || strings.ContainsRune(relative, 0) {
+		return nil, errors.New("file.write directory path must be a non-empty relative path")
+	}
+	components := strings.Split(relative, string(filepath.Separator))
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return nil, errors.New("file.write directory path contains an unsafe component")
+		}
+	}
+	return components, nil
+}
+
+func fileWriteMountID(fd int) (uint64, error) {
+	var stat unix.Statx_t
+	if err := secureFileStatx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &stat); err != nil {
+		return 0, fmt.Errorf("statx file.write directory mount identity: %w", err)
+	}
+	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Mnt_id == 0 {
+		return 0, errors.New("statx file.write directory mount identity is unavailable")
+	}
+	return stat.Mnt_id, nil
+}
+
+func openFileWriteDirectoryFallback(dirFD int, relative string, resolve uint64) (int, error) {
+	if resolve != fileWriteRootResolveFlags && resolve != fileWriteResolveFlags {
+		return -1, errors.New("file.write directory fallback received an unsupported resolve policy")
+	}
+	components, err := fileWriteRelativeComponents(relative)
+	if err != nil {
+		return -1, err
+	}
+
+	expectedMountID := uint64(0)
+	if resolve&unix.RESOLVE_NO_XDEV != 0 {
+		expectedMountID, err = fileWriteMountID(dirFD)
+		if err != nil {
+			return -1, err
+		}
+	}
+
+	currentFD := dirFD
+	currentOwned := false
+	for _, component := range components {
+		nextFD, openErr := secureFileOpenat(currentFD, component,
+			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if currentOwned {
+			_ = unix.Close(currentFD)
+		}
+		if openErr != nil {
+			if nextFD >= 0 {
+				_ = unix.Close(nextFD)
+			}
+			return -1, openErr
+		}
+		currentFD = nextFD
+		currentOwned = true
+		mountID, mountErr := fileWriteMountID(currentFD)
+		if mountErr != nil {
+			_ = unix.Close(currentFD)
+			return -1, mountErr
+		}
+		if resolve&unix.RESOLVE_NO_XDEV != 0 && mountID != expectedMountID {
+			_ = unix.Close(currentFD)
+			return -1, errors.New("file.write directory path crosses a mount")
+		}
+	}
+	return currentFD, nil
+}
+
+func openFileWriteDirectoryAt(dirFD int, relative string, resolve uint64) (int, error) {
+	fd, err := secureFileOpenat2(dirFD, relative, &unix.OpenHow{
+		Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: resolve,
+	})
+	if err == nil {
+		return fd, nil
+	}
+	if fd >= 0 {
+		_ = unix.Close(fd)
+	}
+	if !errors.Is(err, unix.ENOSYS) {
+		return -1, err
+	}
+	return openFileWriteDirectoryFallback(dirFD, relative, resolve)
+}
+
 func validateAllowedParent(stat unix.Stat_t) error {
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != secureFileRequiredParentUID || stat.Mode&0o022 != 0 {
 		return errors.New("file.write parent must be a root-owned directory that is not group/world writable")
@@ -42,18 +136,17 @@ func openAllowedFileParent(path string, roots []string) (int, string, unix.Stat_
 		allowedFD, err = unix.FcntlInt(uintptr(rootFD), unix.F_DUPFD_CLOEXEC, 0)
 	} else {
 		rootParentRelative := strings.TrimPrefix(filepath.Dir(root), "/")
+		rootParentFD := -1
+		var parentErr error
 		if rootParentRelative == "" {
-			rootParentRelative = "."
+			rootParentFD, parentErr = unix.FcntlInt(uintptr(rootFD), unix.F_DUPFD_CLOEXEC, 0)
+		} else {
+			rootParentFD, parentErr = openFileWriteDirectoryAt(rootFD, rootParentRelative, fileWriteResolveFlags)
 		}
-		rootParentFD, parentErr := unix.Openat2(rootFD, rootParentRelative, &unix.OpenHow{
-			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteResolveFlags,
-		})
 		if parentErr != nil {
 			return -1, "", unix.Stat_t{}, errors.New("configured file.write root parent crosses a mount or is not a symlink-free directory")
 		}
-		allowedFD, err = unix.Openat2(rootParentFD, filepath.Base(root), &unix.OpenHow{
-			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteRootResolveFlags,
-		})
+		allowedFD, err = openFileWriteDirectoryAt(rootParentFD, filepath.Base(root), fileWriteRootResolveFlags)
 		_ = unix.Close(rootParentFD)
 	}
 	if err != nil {
@@ -66,9 +159,7 @@ func openAllowedFileParent(path string, roots []string) (int, string, unix.Stat_
 	if parentRelative == "." {
 		parentFD, err = unix.FcntlInt(uintptr(allowedFD), unix.F_DUPFD_CLOEXEC, 0)
 	} else {
-		parentFD, err = unix.Openat2(allowedFD, parentRelative, &unix.OpenHow{
-			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteResolveFlags,
-		})
+		parentFD, err = openFileWriteDirectoryAt(allowedFD, parentRelative, fileWriteResolveFlags)
 	}
 	if err != nil {
 		return -1, "", unix.Stat_t{}, errors.New("file.write parent is not a symlink-free directory beneath the allowed root")

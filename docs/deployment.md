@@ -79,6 +79,12 @@ drop-in 闭包证明没有非空或含混的 `ImportCredential=` authority 时�
 typed empty。systemd `>=254` 仍必须返回真实 `as` property 并通过 exact-empty 校验；其他 query、类型、
 版本、introspection 结构/anchor 或闭包错误均中止事务。
 
+同一 systemd 252 边界中的 `RestrictSUIDSGID=yes` 可能使 core broker 的 `openat2` 返回 `ENOSYS`。
+Release 保留该 hardening；`file.write` 仅对精确 `ENOSYS` 使用逐 component 的 fd-relative/no-follow
+目录解析，并以 `statx(AT_EMPTY_PATH, STATX_MNT_ID)` 非零 mount ID 验证 root parent 与 root 内部
+没有跨 mount。configured root 的最后一跳仍可恰好成为 mount point；其他 syscall 错误或 statx
+证据缺失均 fail closed。
+
 这项检查是安装/升级时的 PID 1 快照，不是对安装后宿主 root 或随后写入的新 drop-in 的持续防护。
 OS image、LXC runtime 或站点管理员改变 type-wide/unit-specific drop-in 后，必须在维护窗口重新运行
 同一 mode 的版本匹配 installer 验证，并重新检查 effective properties；只看
