@@ -677,6 +677,27 @@ maybe_inject_install_failure() {
   }
 }
 
+wait_for_committed_endpoint_socket() {
+  local label="$1"
+  local unit="$2"
+  local socket_path="$3"
+  local socket_attempt=0
+  while [[ ! -S "${socket_path}" ]] && ((socket_attempt < 100)); do
+    if ! systemctl is-active --quiet "${unit}"; then
+      printf 'Endpoint install committed, but %s is not active while waiting for its runtime socket: %s\n' \
+        "${unit}" "${socket_path}" >&2
+      return 1
+    fi
+    sleep 0.1
+    socket_attempt=$((socket_attempt + 1))
+  done
+  if [[ ! -S "${socket_path}" ]] || ! systemctl is-active --quiet "${unit}"; then
+    printf 'Endpoint install committed, but the %s did not become ready; expected active unit %s and socket %s.\n' \
+      "${label}" "${unit}" "${socket_path}" >&2
+    return 1
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -3730,18 +3751,15 @@ if [[ "${MODE}" == join ]]; then
       printf 'Endpoint install committed, but its services did not start; inspect systemd before retrying.\n' >&2
       exit 1
     fi
+    wait_for_committed_endpoint_socket \
+      "core broker" ops-root-helper.service /run/ops-agent/helper/root-helper.sock
     if [[ "${PVE_ENDPOINT}" == true ]]; then
-      socket_attempt=0
-      while [[ ! -S /run/ops-agent/helper/pve-root-helper.sock ]] \
-          && ((socket_attempt < 100)); do
-        sleep 0.1
-        socket_attempt=$((socket_attempt + 1))
-      done
-      if [[ ! -S /run/ops-agent/helper/pve-root-helper.sock ]] \
-          || ! systemctl is-active --quiet ops-pve-root-helper.service; then
-        printf 'Endpoint install committed, but the PVE broker did not become ready.\n' >&2
-        exit 1
-      fi
+      wait_for_committed_endpoint_socket \
+        "PVE broker" ops-pve-root-helper.service /run/ops-agent/helper/pve-root-helper.sock
+    fi
+    if ! systemctl is-active --quiet ops-agent-server.service; then
+      printf 'Endpoint install committed, but ops-agent-server.service is not active after broker readiness.\n' >&2
+      exit 1
     fi
     "${CURRENT_LINK}/scripts/healthcheck.sh" --endpoint
   fi

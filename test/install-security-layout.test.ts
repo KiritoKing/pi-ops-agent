@@ -895,6 +895,96 @@ describe("installed client-plane isolation", () => {
     );
   });
 
+  it("waits for every committed join broker to become active and publish its socket", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const helperMatch = installer.match(
+      /wait_for_committed_endpoint_socket\(\) \{\n(?<body>[\s\S]*?)\n\}\n\nusage\(\)/u,
+    );
+    const helperBody = helperMatch?.groups?.body;
+    expect(helperBody).toBeDefined();
+    if (helperBody === undefined) throw new Error("endpoint readiness helper is missing");
+
+    expect(helperBody).toContain('while [[ ! -S "${socket_path}" ]] && ((socket_attempt < 100)); do');
+    expect(helperBody).toContain('systemctl is-active --quiet "${unit}"');
+    expect(helperBody).toContain("sleep 0.1");
+    expect(helperBody).toContain("Endpoint install committed");
+
+    const joinStart = installer.indexOf(
+      'if [[ "${MODE}" == join ]]; then\n  join_units=(',
+    );
+    const joinEnd = installer.indexOf(
+      "\nsystemctl enable ops-agent.target ops-agent-healthcheck.timer",
+      joinStart,
+    );
+    expect(joinStart).toBeGreaterThan(0);
+    expect(joinEnd).toBeGreaterThan(joinStart);
+    const joinActivation = installer.slice(joinStart, joinEnd);
+    const coreReadiness = joinActivation.indexOf(
+      'wait_for_committed_endpoint_socket \\\n      "core broker" ops-root-helper.service /run/ops-agent/helper/root-helper.sock',
+    );
+    const pveGuard = joinActivation.indexOf(
+      'if [[ "${PVE_ENDPOINT}" == true ]]; then',
+      coreReadiness,
+    );
+    const pveReadiness = joinActivation.indexOf(
+      'wait_for_committed_endpoint_socket \\\n        "PVE broker" ops-pve-root-helper.service /run/ops-agent/helper/pve-root-helper.sock',
+      pveGuard,
+    );
+    const serverReadiness = joinActivation.indexOf(
+      "systemctl is-active --quiet ops-agent-server.service",
+      pveReadiness,
+    );
+    const healthcheck = joinActivation.indexOf(
+      '"${CURRENT_LINK}/scripts/healthcheck.sh" --endpoint',
+      serverReadiness,
+    );
+    expect(coreReadiness).toBeGreaterThan(0);
+    expect(pveGuard).toBeGreaterThan(coreReadiness);
+    expect(pveReadiness).toBeGreaterThan(pveGuard);
+    expect(serverReadiness).toBeGreaterThan(pveReadiness);
+    expect(healthcheck).toBeGreaterThan(serverReadiness);
+    expect(joinActivation).not.toContain("socket_attempt=");
+
+    const verification = spawnSync(
+      "/bin/bash",
+      [
+        "-c",
+        [
+          "set -euo pipefail",
+          "wait_for_committed_endpoint_socket() {",
+          helperBody,
+          "}",
+          'socket_path="${TMPDIR:-/tmp}/ops-agent-readiness-$$.sock"',
+          '[[ ! -e "${socket_path}" ]]',
+          "sleep_calls=0",
+          "systemctl() { [[ \"$1\" == is-active && \"$2\" == --quiet && \"$3\" == ops-root-helper.service ]]; }",
+          "sleep() { sleep_calls=$((sleep_calls + 1)); }",
+          'diagnostic_file="$(mktemp)"',
+          'trap \'rm -f -- "${diagnostic_file}"\' EXIT',
+          "set +e",
+          'wait_for_committed_endpoint_socket "core broker" ops-root-helper.service "${socket_path}" 2>"${diagnostic_file}"',
+          "status=$?",
+          "set -e",
+          '[[ "${status}" -eq 1 ]]',
+          '[[ "${sleep_calls}" -eq 100 ]]',
+          "grep -F 'Endpoint install committed, but the core broker did not become ready' \"${diagnostic_file}\"",
+          "sleep_calls=0",
+          "systemctl() { return 1; }",
+          ": >\"${diagnostic_file}\"",
+          "set +e",
+          'wait_for_committed_endpoint_socket "core broker" ops-root-helper.service "${socket_path}" 2>"${diagnostic_file}"',
+          "status=$?",
+          "set -e",
+          '[[ "${status}" -eq 1 ]]',
+          '[[ "${sleep_calls}" -eq 0 ]]',
+          "grep -F 'ops-root-helper.service is not active while waiting for its runtime socket' \"${diagnostic_file}\"",
+        ].join("\n"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+  });
+
   it("installs the JSON config helper as one transactionally managed root-owned executable", () => {
     const installer = repositoryFile("scripts/install-release.sh");
     const uninstaller = repositoryFile("scripts/uninstall.sh");
