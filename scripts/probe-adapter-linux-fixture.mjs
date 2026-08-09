@@ -18,7 +18,7 @@ const descriptor = {
   },
   session: {
     mapping: "adapter-owned",
-    writerLease: "process-local",
+    writerLease: "gateway-global",
     controlApiVersion: "agentd.adapter-session-control/v1",
     supportedControls: ["bind"],
   },
@@ -86,23 +86,30 @@ async function main() {
     mode: 0o600,
   });
 
-  const hostPidPath = join(resultDirectory, "detached-host-pid");
+  const detachedReadyPath = join(resultDirectory, "detached-ready");
+  const detachedObservedPath = join(resultDirectory, "detached-observed");
+  const detachedToken = `ops-agent-adapter-detached:${resultDirectory}`;
   const escapedPath = join(resultDirectory, "detached-survived");
   const childScript = [
     "const fs = require('node:fs');",
-    "const status = fs.readFileSync('/proc/self/status', 'utf8');",
-    "const match = /^NSpid:\\s+([0-9]+)/m.exec(status);",
-    "if (!match) throw new Error('NSpid is unavailable');",
-    `fs.writeFileSync(${JSON.stringify(hostPidPath)}, match[1] + '\\n', { mode: 0o600 });`,
-    `setTimeout(() => fs.writeFileSync(${JSON.stringify(escapedPath)}, 'escaped\\n'), 400);`,
+    `fs.writeFileSync(${JSON.stringify(detachedReadyPath)}, 'ready\\n', { mode: 0o600 });`,
+    "const observed = setInterval(() => {",
+    `  if (!fs.existsSync(${JSON.stringify(detachedObservedPath)})) return;`,
+    "  clearInterval(observed);",
+    `  setTimeout(() => fs.writeFileSync(${JSON.stringify(escapedPath)}, 'escaped\\n'), 400);`,
+    "}, 10);",
     "setTimeout(() => {}, 5_000);",
   ].join("\n");
-  const child = spawn(process.execPath, ["-e", childScript], {
+  const child = spawn(process.execPath, ["-e", childScript, detachedToken], {
     detached: true,
     stdio: "ignore",
   });
   child.unref();
-  await waitFor(hostPidPath);
+  await waitFor(detachedReadyPath);
+  // The host-side probe driver must bind the real host PID and starttime from
+  // its own procfs view before this Source is allowed to exit. An inner
+  // bubblewrap procfs view cannot truthfully self-report a host PID.
+  await waitFor(detachedObservedPath);
 
   const externalSessionId = "linux-probe-external-session";
   const frames = [

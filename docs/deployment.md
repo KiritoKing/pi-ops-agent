@@ -28,6 +28,54 @@ PVE 本机 `pvesh` 的 mutation handler 会写 pmxcfs。为让真实 PVE host �
 `agentd-server`、Agent 与 Source Plugin runtime 也不获得该路径。`/etc/pve/priv` 的路径、内容与
 派生 secret 不得出现在模型输出、RPC response、receipt 或 audit。
 
+## Managed service 的 effective systemd 边界
+
+Release 中每个会由 installer 安装的 managed **service** 都同时带一个 unit-name-specific
+`zzzz-ops-agent-security.conf`。这不是只给 `ops-agentd` 或 bubblewrap probe 使用的补丁；它是为了在
+host 存在 `/run/systemd/system/service.d/*.conf`、distribution type-wide drop-in 或站点自定义
+unit override 时，把每个已安装 daemon 的最小 hardening 重新固定到 unit 自己的最终 drop-in。
+`ops-agent.target` 与 healthcheck timer 不是进程执行边界，不属于这组 service security drop-in。
+
+安装模式决定唯一允许出现并必须验证的 service 集合：
+
+- `init`：`agentd-approval-reviewer.service`、`agentd-client-gateway.service`、
+  `agentd-guardian.service`、`agentd-plugin-lease-broker.service`、`ops-agentd.service`、
+  `ops-agent-server.service`、`ops-root-helper.service`、`ops-agent-healthcheck.service`；仅当本机
+  `/usr/bin/pvesh` 可执行时再加入 `ops-pve-root-helper.service`；
+- `join`：只有 `ops-agent-server.service` 与 `ops-root-helper.service`；仅当 signed enrollment 的
+  PVE bit 与本机 `/usr/bin/pvesh` 双向精确匹配时再加入 `ops-pve-root-helper.service`。`join` 不得
+  安装 controller-only unit 或它们的 drop-in，非 PVE endpoint 也不得残留 managed PVE unit/drop-in。
+
+复制 unit/drop-in 并执行 `systemctl daemon-reload` 后，installer 以 PID 1 的
+`systemctl show` 与 typed D-Bus property 结果作为权威证据，而不信文件名或文件内容本身。对上述每个 mode-applicable
+service，它要求 unit 与 security drop-in 都是 `root:root 0644`、non-symlink、单硬链接并逐字匹配
+当前 immutable Release；PID 1 的 `FragmentPath` 必须指向该 unit，`DropInPaths` 必须包含该最终
+security drop-in；agentd 的最终 encrypted-credential drop-in 也必须是 exact root-owned file 并被
+PID 1 加载。它还逐项核对 `User`、`Group`、`Type`、`UMask`、`Restart`/timeout、
+`KillMode=control-group`、唯一的 release `ExecStart`/argv 及无 `+`/`!` 等前缀的空
+`ExecStartEx.flags`、完整 environment/EnvironmentFile 和声明的 resource limits，拒绝
+额外 `ExecCondition`、start pre/post、reload、stop 或 stop-post command，并精确核对 healthcheck 的
+`SuccessExitStatus`。`systemctl show` 无法可靠打印的 `Conditions`、`Asserts` 与 Load/Set/Import
+credential vectors 通过 PID 1 D-Bus typed arrays 与 exact release unit 比较。最终 security drop-in 的
+每个 scalar property 必须与 effective value 精确相等；namespace/address-family/path/group 等
+list property 必须按集合精确相等；capability bounding set 必须没有重新获得被 drop-in 排除的
+capability；release 未声明 `ReadWritePaths` 或 `SupplementaryGroups` 的 service 也必须得到空
+effective set。除 exact managed policy 外，loaded drop-in 只能来自固定 host-wide `service.d` 位置，
+且必须是 `root:root 0644` non-symlink single-link file，其完整语法只能包含版本化窄 allowlist 中的
+container compatibility reset；未知 unit-specific drop-in、mount/execution view、directory/credential
+grant 或其他未验证 directive 一律拒绝。语法异常、重复 security directive、PID 1 无法精确返回的
+property、缺失 final drop-in 或任何 host-wide reset 造成的漂移都会在启动服务前 fail closed，并触发
+当前安装事务回滚。
+
+`--no-start` 安装中的 inactive service 可能被 PID 1 从已加载 unit cache 回收；因此 typed D-Bus
+核验先调用 `org.freedesktop.systemd1.Manager.LoadUnit` 并使用其返回的 object path，再读取 unit
+property，不能依赖只对当前 cache 命中的 `GetUnit`。
+
+这项检查是安装/升级时的 PID 1 快照，不是对安装后宿主 root 或随后写入的新 drop-in 的持续防护。
+OS image、LXC runtime 或站点管理员改变 type-wide/unit-specific drop-in 后，必须在维护窗口重新运行
+同一 mode 的版本匹配 installer 验证，并重新检查 effective properties；只看
+`systemctl cat` 或 `zzzz-ops-agent-security.conf` 存在不能证明当前 service 仍满足边界。
+
 ## Release pin 与完整性
 
 生产环境应同时固定 Raw bootstrap 与 Release tag：
@@ -76,13 +124,24 @@ Ubuntu job 中只创建 `ops-agent-botmux` 专用系统账号及其两个专用�
 用户，再由 root 运行 `npm run test:adapter-linux-runtime`；`publish` 必须显式依赖该 job。目标机完成
 `init`、确认 `ops-agent-botmux` primary group 与 `ops-agent-client` supplementary group 已安装后，也应
 在源码构建树执行 `npm run build` 并由 root 运行同一命令；已安装 Release 可直接执行
-`/opt/pi-ops-agent/current/scripts/probe-adapter-linux-runtime.sh`。它必须用真实 `/usr/bin/bwrap`
-并在 transient systemd service 中复现 BotMux drop-in：只允许 `user/pid/mnt` namespace，并在
-`ProtectKernelTunables=yes` 下仅向 bwrap 暴露 namespaced
+`/opt/pi-ops-agent/current/scripts/probe-adapter-linux-runtime.sh`。它必须使用真实 `/usr/bin/bwrap`；
+release verifier 还必须确认该 wrapper 依赖的 fixture、socket、client 与 runtime driver 脚本全部
+包含在 installed payload 中，源码树探针通过不能替代已安装 artifact 的自包含验证。探针必须在
+transient systemd service 中复现 BotMux drop-in：只允许 `user/pid/mnt` namespace，并在
+`PrivateDevices=yes`、`ProtectKernelTunables=yes`、`ProtectProc=invisible` 与 `ProcSubset=all` 下
+仅向 bwrap 暴露 namespaced
 `/proc/sys/user/max_user_namespaces` 写入口；同时通过 group DAC 文件/socket、PID namespace descendant
-cleanup 与 exact-digest lease release ordering。退出码 `77` 只表示
+cleanup 与 exact-digest lease release ordering。探针必须安装 unit-name-specific late drop-in，
+先用 `systemctl show` 核对 manager 的 effective property/path vector，再运行真实 workload；不能让
+host-wide `service.d` 的 list reset 使 transient unit 静默降级后假通过。`ProcSubset=all` 也意味着
+未被其他 hardening 屏蔽的只读非 PID procfs 全局元数据可见，`ProtectProc=invisible` 不隐藏这部分
+或 same-UID PID。退出码 `77` 只表示
 Linux/root/systemd/账号/组/bwrap 前置条件缺失，是“未验证”而不是通过；失败或 skip 都
 必须阻断该环境的发布签署。
+
+探针复制最小 runtime 时必须保留 release 的相对模块拓扑：driver 位于临时 `scripts/`，compiled
+runner 位于同级 `dist/runtime/`，因此 driver 的 `../dist/...` import 仍指向被只读 bind 的 exact
+artifact。不得把 driver 平铺到 runtime root 后意外导入宿主源码树或一个不存在的 sibling。
 
 ## `init`
 
@@ -123,14 +182,18 @@ E2E 应创建专用、带密码且无 broad sudo rule 的 `opsadmin`；生产机
   以及无参数的 `/usr/libexec/pi-ops-agent/setup-botmux`，均使用 `PASSWD` 与 command-specific
   `timestamp_timeout=0`，不授予通用 root command；完整 sudo policy 必须通过 `sudo -k` 后的
   non-interactive 负向探针，且 root 视角的 `sudo -U ops-agent-botmux -l` 必须证明专用账号没有
-  任何 sudo rule，否则安装失败；
+  任何 sudo rule，否则安装失败。sudo 1.9 在“无规则”时也可能返回 status 0，所以安装器不信退出码，
+  只接受 C locale 下唯一一行 canonical `is not allowed to run sudo` 结果；warning、Defaults、command
+  listing 或其他附加输出一律 fail closed；
 - 安装 unit、tmpfiles、immutable release 目录和 `/opt/pi-ops-agent/current`；PVE broker unit、
   state/audit 目录与 socket 只在检测到 `/usr/bin/pvesh` 的 PVE host 启用；
 - 初始化 root-owned Target policy 与本机 Machine registration；
 - 复制、检查并请求批准 `adapter.tui`、`workload.base`；
-- 在与 `ops-agentd.service` 等价的 transient systemd hardening 中，以 `ops-agent` 身份探测
-  bubblewrap 的最小 `user/ipc/pid/net/mnt` namespace 集合、nested-userns deny、`PrivateDevices`
-  与 kernel-tunable mount 例外；任一边界不可用时必需的 `workload.base` 无法加载，因此 `init`
+- 在唯一、root-owned、位于 `/run/systemd/system` 且执行后精确清理的短生命周期 static unit 中，
+  复制并核验与 `ops-agentd.service` 等价的 systemd hardening，再以 `ops-agent` 身份探测
+  bubblewrap 的最小 `user/ipc/pid/net/mnt` namespace 集合、nested-userns deny、`PrivateDevices=yes`、
+  `ProtectKernelTunables=yes`、`ProtectProc=invisible`、`ProcSubset=all` 与精确 kernel-tunable mount
+  例外；任一边界不可用时必需的 `workload.base` 无法加载，因此 `init`
   fail closed 并回滚整轮安装事务；
 - 通过 `/dev/tty` 读取模型 key 并生成 systemd encrypted credential；
 - 启动服务并运行当前 healthcheck。
@@ -336,6 +399,11 @@ systemd unit 的 runtime-only `SupplementaryGroups=ops-agent-client` 只用于�
 | `client-ca.crt`、`server.crt`、`server.key` | `root:ops-agent-server 0640` | server，不给 agent/admin |
 | `/etc/ops-agent/approver/root/*` | `root:root 0600` | approval submitter only |
 
+创建 `invocation-leases` 时，Linux 会从其 `2750` registry parent 暂时继承 setgid。Installer 必须在
+校验前用显式 special-bit-zero numeric mode（`00750`，而不是会保留目录 setgid 的 `0750`）清除
+该位，并证明最终值精确为 `root:ops-agent-lease 0750`；不能接受继承得到的 `2750`，否则会把
+client-readable registry 的目录语义误带入 broker-only lock boundary。
+
 `/etc/ops-agent` 与 `tls/` 本身是 root:root `0755` 中性目录；看到文件名不代表能读取 credential。
 不得把 client principals 加回 `ops-agent` service group、让 observer role 准备/提交变更，或给
 server 补任何 client/service supplementary membership。
@@ -381,8 +449,13 @@ shell、进程内 loader，或给容器额外 host 权限作为降级路径。
 
 Debian merged-/usr 上 `/bin`、`/sbin`、`/lib*` 可能是 symlink。部署 smoke 必须同时覆盖 merged
 和非 merged layout，保证 bubblewrap 的只读 bind 不把 symlink target 遮蔽或制造不存在路径。
-安装器的 preflight 在等价 transient systemd unit 中证明 `/bin/true` 可启动，能捕获
-`RestrictNamespaces`、`ProtectHostname` 或 `ProtectKernelTunables` 与 bwrap 参数漂移；它仍不替代
+安装器的 preflight 在唯一、root-owned、位于 `/run/systemd/system` 的短生命周期 static unit 中
+复制最终 security drop-in、核验 PID 1 的 effective 配置，并运行真实双层 bwrap；结束后必须精确清理
+unit、drop-in、driver 与 nonce。outer 默认 PID 1 reaper
+只启动固定 inner bwrap，inner 以 `/bin/sh` 为 PID 1 并禁止继续嵌套 userns；runtime 另以 outer
+PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init identity 消失作为完整
+进程树 completion barrier。preflight 能捕获
+`RestrictNamespaces`、`ProtectHostname`、`ProtectKernelTunables`、nested userns 或 bwrap 参数漂移；它仍不替代
 对真实 Source Workload/provider/lease 的部署验证。
 
 ## 安装其他 Source Plugin
@@ -417,7 +490,8 @@ current 未漂移，再通过固定 lease broker socket 为 exact digest 持有 
 snapshot 只能包含不可执行 `manifest.json`/`profile.json`；runner 解析固定 local-TTY profile 后
 以当前非 root 本地用户在宿主 TTY 直接启动 release compiled Client，而不执行 snapshot；Client
 自己通过同一 broker 持有 exact digest lease 到退出，保留 host sudo/PAM 且不依赖 runner 单点存活。可执行
-Source Adapter 才进入保留网络/宿主用户权限的 bubblewrap PID namespace，用 PID 1 收拢后代。旧
+Source Adapter 才进入保留网络/宿主用户权限的双层 bubblewrap PID namespace：inner 让 Source 成为
+PID 1 并禁用后续 userns，outer 默认 reaper 通过 lifecycle FD + exact init identity 证明全部后代已消失。旧
 Adapter/TUI 仍在
 运行时，更新的 exclusive lease 必须在激活前失败而不是撤销其审批边界。
 唯一的 TUI 自更新例外不绕过该锁：一个单步 canonical `adapter.tui plugin.register` 经过同一本地
@@ -440,8 +514,8 @@ BotMux 本体是外部依赖，`init` 不安装。先审批并注册 Source `ada
 `sudo -k -- /usr/libexec/pi-ops-agent/setup-botmux`；sudo/PAM 要求管理员密码，root-owned wrapper
 不接受参数，并以 `ops-agent-botmux` UID 启动固定 setup runner。Runner 通过固定 lease broker
 socket 为 `adapter.botmux` exact digest 持有 shared lease，完整覆盖 BotMux 官方 `setup`、获批
-snapshot 中的 hardener 和 `restart`；hardener 是固定 bubblewrap PID namespace 的 PID 1，不能用
-detached 后代越过 lease。Lease 丢失会终止当前命令并禁止后续步骤，并发更新只能在
+snapshot 中的 hardener 和 `restart`；hardener 是 inner bubblewrap PID namespace 的 PID 1，outer
+默认 reaper 的 lifecycle FD + init identity barrier 必须等 detached 后代完全消失，不能让它们越过 lease。Lease 丢失会终止当前命令并禁止后续步骤，并发更新只能在
 `current` 切换前失败。Wrapper 使用 `agentd-pluginctl current --runtime` 重新验证 registration、
 snapshot digest 与 entrypoint，绝不执行可编辑 `plugin-sources`。current 不存在或任一 Source
 校验失败时都直接中止并要求管理员审阅、注册 Source 插件；legacy `.opspkg` 只保留为恢复证据，
@@ -494,6 +568,9 @@ Source Plugin registration；显式 `systemctl status` 仍用于补充查看 uni
 9. 无 user namespace 时 `init` fail closed 并回滚，不留下无法加载 `workload.base` 的半可用 controller；
 10. 重复 request/status 不重放 mutation，只有通过 pinned receipt 验证的 broker `COMMITTED` 才算成功；
 11. join host 未运行第二份 agentd/model/session controller，不存在 `ops-agent.target.wants`，且
-    `--endpoint` healthcheck 不要求 controller unit、socket、credential 或 plugin surface。
+    `--endpoint` healthcheck 不要求 controller unit、socket、credential 或 plugin surface；
+12. PID 1 已对当前 mode 的完整 managed service 集合加载 exact release unit 与 unit-specific final
+    security drop-in，并通过 lifecycle/security effective-vector 核验；`init` 与 `join` 的集合不能
+    取并集，非 PVE host 不应残留 managed PVE unit/drop-in。
 
 使用仓库 Skill 执行这套流程：[`agentd-init`](../skills/agentd-init/SKILL.md)。

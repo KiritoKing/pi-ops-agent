@@ -92,8 +92,11 @@ describe("exact-digest BotMux setup runner", () => {
       `validate:${SNAPSHOT}/configure-botmux.mjs`,
       "BotMux setup:/usr/bin/botmux:setup",
       "approved BotMux configuration hardener:/usr/bin/bwrap:" + [
-        "--die-with-parent", "--unshare-pid", "--as-pid-1", "--disable-userns",
-        "--cap-drop", "ALL", "--bind", "/", "/", "--proc", "/proc",
+        "--die-with-parent", "--sync-fd", "8", "--info-fd", "9",
+        "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
+        "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "/usr/bin/bwrap",
+        "--die-with-parent", "--unshare-user", "--unshare-pid", "--as-pid-1", "--disable-userns",
+        "--cap-drop", "ALL", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--chdir", SNAPSHOT, "--", dependencies.nodePath,
         `${SNAPSHOT}/configure-botmux.mjs`, dependencies.configPath, "0",
       ].join("|"),
@@ -126,6 +129,40 @@ describe("exact-digest BotMux setup runner", () => {
     );
     expect(events).toContain("stopped:approved BotMux configuration hardener");
     expect(events).not.toContain("start:BotMux restart");
+    expect(events.at(-1)).toBe("release");
+  });
+
+  it("treats a normally resolved loss signal as loss and waits before release", async () => {
+    const commandAborted = Promise.withResolvers<undefined>();
+    const allowCommandSettlement = Promise.withResolvers<undefined>();
+    const unexpectedlyResolvedLoss = Promise.resolve(undefined) as unknown as Promise<never>;
+    const { dependencies, events } = fixture({
+      lost: unexpectedlyResolvedLoss,
+      execute: async (command, signal) => {
+        events.push(`start:${command.label}`);
+        return await new Promise<number>((resolve) => {
+          signal.addEventListener("abort", () => {
+            events.push(`aborted:${command.label}`);
+            commandAborted.resolve(undefined);
+            void allowCommandSettlement.promise.then(() => {
+              events.push(`settled:${command.label}`);
+              resolve(143);
+            });
+          }, { once: true });
+        });
+      },
+    });
+
+    const setup = runBotMuxSourceSetup(DIGEST, dependencies);
+    await commandAborted.promise;
+    expect(events).toContain("aborted:BotMux setup");
+    expect(events).not.toContain("release");
+
+    allowCommandSettlement.resolve(undefined);
+    await expect(setup).rejects.toThrow("lease ended without a loss reason");
+    expect(events).not.toContain("start:approved BotMux configuration hardener");
+    expect(events).not.toContain("start:BotMux restart");
+    expect(events.at(-2)).toBe("settled:BotMux setup");
     expect(events.at(-1)).toBe("release");
   });
 

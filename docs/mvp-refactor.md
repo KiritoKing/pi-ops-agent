@@ -97,6 +97,12 @@ key。任意 root capsule 只能走同一 endpoint 的 core broker，不能穿�
 但本项目通过 `ModelRuntime` + systemd credential 注入，不应把 CLI 输出 credential 的模式接到
 Agent 或审计。
 
+截至 2026-08-09，`v0.84.1` 仍是 Pi 最新正式 Release。Pi `main` 已继续加入 Harness durable-state
+设计、event/watch API 与 provider/TUI 修正，但这些仍是
+[`936aff0`](https://github.com/earendil-works/pi/commit/936aff00918de1187f085f123c2812d8f2d67745)
+所代表的未发布主干；本项目不会绕过 tag 直接跟随它。未来只在新 Release 发布后重新审计 public
+API、changelog 与 lockfile，再决定是否升级。
+
 ### 与本项目相关但不是 0.84.1 新增的公开 API
 
 - `agent_settled` 已是公开 session event；`agent_end` 只表示一次低层 run 完成，可能仍有 retry、
@@ -116,12 +122,12 @@ Machine/Target policy、root peer UID、approval grant 和 recovery state。也�
 |---|---|---|
 | `agent_end` 后仍 retry/compact，completion 重复或过早 | `agent_settled` authoritative；`agent_end(willRetry=false)` 只作短 fallback，retry/compaction/start 取消 timer | Core，可向 Pi 报 prompt settlement contract 的最小复现 |
 | agentd socket 断开后旧 CLI 仍占 PTY | Client/Adapter 解绑并 pause stdin，等待队列后退出，由 BotMux/tmux 重建 | Core/Adapter，本仓库 |
-| callback 经 shell、FD3 丢失 | runner 以 `shell:false` 启动 Source/compiled Client sibling；固定 FD4 typed inbound、FD3 completion、runner-only FD5 context，bounded terminal-safe stderr | Adapter contract，可向 BotMux 提交结构化 launcher PR |
+| callback 经 shell、FD3 丢失 | runner 以 `shell:false` 启动 Source/compiled Client sibling；固定 FD4 typed inbound、FD3 completion、runner-only FD5 context，bounded terminal-safe stderr | Adapter contract；BotMux 当前 CliAdapter 已具备 direct bin/argv，专用 FD contract 留在本仓库 |
 | BotMux multiline wrapper 被正文 tag 截断 | 只在完整 prefix 时解包 first-open + last-close；sender 从 suffix 取 | BotMux Adapter；可提 upstream envelope schema PR |
 | 人类/bot 回复 @ 行为混乱 | human `--mention-back`，bot `--no-mention`；关闭 streaming cards/reactions | BotMux Adapter/config |
 | 远端 sender 被误当 approver | 所有外部 Adapter 的 action 当前拒绝，只能 status；私钥迁到 root-only submitter，owner approval 回到 PASSWD/TTY TUI | Core security |
 | zsh/default PATH 导致 CLI/恢复失败 | `/bin/bash`、固定 PATH，`botmux-bin` 第一；必须存在名为 `pi` 的 wrapper | Adapter/deployment |
-| `npm --ignore-scripts` 造成 `node-pty` 不可用 | Adapter 安装显式 build/load verification | BotMux packaging；可向上游补安装诊断 |
+| `npm --ignore-scripts` 造成 `node-pty` 不可用 | Adapter 安装显式 build/load verification | 本地错误安装路径；只有在 BotMux 支持的安装流程可复现时才提 doctor/docs issue |
 | Debian merged-/usr 下 bwrap bind 失败 | 运行时按实际存在路径构建只读 bind；发布必须测试 merged/non-merged layout | Core sandbox/release |
 | 审计包含无限 stderr/secret | transport stderr/response 有界，错误脱敏；仍禁止把 secret 放入 `ops_bash` | Core/Adapter |
 | sudoers/wrapper 参数匹配过宽 | wrapper 必须固定 executable/argv；无参 sudoers command spec 使用 `""`；root 不执行 user-writable CLI | 部署/业务 Workload |
@@ -149,17 +155,18 @@ Machine/Target policy、root peer UID、approval grant 和 recovery state。也�
 
 ### BotMux upstream
 
-适合拆成独立 PR/issue：
+2026-08-09 重新核对 BotMux `master` 后，`CliAdapter` 已有 resolved bin/build args、typed sender、
+structured-input hook 与一致的 resume policy；Pi Adapter 也已对长/控制字符 initial prompt 使用受控
+`@file`。因此不再重复提交历史建议中的 direct executable/argv、sender type、resume executable 或
+long-prompt PR。
 
-1. 提供版本化、长度有界的结构化 inbound envelope，正文不靠可冲突 XML delimiter；
-2. launcher 原生支持 direct executable/argv、额外继承 FD 和 disconnect-exit contract；
-3. sender type 与 reply mention policy 使用 typed field；
-4. resume 路径一致遵循 configured executable/PATH，不隐式查找另一个 `pi`；
-5. 安装/doctor 明确检查 `node-pty` native addon；
-6. 提供关闭 streaming card/reaction 与 bot reply rate limit 的稳定配置文档。
-
-PR 应带伪造 sender、tag-like正文、split paste、disconnect、FD 与 bot mention tests。不要把本项目
-的 approver private key 或 root policy 放入 BotMux。
+仍适合先开 issue/RFC 的是用户正文边界：当前
+[`buildNewTopicPrompt` / `buildFollowUpContent`](https://github.com/deepcoldy/botmux/blob/c54cf25b294dc86e3f53039f947cb8df81e70270/src/adapters/cli/pi.ts)
+仍把原始正文直接放入 `<user_message>...</user_message>`；正文中的 closing/tag-like 文本可能与
+envelope 冲突。Issue 应先给 tag-like 正文、multiline/split、title/resume extraction 的最小复现与
+兼容目标；maintainer 确认编码或 sidecar 方案后再拆小 PR。`node-pty` 只在上游支持的安装路径能
+稳定复现时提交 doctor/docs 修正，不能把刻意使用 `--ignore-scripts` 造成的 native addon 缺失当作
+上游 bug。不要把本项目的额外 FD、approver private key 或 root policy 放入 BotMux。
 
 ### 本项目保留
 
@@ -178,7 +185,19 @@ merged-/usr 与 AppleDouble 检查均应留在本仓库。它们可以形成通�
 | Adapter | 通用 `.mjs` Source runner、TUI local-only 特例、BotMux immutable entrypoint、Source/Client sibling + strict FD4/FD3/FD5、统一 bounded stdin ingress、envelope/sender/completion/disconnect 修正 | handoff/compact/clear consumer、trusted ApprovalIntent、outbox/dedup/rate limit |
 | Workload | isolated Source workload host；descriptor/manifest capability exact match + provider-name requested-scope policy；资源 policy 与显式 standing scope 分离；PVE digest-bound typed arms；Hermes/BotMux source-owned profile + generic service provider；legacy Hermes OCI | Hermes/BotMux CLI/conversation/config content 与更多 audited provider |
 | C/S | TLS 1.3 mTLS roles、strict HTTP、server/broker split、revision grant；每次 prepare 后用 domain pinned key 验证 signed `change.status`，仅 PENDING 暴露审批 side-channel；join 先匹配独立渠道传入的 controller CA SHA-256 pin，再验证 bundle 签名 | distributed limiter、controller HA、online enrollment consumption |
-| Release | static Go、Node runtime、tar/deb/SBOM/checksum/attestation、`._*` cleanup | 本次 OrbStack/systemd/PVE/release workflow 结果未在本文预先宣称 |
+| Release | static Go、Node runtime、tar/deb/SBOM/checksum/attestation、`._*` cleanup；disposable native ARM64 Linux 已完成 `0.3.0` tar/deb build 与 `verify-release.sh` | exact final commit 的 GitHub-hosted release gates 尚未完成 |
+
+## 本轮验证证据（2026-08-09）
+
+以下结论只描述实际执行过的候选，不把 disposable VM、fake API 或一次安装事务扩大为生产验证：
+
+| 场景 | 已取得的证据 | 仍不能证明 |
+|---|---|---|
+| Native ARM64 Release | disposable ARM64 Linux builder 成功构建 `0.3.0` tar/deb；完整 release verifier 通过 ELF、payload parity、随包 Node `22.23.2` 与 Client/Reviewer 加载检查 | 文档更新后的 exact final commit 尚未经过 GitHub-hosted amd64/arm64 publish gates |
+| Clean controller `init` | OrbStack/LXC clean VM 已通过 managed-unit effective policy 与必需 Plugin gate；随后真实双层 bwrap preflight 在 user namespace 内挂载 `/newroot/proc` 时返回 `EPERM`，installer fail closed 并完整回滚本轮 controller surface | 该 LXC kernel 不支持所需 proc mount，因此这里没有成功安装 controller，也不是 bare-metal/普通 VM 的成功 smoke；不能通过削弱 `--proc` 或 hardening 制造通过 |
+| Signed PVE endpoint `join` | disposable endpoint 使用 signed PVE enrollment 完成 fresh join；server、core broker、PVE broker 启动后 endpoint healthcheck 为 0 failures / 0 warnings | `/usr/bin/pvesh` 是严格 fake fixture；该结果只验证 enrollment、安装拓扑、mTLS/broker transport、DAC/receipt/audit 健康，不验证真实 Proxmox API、pmxcfs、quorum 或 guest mutation |
+| PVE fake E2E | disposable strict fixture 已拒绝额外 argv 且状态摘要不变；standing start 的 unsigned `change.prepare` 经 observer mTLS 与 pinned PVE receipt 验证后进入 `COMMITTED`；held task 在 PVE broker restart 后沿同一 UPID 从 `EXECUTING` 续跑到 `COMMITTED` 且 fake 仅产生一个 task；最终 failure 场景得到签名 `RECOVERY_REQUIRED`，task 为 `stopped/ERROR`、guest 保持 `stopped` | Harness 从 typed HTTPS client 开始，绕过 model、Workload source host 与 Plugin invocation lease；fake 也不具备真实 PVE cluster、pmxcfs、quorum、storage 或 guest side effect，因此仍不是实际 Proxmox 验证 |
+| Hosted/production | 本地 TS/Go 检查与 native ARM64 候选验证已有独立结果 | exact final commit 的 GitHub-hosted installer/join/Adapter gates、真实模型 Session、真实 Proxmox 环境仍未验证；这些证据齐备前不发布 `v0.3.0` tag |
 
 ## 近期实施顺序
 

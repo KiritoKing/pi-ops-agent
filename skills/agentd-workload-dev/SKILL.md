@@ -37,8 +37,16 @@ The source manifest is `agentd.plugin/v1`, schema `1`, with exact fields `apiVer
 package-relative entrypoint, and sorted unique capability/scope arrays.
 
 In v0.3 the source entrypoint is an executable extension point, but never an in-process one. The
-fixed workload host runs `workload.mjs` from the immutable CAS in a fresh no-network bubblewrap,
-using root-owned fixed runtimes, empty namespace capabilities, nested-userns denial, and bounded
+fixed workload host runs `workload.mjs` from the immutable CAS in a fresh no-network, nested
+bubblewrap. The outer fixed bwrap retains its default PID 1 reaper and executes only the same fixed
+root-owned inner bwrap; the inner makes Source PID 1 and disables further user namespaces. A dedicated
+`--sync-fd` remains open only in the outer PID 1 after launch, while bounded `--info-fd` output binds
+that init's exact process identity. Both the sync EOF and identity disappearance are required before
+the invocation and digest lease may settle. Sync failure must still wait for identity disappearance;
+an unreadable initial stat accepts only later ENOENT, and missing authoritative info remains
+fail-stop. This covers managed settlement, not broker restart, forced disconnect, hard-deadline, or
+runtime-SIGKILL crash persistence. This still uses root-owned
+fixed runtimes, empty namespace capabilities, nested-userns denial, and bounded
 CPU/address-space/process/file/fd limits. It has read-only source, bounded framed IPC, and no host
 credentials. Source may
 declare tool schemas, business validation rules, perform pure computation, and orchestrate only the trusted providers it
@@ -66,12 +74,27 @@ Never add a host-shell, in-process loader, Docker, or reduced-isolation fallback
 bubblewrap/user namespaces. Because `workload.base` is mandatory, that condition fails the whole
 initialization transaction rather than merely hiding `ops_bash`.
 
-Keep the runtime and unit contract synchronized: Workload bwrap uses only `user/ipc/pid/net/mnt`,
+Keep the runtime and unit contract synchronized: both Workload bwrap layers use only
+`user/ipc/pid/net/mnt`,
 while `ops-agentd.service` allow-lists exactly those namespace types. Do not add cgroup, UTS, or time
 namespaces. Preserve `ProtectHostname=yes`, nested-userns denial, and the narrow
-`ReadWritePaths=/proc/sys/user/max_user_namespaces` exception that bwrap uses only after entering a
-new user namespace. Update the equivalent transient-systemd install probe whenever these arguments
-or hardening properties change.
+`ReadWritePaths=/proc/sys/user/max_user_namespaces` exception that the fixed outer uses to create the
+inner namespace and the inner uses to deny later nesting. Bubblewrap must verify that denial by its
+own post-setup `CLONE_NEWUSER` attempt; the numeric value visible in final procfs is not equivalent
+evidence. Keep `PrivateDevices=yes`, `ProtectKernelTunables=yes`, `ProtectProc=invisible`, and
+`ProcSubset=all` in the effective unit vector. `all` intentionally retains otherwise-unmasked,
+read-only non-PID procfs metadata so the namespaced sysctl exists; `invisible` hides only foreign-UID
+PID directories, not same-UID PIDs or that metadata. Update the unique, root-owned, short-lived
+static install probe under `/run/systemd/system` whenever these arguments or hardening properties
+change, and keep its exact cleanup contract synchronized.
+
+The `ops-agentd` drop-in is one member of the installer-wide managed service contract, not a special
+file whose presence alone proves safety. If a workload/provider change alters any managed service
+unit or hardening, update its unit-name-specific final `zzzz-ops-agent-security.conf`, Release
+packaging, transaction snapshot/rollback, PID 1 lifecycle/security effective verification, docs,
+and tests in the same change. Preserve topology: `init` owns controller services plus local
+server/core (and host-fact PVE); `join` owns only server/core plus enrollment-and-host-matched PVE.
+Never add controller service/drop-in surfaces to join or leave managed PVE surfaces on non-PVE hosts.
 
 ## Choose the least authority
 

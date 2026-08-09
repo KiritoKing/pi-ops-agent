@@ -38,6 +38,12 @@ import {
   loadEnrolledLocalAdministrator,
   type EnrolledLocalAdministrator,
 } from "../shared/local-administrator.js";
+import {
+  monitorBubblewrapReaper,
+  type BubblewrapReaperMonitor,
+  type BubblewrapReaperMonitorDependencies,
+  wrapWithBubblewrapProcessReaper,
+} from "../shared/bubblewrap-containment.js";
 
 const FIXED_ROOT = "/opt/pi-ops-agent/current";
 const FIXED_PLUGIN_REGISTRY = "/var/lib/ops-agent/plugins";
@@ -71,6 +77,7 @@ export interface AdapterRunnerDependencies {
   stdinIsTTY: boolean;
   stdoutIsTTY: boolean;
   runtimeRecheckMilliseconds?: number;
+  bubblewrapMonitorDependencies?: BubblewrapReaperMonitorDependencies;
   loadActive(pluginId: string): Promise<ActiveRuntimeSourcePlugin>;
   acquireLease(plugin: ActiveRuntimeSourcePlugin): Promise<ActiveRuntimeSourcePluginLease>;
   loadEnrolledAdministrator(): Promise<EnrolledLocalAdministrator>;
@@ -359,30 +366,76 @@ function safeStderr(value: Buffer): string {
   return terminalSafeTextFromBytes(value, 2048);
 }
 
+function adapterLaunchAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Adapter launch was aborted");
+}
+
+function throwIfAdapterLaunchAborted(signal?: AbortSignal): void {
+  if (signal?.aborted === true) throw adapterLaunchAbortError(signal);
+}
+
 async function captureDescriptor(
   executable: string,
   arguments_: string[],
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  monitorDependencies?: BubblewrapReaperMonitorDependencies,
+  signal?: AbortSignal,
 ): Promise<AdapterDescriptor> {
+  throwIfAdapterLaunchAborted(signal);
   return await new Promise<AdapterDescriptor>((resolve, reject) => {
     const child = spawn(executable, [...arguments_, ADAPTER_DESCRIBE_ARGUMENT], {
       cwd,
       env: environment,
       shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [
+        "ignore", "pipe", "pipe",
+        "ignore", "ignore", "ignore", "ignore", "ignore",
+        "pipe", "pipe",
+      ],
       windowsHide: true,
     });
+    let reaperMonitor: BubblewrapReaperMonitor;
+    try {
+      reaperMonitor = monitorBubblewrapReaper(child, monitorDependencies);
+    } catch {
+      child.kill("SIGKILL");
+      // A contained process was spawned but no authoritative cleanup monitor
+      // can be constructed. Keep the caller and its lease fail-stop.
+      return;
+    }
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    if (stdout === null || stderr === null) {
+      child.kill("SIGKILL");
+      child.once("close", () => {
+        void reaperMonitor.waitForExit().then(
+          () => reject(new Error("Adapter descriptor pipes are unavailable")),
+          () => reject(new Error("Adapter reaper lifecycle monitoring failed")),
+        );
+      });
+      return;
+    }
     const output: Buffer[] = [];
     const errors: Buffer[] = [];
     let outputBytes = 0;
     let errorBytes = 0;
     let failure: Error | undefined;
+    const abortDescriptor = (): void => {
+      failure ??= signal === undefined
+        ? new Error("Adapter launch was aborted")
+        : adapterLaunchAbortError(signal);
+      child.kill("SIGKILL");
+    };
+    signal?.addEventListener("abort", abortDescriptor, { once: true });
+    if (signal?.aborted === true) abortDescriptor();
     const timer = setTimeout(() => {
-      failure = new Error("adapter descriptor timed out");
+      failure ??= new Error("adapter descriptor timed out");
       child.kill("SIGKILL");
     }, DESCRIBE_TIMEOUT_MILLISECONDS);
-    child.stdout.on("data", (chunk: Buffer) => {
+    stdout.on("data", (chunk: Buffer) => {
       outputBytes += chunk.length;
       if (outputBytes > MAX_ADAPTER_DESCRIPTOR_BYTES) {
         failure = new Error("adapter descriptor exceeds its output limit");
@@ -391,41 +444,61 @@ async function captureDescriptor(
       }
       output.push(chunk);
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    stderr.on("data", (chunk: Buffer) => {
       if (errorBytes >= MAX_DESCRIPTOR_STDERR_BYTES) return;
       const remaining = MAX_DESCRIPTOR_STDERR_BYTES - errorBytes;
       errors.push(chunk.subarray(0, remaining));
       errorBytes += Math.min(chunk.length, remaining);
     });
+    const failReaperMonitor = (): void => {
+      failure ??= new Error("Adapter reaper lifecycle monitoring failed");
+      child.kill("SIGKILL");
+    };
+    void reaperMonitor.syncEof.catch(failReaperMonitor);
+    void reaperMonitor.identity.catch(failReaperMonitor);
     child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      if (child.pid === undefined) {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abortDescriptor);
+        reject(error);
+        return;
+      }
+      failure ??= error;
+      child.kill("SIGKILL");
     });
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (failure !== undefined) {
-        reject(failure);
-        return;
-      }
-      if (code !== 0) {
-        const detail = safeStderr(Buffer.concat(errors));
-        reject(new Error(
-          `adapter descriptor exited with ${signal ?? code ?? "unknown"}${detail ? `: ${detail}` : ""}`,
-        ));
-        return;
-      }
-      try {
-        let text: string;
+    child.once("close", (code, childSignal) => {
+      void (async (): Promise<void> => {
         try {
-          text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
-            .decode(Buffer.concat(output));
+          await reaperMonitor.waitForExit();
         } catch {
-          throw new Error("adapter descriptor is not valid UTF-8");
+          failReaperMonitor();
         }
-        resolve(parseAdapterDescriptorJson(text));
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error("adapter descriptor is invalid"));
-      }
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abortDescriptor);
+        if (failure !== undefined) {
+          reject(failure);
+          return;
+        }
+        if (code !== 0) {
+          const detail = safeStderr(Buffer.concat(errors));
+          reject(new Error(
+            `adapter descriptor exited with ${childSignal ?? code ?? "unknown"}${detail ? `: ${detail}` : ""}`,
+          ));
+          return;
+        }
+        try {
+          let text: string;
+          try {
+            text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+              .decode(Buffer.concat(output));
+          } catch {
+            throw new Error("adapter descriptor is not valid UTF-8");
+          }
+          resolve(parseAdapterDescriptorJson(text));
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error("adapter descriptor is invalid"));
+        }
+      })();
     });
   });
 }
@@ -507,23 +580,22 @@ async function containExecutableAdapterCommand(
   dependencies: Pick<AdapterRunnerDependencies, "bwrapPath" | "expectedOwnerUid">,
 ): Promise<ContainedAdapterLaunch> {
   const bwrap = await fixedInterpreter(dependencies.bwrapPath, dependencies.expectedOwnerUid);
-  return {
-    executable: bwrap,
-    arguments: [
-      "--die-with-parent",
-      "--unshare-pid",
-      "--as-pid-1",
-      "--disable-userns",
-      "--cap-drop", "ALL",
-      "--bind", "/", "/",
-      "--proc", "/proc",
-      "--chdir", workingDirectory,
-      "--",
-      executable,
-      ...arguments_,
-    ],
-    workingDirectory: "/",
-  };
+  const command = wrapWithBubblewrapProcessReaper(bwrap, [
+    "--die-with-parent",
+    "--unshare-user",
+    "--unshare-pid",
+    "--as-pid-1",
+    "--disable-userns",
+    "--cap-drop", "ALL",
+    "--bind", "/", "/",
+    "--dev", "/dev",
+    "--proc", "/proc",
+    "--chdir", workingDirectory,
+    "--",
+    executable,
+    ...arguments_,
+  ]);
+  return { ...command, workingDirectory: "/" };
 }
 
 function validateDescriptorGrant(
@@ -556,7 +628,9 @@ export async function prepareAdapterLaunch(
   pluginId: string,
   adapterArguments: readonly string[],
   dependencies: AdapterRunnerDependencies,
+  signal?: AbortSignal,
 ): Promise<PreparedAdapterLaunch> {
+  throwIfAdapterLaunchAborted(signal);
   if (!ADAPTER_ID_PATTERN.test(pluginId)) throw new Error("adapter runner plugin id is invalid");
   if (dependencies.effectiveUid === 0) throw new Error("source adapters must never run as root");
   const enrolledAdministrator = pluginId === "adapter.tui"
@@ -569,6 +643,7 @@ export async function prepareAdapterLaunch(
     enrolledAdministrator,
   );
   const plugin = await dependencies.loadActive(pluginId);
+  throwIfAdapterLaunchAborted(signal);
   requireAdapterRegistration(plugin);
   if (plugin.pluginId !== pluginId) throw new Error("adapter registry returned a different identity");
   const isTUI = plugin.pluginId === "adapter.tui";
@@ -602,10 +677,14 @@ export async function prepareAdapterLaunch(
           contained.arguments,
           contained.workingDirectory,
           sanitizedAdapterEnvironment(plugin, undefined, dependencies),
+          dependencies.bubblewrapMonitorDependencies,
+          signal,
         );
       })();
+  throwIfAdapterLaunchAborted(signal);
   validateDescriptorGrant(plugin, descriptor);
   const current = await dependencies.loadActive(pluginId);
+  throwIfAdapterLaunchAborted(signal);
   if (!sameRuntimeRegistration(plugin, current)) {
     throw new Error("adapter current registration changed during launch; retry from the new active version");
   }
@@ -654,12 +733,14 @@ export async function prepareAdapterLaunch(
 }
 
 /**
- * Put every Adapter runtime in a dedicated PID namespace. The source process
- * runs as PID 1, so Linux kills all of its descendants before bubblewrap can
- * report that PID 1 exited. This prevents detached/unref grandchildren from
- * surviving past the exact-digest lease held by the outer runner. We retain
- * the host filesystem, network and controlling TTY because this is lifecycle
- * containment, not a claim that business adapters have no host access.
+ * Put every executable Adapter runtime in nested PID namespaces. The inner
+ * source process is PID 1 and disables further user namespaces; the outer
+ * fixed bubblewrap keeps its own PID 1 reaper and does not exit until the
+ * complete inner process tree is gone. This closes the interval between the
+ * inner PID 1 exiting and detached descendants actually disappearing before
+ * the runner releases its exact-digest lease. We retain the host filesystem,
+ * network and controlling TTY because this is lifecycle containment, not a
+ * claim that business adapters have no host access.
  */
 export async function containAdapterLaunch(
   launch: PreparedAdapterLaunch,
@@ -765,31 +846,81 @@ export async function runAdapter(
     await releaseLease();
     throw new Error("adapter current registration changed before its runtime lease");
   }
+  const preparationAbort = new AbortController();
+  let leaseLostError: Error | undefined;
+  const leaseLost = lease.lost.then(
+    () => {
+      const failure = new Error("plugin lease broker ended without a loss reason");
+      leaseLostError = failure;
+      preparationAbort.abort(failure);
+      throw failure;
+    },
+    (error: unknown) => {
+      const failure = error instanceof Error
+        ? error
+        : new Error("plugin lease broker connection was lost");
+      leaseLostError = failure;
+      preparationAbort.abort(failure);
+      throw failure;
+    },
+  );
+  void leaseLost.catch(() => undefined);
   try {
-    const launch = await Promise.race([
-      prepareAdapterLaunch(pluginId, adapterArguments, dependencies),
-      lease.lost,
-    ]);
+    const preparation = prepareAdapterLaunch(
+      pluginId,
+      adapterArguments,
+      dependencies,
+      preparationAbort.signal,
+    );
+    let launch: PreparedAdapterLaunch;
+    try {
+      launch = await Promise.race([preparation, leaseLost]);
+    } catch (error) {
+      if (leaseLostError !== undefined) {
+        // Lease loss aborts any descriptor child immediately, but its exact
+        // outer reaper barrier remains authoritative. Do not return/release
+        // while that cleanup continues in the background.
+        await preparation.catch(() => undefined);
+        throw leaseLostError;
+      }
+      throw error;
+    }
     if (!sameRuntimeRegistration(launch.plugin, lease.registration)) {
       throw new Error("adapter launch changed after its exact-digest runtime lease was acquired");
     }
     const contained = await containAdapterLaunch(launch, dependencies);
+    if (leaseLostError !== undefined) throw leaseLostError;
     const versionOnly = launch.client.arguments.length === 2
       && (launch.client.arguments[1] === "--version" || launch.client.arguments[1] === "-v");
     const sourceMode = launch.descriptor.runtimeAuthority.execution === "source-process"
       && !versionOnly;
     const children: ChildProcess[] = [];
     let source: ChildProcess | undefined;
+    let sourceReaperMonitor: BubblewrapReaperMonitor | undefined;
     try {
       if (sourceMode) {
         source = spawn(contained.executable, contained.arguments, {
           cwd: contained.workingDirectory,
           env: launch.environment,
           shell: false,
-          stdio: ["inherit", "inherit", "inherit", "pipe", "pipe"],
+          stdio: [
+            "inherit", "inherit", "inherit", "pipe", "pipe",
+            "ignore", "ignore", "ignore", "pipe", "pipe",
+          ],
           windowsHide: true,
         });
+        // Register the process before inspecting any custom pipe. Every
+        // post-spawn failure must still terminate and await this child.
         children.push(source);
+        try {
+          sourceReaperMonitor = monitorBubblewrapReaper(
+            source,
+            dependencies.bubblewrapMonitorDependencies,
+          );
+        } catch (error) {
+          source.kill("SIGKILL");
+          throw error;
+        }
       }
       const client = spawn(launch.client.executable, launch.client.arguments, {
         cwd: launch.client.workingDirectory,
@@ -818,6 +949,14 @@ export async function runAdapter(
             for (const child of children) child.kill("SIGKILL");
           }, RUNTIME_STOP_GRACE_MILLISECONDS);
         };
+        if (sourceReaperMonitor !== undefined) {
+          void sourceReaperMonitor.syncEof.catch(() => {
+            stopForRuntimeFailure(new Error("Adapter reaper lifecycle monitoring failed"));
+          });
+          void sourceReaperMonitor.identity.catch(() => {
+            stopForRuntimeFailure(new Error("Adapter reaper lifecycle monitoring failed"));
+          });
+        }
         try {
           const contextOutput = requireWritablePipe(client, ADAPTER_CONTEXT_FD, "compiled Client");
           contextOutput.on("error", (error: NodeJS.ErrnoException) => {
@@ -910,7 +1049,7 @@ export async function runAdapter(
           reject(error instanceof Error ? error : new Error("Adapter pipe setup failed"));
           return;
         }
-        void lease.lost.catch((error: unknown) => { stopForRuntimeFailure(error); });
+        void leaseLost.catch((error: unknown) => { stopForRuntimeFailure(error); });
         const recheck = (): void => {
           if (recheckActive || runtimeFailure !== undefined || selfUpdateHandoff) return;
           recheckActive = true;
@@ -957,19 +1096,36 @@ export async function runAdapter(
         for (const child of children) {
           child.once("error", (error) => { stopForRuntimeFailure(error); });
           child.once("close", (code, signal) => {
-            statuses.set(child, code ?? (signal === null ? 1 : 128));
-            const status = statuses.get(child) ?? 1;
-            if (status !== 0 && runtimeFailure === undefined) {
-              stopForRuntimeFailure(new Error(
-                `${child === client ? "compiled Client" : "Source Adapter"} exited with status ${status}`,
-              ));
-            }
-            finish();
+            void (async (): Promise<void> => {
+              if (child === source && sourceReaperMonitor !== undefined) {
+                try {
+                  await sourceReaperMonitor.waitForExit();
+                } catch {
+                  stopForRuntimeFailure(new Error(
+                    "Adapter reaper lifecycle monitoring failed",
+                  ));
+                }
+              }
+              statuses.set(child, code ?? (signal === null ? 1 : 128));
+              const status = statuses.get(child) ?? 1;
+              if (status !== 0 && runtimeFailure === undefined) {
+                stopForRuntimeFailure(new Error(
+                  `${child === client ? "compiled Client" : "Source Adapter"} exited with status ${status}`,
+                ));
+              }
+              finish();
+            })();
           });
         }
       });
     } catch (error) {
       await terminateAdapterChildren(children);
+      if (sourceReaperMonitor !== undefined) {
+        // ChildProcess close follows the outer monitor, not necessarily the
+        // outer namespace PID 1. Preserve the exact-digest lease until the
+        // same lifecycle proof used by the normal settlement path completes.
+        await sourceReaperMonitor.waitForExit();
+      }
       throw error;
     }
   } finally {

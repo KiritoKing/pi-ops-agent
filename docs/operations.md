@@ -31,6 +31,38 @@ broker、socket、TLS/policy 与 receipt DAC，不要求 agentd、reviewer、plu
 PVE broker unit 默认由 `multi-user.target` 启动；controller `init` 另行把它加入
 `ops-agent.target`，server-only endpoint 不应出现 `/etc/systemd/system/ops-agent.target.wants`。
 
+### 检查 PID 1 的 effective unit，而不只检查磁盘文件
+
+安装器在每次 `init`/controller upgrade 中验证 reviewer、client gateway、guardian、plugin lease
+broker、agentd、server、core broker 与 healthcheck 这八个 managed service；PVE host 再验证 PVE
+broker。`join`/endpoint upgrade 的集合严格只有 server 与 core broker，且只有 signed PVE enrollment
+与本机 `/usr/bin/pvesh` 双向匹配时才加 PVE broker。非 PVE endpoint 上出现 managed PVE unit/drop-in，
+或 join 上出现任一 controller-only service/drop-in，都是 topology drift，不应当作“未启用所以无害”。
+
+每个上述 service 的磁盘 unit 与 unit-specific
+`zzzz-ops-agent-security.conf` 必须逐字来自当前 Release；更重要的是，PID 1 的 `FragmentPath`、
+`DropInPaths`、identity/lifecycle/command/environment/resource limits 与全部 security
+scalar/list/path/capability effective value 必须匹配；还要拒绝带 privilege prefix 的
+`ExecStartEx.flags`，以及 release 未声明却由 host drop-in 注入的 writable path。Installer 还通过
+PID 1 D-Bus typed properties 精确核对 `Conditions`、`Asserts`、Load/Set/Import credential vectors，
+并验证 healthcheck `SuccessExitStatus` 与 agentd final credential drop-in。除 exact managed policy 外，
+额外 loaded drop-in 必须是固定位置中 metadata 安全、完整语法落入窄 compatibility-reset allowlist 的
+host-wide file；未知 unit-specific 或 authority-bearing directive 会 fail closed。日常定位可先查看：
+
+```bash
+systemctl show ops-agentd.service \
+  -p FragmentPath -p DropInPaths -p User -p Group -p ExecStart -p ExecStartEx \
+  -p NoNewPrivileges -p PrivateDevices -p ProtectKernelTunables \
+  -p RestrictNamespaces -p ReadOnlyPaths -p ReadWritePaths -p InaccessiblePaths
+```
+
+这只是便于人工定位的子集，不能替代 installer 的完整逐项验证。尤其不要根据
+`systemctl cat` 的文本顺序猜 effective list：host-wide `service.d` 可以先清空再重建 list，也可以
+覆盖 scalar/command。安装后若 distribution、OrbStack/LXC image 或管理员改变任何 type-wide 或
+unit-specific drop-in，应进入维护窗口，保留恢复入口，并用同一 immutable Release、同一
+`init`/`join` mode 重新跑安装/升级验证；验证失败时保持服务停止并检查 PID 1 的实际合并结果，不能
+删除 final drop-in、放宽 hardening 或只重启 service 来宣称恢复。
+
 当前真实 socket：
 
 ```text
@@ -388,8 +420,9 @@ lock 或手改 `current`。profile digest 更新
 命令和 Source snapshot 中 digest-approved hardener 都降权到 `ops-agent-botmux`。Wrapper 先用
 `agentd-pluginctl current --runtime` 复核 registration/snapshot，再以该 UID 启动固定 setup runner；
 runner 通过 `/run/ops-agent/plugin-lease/lease.sock` 为 exact `adapter.botmux` digest 持有 shared
-lease，直到 `setup`、hardener 与 `restart` 全部完成；hardener 在 bubblewrap PID namespace 内作为
-PID 1，detached 后代必须先清理。Lease 丢失会终止当前子进程且禁止后续步骤，
+lease，直到 `setup`、hardener 与 `restart` 全部完成；hardener 在 inner bubblewrap PID namespace
+内作为 PID 1，runner 必须等 outer 默认 PID 1 reaper 的 lifecycle FD EOF 与 exact init identity
+消失，证明 detached 后代完全清理。Lease 丢失会终止当前子进程且禁止后续步骤，
 并发注册只能在切换 `current` 前失败。active Source registration 缺失、current 无效或任一
 snapshot 校验失败都直接中止；legacy `.opspkg` 只保留 artifact/change/rollback 恢复证据，不能
 作为新版 Client 的 runtime fallback。配置前创建 `0600` 备份；secret
@@ -432,8 +465,9 @@ snapshot 校验失败都直接中止；legacy `.opspkg` 只保留 artifact/chang
 3. 检查 TS/Go protocol、capability revision、persisted change 和 config schema 兼容；
 4. 确认没有 PREPARING/EXECUTING/VERIFYING/ROLLING_BACK change，停止 target 与 core/PVE broker；
 5. 检查新 release 的 unit hardening、account 和 source-plugin diff；
-6. 核对 release verifier 已证明 archive/deb payload 完全一致、六个 Go artifact 为目标架构静态
-   binary、固定 Node runtime 可加载全部 compiled entrypoint，且旧 root watchdog 不在 payload；
+6. 核对 release verifier 已证明 archive/deb payload 完全一致、七个 Go artifact 为目标架构静态
+   binary、固定 Node runtime 已语法检查全部 compiled JavaScript 并实际执行 Client/Reviewer smoke，
+   且旧 root watchdog 不在 payload；
 7. 在隔离 systemd 环境做 upgrade + rollback smoke。SBOM 是依赖清单，archive/deb 的逐字内容
    完整性仍以 asset checksum、manifest 和 provenance attestation 为准，不能把 SBOM 当文件签名。
 
@@ -446,6 +480,14 @@ unit 状态都处于同一个 root-only 回滚事务；激活、plugin registrat
 不进入整树 snapshot。服务在 commit 后才启动；此后的 start/health 失败保留新版本与证据，
 不会竞态恢复旧 registry/config。已有 config 不覆盖，新默认写相邻 `.dist`。升级不得自动新增
 artifact、PVE guest/storage、read path 或 requested scope。
+
+unit/drop-in snapshot 也必须按 topology 分开：`init` 覆盖 Release 中全部 controller managed unit、
+全部 managed service drop-in directory 和待清理的旧 managed `zzzz-ops-agent-*` 文件；`join` 只覆盖
+server/core/PVE 三个候选 unit 以及各自 drop-in directory，其中 PVE directory 在 enrollment 判定前
+也先无条件纳入 snapshot，避免 conditional install 产生未记录的回滚面。安装只写当前 mode
+适用的集合；non-PVE `init`/`join` 会移除 stale managed PVE unit/drop-in，但不得删除该目录中的
+第三方文件或 PVE state/audit。`daemon-reload` 后、服务启动前，任一 applicable service 的 exact
+unit/final drop-in 或 PID 1 effective lifecycle/security vector 不匹配，都在同一事务内回滚。
 
 多 endpoint 管理域先升级能解析新 schema 的 controller，再升级 endpoint。没有 capability
 negotiation 时，旧 controller 遇到未知 capability 应 fail closed。

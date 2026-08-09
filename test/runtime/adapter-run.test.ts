@@ -15,12 +15,22 @@ import type { ActiveRuntimeSourcePlugin } from "../../src/shared/source-plugin.j
 
 const temporaryDirectories: string[] = [];
 const realBubblewrapContainmentAvailable = process.platform === "linux"
+  && process.geteuid?.() === 0
   && existsSync("/usr/bin/bwrap")
   && spawnSync("/usr/bin/bwrap", [
-    "--die-with-parent", "--unshare-pid", "--as-pid-1", "--disable-userns",
-    "--cap-drop", "ALL", "--bind", "/", "/", "--proc", "/proc",
+    "--die-with-parent", "--sync-fd", "8", "--info-fd", "9",
+    "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
+    "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", "/usr/bin/bwrap",
+    "--die-with-parent", "--unshare-user", "--unshare-pid", "--as-pid-1", "--disable-userns",
+    "--cap-drop", "ALL", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
     "--", "/usr/bin/true",
-  ], { stdio: "ignore" }).status === 0;
+  ], {
+    stdio: [
+      "ignore", "ignore", "ignore",
+      "ignore", "ignore", "ignore", "ignore", "ignore",
+      "pipe", "pipe",
+    ],
+  }).status === 0;
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(async (path) => {
@@ -112,12 +122,19 @@ async function fixture(adapterId = "adapter.example"): Promise<{
     "const args = process.argv.slice(2);",
     "const separator = args.indexOf('--');",
     "const chdir = args.indexOf('--chdir');",
-    "if (separator < 0 || chdir < 0) process.exit(125);",
+    "if (separator < 0) process.exit(125);",
     "const runtimeStdio = process.env.OPS_AGENT_ADAPTER_INPUT_FD === '4'",
     "  ? ['inherit', 'inherit', 'inherit', 'inherit', 'inherit'] : 'inherit';",
     "const child = spawn(args[separator + 1], args.slice(separator + 2), {",
-    "  cwd: args[chdir + 1], env: process.env, shell: false, stdio: runtimeStdio,",
+    "  cwd: chdir < 0 ? '/' : args[chdir + 1], env: process.env, shell: false, stdio: runtimeStdio,",
     "});",
+    "const info = args.indexOf('--info-fd');",
+    "if (info >= 0) {",
+    "  const fs = require('node:fs');",
+    "  if (!Number.isSafeInteger(child.pid) || child.pid <= 1) process.exit(125);",
+    "  fs.writeSync(Number(args[info + 1]), JSON.stringify({ 'child-pid': child.pid }));",
+    "  fs.closeSync(Number(args[info + 1]));",
+    "}",
     "if (Array.isArray(runtimeStdio)) {",
     "  const fs = require('node:fs'); fs.closeSync(3); fs.closeSync(4);",
     "}",
@@ -125,7 +142,7 @@ async function fixture(adapterId = "adapter.example"): Promise<{
     "  process.on(signal, () => child.kill(signal));",
     "}",
     "child.once('error', (error) => { throw error; });",
-    "child.once('close', (code, signal) => { process.exitCode = code ?? (signal ? 128 : 1); });",
+    "child.once('close', (code, signal) => { process.exit(code ?? (signal ? 128 : 1)); });",
     "",
   ].join("\n"), { mode: 0o500 });
   await chmod(bwrapPath, 0o500);
@@ -170,6 +187,15 @@ async function fixture(adapterId = "adapter.example"): Promise<{
     },
     stdinIsTTY: false,
     stdoutIsTTY: false,
+    bubblewrapMonitorDependencies: {
+      readProcStat(): Promise<string> {
+        return Promise.reject(Object.assign(
+          new Error("fixture process is already absent"),
+          { code: "ENOENT" },
+        ));
+      },
+      async yieldBeforeRetry(): Promise<void> {},
+    },
     loadActive: async () => await Promise.resolve(plugin),
     acquireLease: async (expected) => await Promise.resolve({
       registration: expected,
@@ -315,11 +341,24 @@ describe("source adapter runner", () => {
     expect(contained.executable).toBe(await realpath(dependencies.bwrapPath));
     expect(contained.arguments).toEqual([
       "--die-with-parent",
+      "--sync-fd", "8",
+      "--info-fd", "9",
+      "--unshare-user",
+      "--unshare-pid",
+      "--cap-drop", "ALL",
+      "--bind", "/", "/",
+      "--dev", "/dev",
+      "--proc", "/proc",
+      "--",
+      await realpath(dependencies.bwrapPath),
+      "--die-with-parent",
+      "--unshare-user",
       "--unshare-pid",
       "--as-pid-1",
       "--disable-userns",
       "--cap-drop", "ALL",
       "--bind", "/", "/",
+      "--dev", "/dev",
       "--proc", "/proc",
       "--chdir", plugin.snapshotPath,
       "--",
@@ -328,6 +367,10 @@ describe("source adapter runner", () => {
     ]);
     expect(contained.arguments).not.toContain("--new-session");
     expect(contained.arguments).not.toContain("--unshare-net");
+    expect(contained.arguments.filter((argument) => argument === "--as-pid-1")).toHaveLength(1);
+    expect(contained.arguments.filter((argument) => argument === "--disable-userns")).toHaveLength(1);
+    expect(contained.arguments.filter((argument) => argument === "--sync-fd")).toHaveLength(1);
+    expect(contained.arguments.filter((argument) => argument === "--info-fd")).toHaveLength(1);
   });
 
   it("bridges split FD4 input/FD3 completion and delivers runner-owned FD5 context", async () => {
@@ -558,13 +601,15 @@ describe("source adapter runner", () => {
 
   it("terminates a long-lived adapter when its active digest changes", async () => {
     const active = await fixture();
+    const started = join(active.dependencies.pluginRegistryPath, "adapter-drift-started");
     await chmod(active.entrypoint, 0o700);
     await writeFile(active.entrypoint, [
       "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
       `const descriptor = ${statusDescriptor(active.plugin.pluginId)};`,
       "if (process.argv[2] === '--agentd-adapter-describe') {",
       "  process.stdout.write(JSON.stringify(descriptor) + '\\n');",
-      "} else { setInterval(() => {}, 1000); }",
+      `} else { writeFileSync(${JSON.stringify(started)}, 'started'); setInterval(() => {}, 1000); }`,
       "",
     ].join("\n"), { mode: 0o500 });
     await chmod(active.entrypoint, 0o500);
@@ -576,11 +621,9 @@ describe("source adapter runner", () => {
       "",
     ].join("\n"), { mode: 0o400 });
     await chmod(active.dependencies.clientPath, 0o400);
-    let calls = 0;
     active.dependencies.runtimeRecheckMilliseconds = 10;
     active.dependencies.loadActive = async () => {
-      calls += 1;
-      return await Promise.resolve(calls <= 3 ? active.plugin : {
+      return await Promise.resolve(!existsSync(started) ? active.plugin : {
         ...active.plugin,
         digest: `sha256:${"c".repeat(64)}`,
       });
@@ -638,6 +681,72 @@ describe("source adapter runner", () => {
     expect(existsSync(started)).toBe(true);
     lost.reject(new Error("plugin lease broker restarted"));
     await expect(runtime).rejects.toThrow("plugin lease broker restarted");
+    expect(released).toBe(true);
+  });
+
+  it("awaits descriptor cleanup and the exact reaper barrier after lease loss", async () => {
+    const active = await fixture();
+    const descriptorStarted = join(
+      active.dependencies.pluginRegistryPath,
+      "adapter-descriptor-started",
+    );
+    await chmod(active.entrypoint, 0o700);
+    await writeFile(active.entrypoint, [
+      "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
+      `const descriptor = ${statusDescriptor(active.plugin.pluginId)};`,
+      "if (process.argv[2] === '--agentd-adapter-describe') {",
+      `  writeFileSync(${JSON.stringify(descriptorStarted)}, 'started');`,
+      "  setTimeout(() => { process.stdout.write(JSON.stringify(descriptor) + '\\n'); }, 150);",
+      "}",
+      "",
+    ].join("\n"), { mode: 0o500 });
+    await chmod(active.entrypoint, 0o500);
+
+    const lost = Promise.withResolvers<never>();
+    const allowIdentityDisappearance = Promise.withResolvers<undefined>();
+    let procReads = 0;
+    let released = false;
+    active.dependencies.bubblewrapMonitorDependencies = {
+      async readProcStat(pid): Promise<string> {
+        procReads += 1;
+        if (procReads === 1) {
+          const fields = ["S", ...Array.from({ length: 18 }, () => "0"), "123"];
+          return `${pid} (adapter-descriptor) ${fields.join(" ")}`;
+        }
+        await allowIdentityDisappearance.promise;
+        throw Object.assign(new Error("fixture reaper is gone"), { code: "ENOENT" });
+      },
+      async yieldBeforeRetry(): Promise<void> {},
+    };
+    active.dependencies.acquireLease = async (expected) => await Promise.resolve({
+      registration: expected,
+      lost: lost.promise,
+      release: () => {
+        released = true;
+        return Promise.resolve();
+      },
+    });
+
+    const runtime = runAdapter(
+      active.plugin.pluginId,
+      ["--session-id", "session-descriptor-loss-1234"],
+      active.dependencies,
+    );
+    void runtime.catch(() => undefined);
+    for (let attempt = 0; attempt < 100 && !existsSync(descriptorStarted); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(existsSync(descriptorStarted)).toBe(true);
+    lost.reject(new Error("plugin lease broker restarted during descriptor capture"));
+    for (let attempt = 0; attempt < 100 && procReads < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(procReads).toBeGreaterThanOrEqual(2);
+    expect(released).toBe(false);
+
+    allowIdentityDisappearance.resolve(undefined);
+    await expect(runtime).rejects.toThrow("restarted during descriptor capture");
     expect(released).toBe(true);
   });
 

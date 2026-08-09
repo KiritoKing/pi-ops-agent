@@ -17,7 +17,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "SKIP: run this probe as root so it can create root:ops-agent-client fixtures and drop to ${PROBE_USER}" >&2
   exit "${SKIP_STATUS}"
 fi
-for command in /usr/bin/bwrap /usr/bin/systemd-run /usr/bin/getent /usr/bin/id; do
+for command in /usr/bin/bwrap /usr/bin/systemd-run /usr/bin/systemctl /usr/bin/getent /usr/bin/id /usr/bin/sleep; do
   if [[ ! -x "${command}" ]]; then
     echo "SKIP: required Linux probe command is unavailable: ${command}" >&2
     exit "${SKIP_STATUS}"
@@ -63,14 +63,31 @@ probe_root="$(mktemp -d /tmp/agentd-adapter-linux-probe.XXXXXX)"
 chown root:"${PROBE_CLIENT_GROUP}" "${probe_root}"
 chmod 0750 "${probe_root}"
 server_pid=""
+probe_unit="ops-agent-adapter-probe-${BASHPID}"
+probe_dropin_directory="/run/systemd/system/${probe_unit}.service.d"
+probe_dropin_path="${probe_dropin_directory}/zzzzzz-ops-agent-probe-security.conf"
+probe_dropin_owned=0
+probe_unit_owned=0
 cleanup() {
+  if [[ "${probe_unit_owned}" -eq 1 ]]; then
+    /usr/bin/systemctl stop "${probe_unit}.service" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
   fi
+  if [[ "${probe_dropin_owned}" -eq 1 ]]; then
+    rm -f -- "${probe_dropin_path}"
+    rmdir -- "${probe_dropin_directory}" 2>/dev/null || true
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   rm -rf -- "${probe_root}"
 }
 trap cleanup EXIT INT TERM
+if [[ -e "${probe_dropin_directory}" ]]; then
+  echo "FAIL: refusing to reuse stale probe drop-in directory: ${probe_dropin_directory}" >&2
+  exit 1
+fi
 
 digest="$(printf 'a%.0s' {1..64})"
 registry_path="${probe_root}/registry"
@@ -82,11 +99,12 @@ ready_path="${probe_root}/socket-ready"
 result_directory="${probe_root}/result"
 probe_client_path="${probe_root}/probe-client.mjs"
 probe_runtime_root="${probe_root}/probe-runtime"
-probe_driver_path="${probe_runtime_root}/probe-adapter-linux-runtime.mjs"
+probe_driver_directory="${probe_runtime_root}/scripts"
+probe_driver_path="${probe_driver_directory}/probe-adapter-linux-runtime.mjs"
 
 install -d -o root -g "${PROBE_CLIENT_GROUP}" -m 0750 \
   "${registry_path}" "${registry_path}/snapshots" "${registry_path}/snapshots/sha256" \
-  "${snapshot_path}" "${socket_directory}" "${probe_runtime_root}"
+  "${snapshot_path}" "${socket_directory}" "${probe_runtime_root}" "${probe_driver_directory}"
 install -d -o "${probe_uid}" -g "${primary_gid}" -m 0700 "${result_directory}"
 install -o root -g "${PROBE_CLIENT_GROUP}" -m 0550 \
   scripts/probe-adapter-linux-fixture.mjs "${snapshot_path}/adapter.mjs"
@@ -102,6 +120,165 @@ printf '%s\n' "root-group-readable" > "${fixture_path}"
 chown root:"${PROBE_CLIENT_GROUP}" "${fixture_path}"
 chmod 0640 "${fixture_path}"
 
+# A host-wide service.d drop-in is allowed to reset list-valued properties after
+# systemd-run constructs a transient service. Install a unit-specific, later
+# drop-in and inspect the manager's effective values before running the probe so
+# the test cannot pass under a silently weakened boundary.
+install -d -o root -g root -m 0755 "${probe_dropin_directory}"
+probe_dropin_owned=1
+{
+  printf '%s\n' \
+    '[Service]' \
+    "User=${PROBE_USER}" \
+    "Group=${PROBE_PRIMARY_GROUP}" \
+    'SupplementaryGroups=' \
+    "SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
+    'WorkingDirectory=/var/lib/ops-agent/adapters/botmux' \
+    'Environment=' \
+    'Environment=HOME=/var/lib/ops-agent/adapters/botmux' \
+    'Environment=PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+    'UMask=0077' \
+    'NoNewPrivileges=yes' \
+    'ProtectSystem=strict' \
+    'ProtectHome=yes' \
+    'ProtectKernelTunables=yes' \
+    'ProtectKernelModules=yes' \
+    'ProtectControlGroups=yes' \
+    'PrivateDevices=yes' \
+    'ProtectProc=invisible' \
+    'ProcSubset=all' \
+    'RestrictSUIDSGID=yes' \
+    'RestrictNamespaces=user pid mnt' \
+    'ReadOnlyPaths=' \
+    "ReadOnlyPaths=/opt/pi-ops-agent ${probe_runtime_root} ${registry_path} ${fixture_path} ${socket_directory}" \
+    'ReadWritePaths=' \
+    'ReadWritePaths=/var/lib/ops-agent/adapters/botmux /tmp /proc/sys/user/max_user_namespaces'
+} >"${probe_dropin_path}"
+chown root:root "${probe_dropin_path}"
+chmod 0644 "${probe_dropin_path}"
+/usr/bin/systemctl daemon-reload
+
+require_effective_property() {
+  local property="$1"
+  local expected="$2"
+  local actual
+  actual="$(/usr/bin/systemctl show "${probe_unit}.service" --property="${property}" --value)"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "FAIL: effective ${property}=${actual@Q}, expected ${expected@Q}" >&2
+    exit 1
+  fi
+}
+
+require_effective_word_set() {
+  local property="$1"
+  shift
+  local actual
+  local expected_word
+  local actual_word
+  local found
+  local -a actual_words=()
+  actual="$(/usr/bin/systemctl show "${probe_unit}.service" --property="${property}" --value)"
+  read -r -a actual_words <<<"${actual}"
+  if [[ "${#actual_words[@]}" -ne "$#" ]]; then
+    echo "FAIL: effective ${property}=${actual@Q}, expected exactly: $*" >&2
+    exit 1
+  fi
+  for expected_word in "$@"; do
+    found=0
+    for actual_word in "${actual_words[@]}"; do
+      if [[ "${actual_word}" == "${expected_word}" ]]; then
+        found=1
+        break
+      fi
+    done
+    if [[ "${found}" -ne 1 ]]; then
+      echo "FAIL: effective ${property}=${actual@Q}, missing ${expected_word@Q}" >&2
+      exit 1
+    fi
+  done
+}
+
+require_effective_word_member() {
+  local property="$1"
+  local expected="$2"
+  local actual
+  local actual_word
+  actual="$(/usr/bin/systemctl show "${probe_unit}.service" --property="${property}" --value)"
+  for actual_word in ${actual}; do
+    if [[ "${actual_word}" == "${expected}" ]]; then
+      return 0
+    fi
+  done
+  echo "FAIL: effective ${property}=${actual@Q}, missing ${expected@Q}" >&2
+  exit 1
+}
+
+# Keep one instance alive long enough to inspect the effective manager state.
+# The same name-specific drop-in remains in force for the real invocation below.
+probe_unit_owned=1
+/usr/bin/systemd-run --quiet --collect --unit="${probe_unit}" \
+  --working-directory=/var/lib/ops-agent/adapters/botmux \
+  --setenv=HOME=/var/lib/ops-agent/adapters/botmux \
+  --setenv=PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --property="User=${PROBE_USER}" \
+  --property="Group=${PROBE_PRIMARY_GROUP}" \
+  --property="SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
+  --property=UMask=0077 \
+  --property=NoNewPrivileges=yes \
+  --property=ProtectSystem=strict \
+  --property=ProtectHome=yes \
+  --property=ProtectKernelTunables=yes \
+  --property=ProtectKernelModules=yes \
+  --property=ProtectControlGroups=yes \
+  --property=PrivateDevices=yes \
+  --property=ProtectProc=invisible \
+  --property=ProcSubset=all \
+  --property=RestrictSUIDSGID=yes \
+  --property="RestrictNamespaces=user pid mnt" \
+  --property="ReadOnlyPaths=/opt/pi-ops-agent ${probe_runtime_root} ${registry_path} ${fixture_path} ${socket_directory}" \
+  --property="ReadWritePaths=/var/lib/ops-agent/adapters/botmux /tmp /proc/sys/user/max_user_namespaces" \
+  /usr/bin/sleep 30
+
+require_effective_property LoadState loaded
+require_effective_property ActiveState active
+require_effective_property NeedDaemonReload no
+require_effective_word_member DropInPaths "${probe_dropin_path}"
+require_effective_property User "${PROBE_USER}"
+require_effective_property Group "${PROBE_PRIMARY_GROUP}"
+require_effective_word_set SupplementaryGroups "${PROBE_CLIENT_GROUP}"
+require_effective_property WorkingDirectory /var/lib/ops-agent/adapters/botmux
+require_effective_word_set Environment \
+  HOME=/var/lib/ops-agent/adapters/botmux \
+  PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+require_effective_property UMask 0077
+require_effective_property NoNewPrivileges yes
+require_effective_property ProtectSystem strict
+require_effective_property ProtectHome yes
+require_effective_property ProtectKernelTunables yes
+require_effective_property ProtectKernelModules yes
+require_effective_property ProtectControlGroups yes
+require_effective_property PrivateDevices yes
+require_effective_property ProtectProc invisible
+require_effective_property ProcSubset all
+require_effective_property RestrictSUIDSGID yes
+require_effective_word_set RestrictNamespaces user pid mnt
+require_effective_word_set ReadOnlyPaths \
+  /opt/pi-ops-agent "${probe_runtime_root}" "${registry_path}" "${fixture_path}" "${socket_directory}"
+require_effective_word_set ReadWritePaths \
+  /var/lib/ops-agent/adapters/botmux /tmp /proc/sys/user/max_user_namespaces
+
+/usr/bin/systemctl stop "${probe_unit}.service"
+for _ in {1..100}; do
+  if [[ "$(/usr/bin/systemctl show "${probe_unit}.service" --property=LoadState --value 2>/dev/null || true)" == "not-found" ]]; then
+    break
+  fi
+  sleep 0.02
+done
+if [[ "$(/usr/bin/systemctl show "${probe_unit}.service" --property=LoadState --value 2>/dev/null || true)" != "not-found" ]]; then
+  echo "FAIL: effective-vector probe unit did not unload before runtime probe" >&2
+  exit 1
+fi
+
 "${node_path}" scripts/probe-adapter-linux-socket.mjs \
   "${socket_path}" "${ready_path}" "${client_gid}" &
 server_pid="$!"
@@ -114,7 +291,6 @@ if [[ ! -f "${ready_path}" ]]; then
   exit 1
 fi
 
-probe_unit="ops-agent-adapter-probe-${BASHPID}"
 /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="${probe_unit}" \
   --working-directory=/var/lib/ops-agent/adapters/botmux \
   --setenv=HOME=/var/lib/ops-agent/adapters/botmux \
@@ -130,6 +306,8 @@ probe_unit="ops-agent-adapter-probe-${BASHPID}"
   --property=ProtectKernelModules=yes \
   --property=ProtectControlGroups=yes \
   --property=PrivateDevices=yes \
+  --property=ProtectProc=invisible \
+  --property=ProcSubset=all \
   --property=RestrictSUIDSGID=yes \
   --property="RestrictNamespaces=user pid mnt" \
   --property="ReadOnlyPaths=/opt/pi-ops-agent ${probe_runtime_root} ${registry_path} ${fixture_path} ${socket_directory}" \

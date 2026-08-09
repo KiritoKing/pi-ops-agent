@@ -58,6 +58,7 @@ func TestLegacyFileRollbackRestoresOnlyExactCommittedTargetAndBrokerBackup(t *te
 	if err := os.MkdirAll(allowedRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	policyRoot := secureFileFixtureAllowedRoot(t, allowedRoot)
 	if err := os.MkdirAll(changeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestLegacyFileRollbackRestoresOnlyExactCommittedTargetAndBrokerBackup(t *te
 	result := ExecutionResult{
 		BackupRefs: []string{backup}, RollbackData: rollback, RollbackAvailable: true,
 	}
-	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{allowedRoot}}
+	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{policyRoot}}
 	operation := legacyFileOperation(t, target, "approved replacement\n", "0640")
 	objects, err := executor.InspectLegacyFileRecovery(ExecutionScope{ChangeID: changeID}, operation, result)
 	if err != nil || len(objects) != 1 || objects[0].Reference != backup || objects[0].Digest != secureFilePayloadDigest([]byte("original\n")) {
@@ -121,6 +122,7 @@ func TestLegacyFileRollbackRemovesOnlyExactRootOwnedNewFile(t *testing.T) {
 	if err := os.MkdirAll(allowedRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	policyRoot := secureFileFixtureAllowedRoot(t, allowedRoot)
 	target := filepath.Join(allowedRoot, "new.conf")
 	if err := os.WriteFile(target, []byte("approved new file\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -129,7 +131,7 @@ func TestLegacyFileRollbackRemovesOnlyExactRootOwnedNewFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := ExecutionResult{RollbackData: json.RawMessage(`{"existed":false}`), RollbackAvailable: true}
-	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{allowedRoot}}
+	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{policyRoot}}
 	operation := legacyFileOperation(t, target, "approved new file\n", "")
 	if err := executor.Rollback(context.Background(), ExecutionScope{ChangeID: changeID}, operation, result); err != nil {
 		t.Fatalf("remove exact legacy-created target: %v", err)
@@ -149,6 +151,7 @@ func TestLegacyFileRollbackRejectsContentOrBackupEvidenceDrift(t *testing.T) {
 	if err := os.MkdirAll(allowedRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	policyRoot := secureFileFixtureAllowedRoot(t, allowedRoot)
 	if err := os.MkdirAll(changeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +173,7 @@ func TestLegacyFileRollbackRejectsContentOrBackupEvidenceDrift(t *testing.T) {
 		Existed: true, BackupPath: backup, Mode: 0o600, UID: os.Geteuid(), GID: os.Getegid(),
 	})
 	result := ExecutionResult{BackupRefs: []string{backup}, RollbackData: rollback, RollbackAvailable: true}
-	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{allowedRoot}}
+	executor := &OSExecutor{StateDir: stateDir, AllowedRoots: []string{policyRoot}}
 	operation := legacyFileOperation(t, target, "approved replacement\n", "0640")
 	if _, err := executor.InspectLegacyFileRecovery(ExecutionScope{ChangeID: changeID}, operation, result); err == nil {
 		t.Fatal("legacy recovery proof accepted drifted content and an unsafe backup mode")

@@ -257,6 +257,13 @@ snapshot_managed_units() {
     for unit in ops-agent-server.service ops-root-helper.service ops-pve-root-helper.service; do
       snapshot_managed_path "${UNIT_ROOT}/${unit}"
     done
+    for unit in ops-agent-server.service ops-root-helper.service; do
+      snapshot_managed_path "${UNIT_ROOT}/${unit}.d"
+    done
+    # Enrollment is validated after the transaction snapshot. Snapshot the PVE
+    # directory unconditionally so a later signed --pve decision cannot create
+    # an unsnapshotted rollback surface.
+    snapshot_managed_path "${UNIT_ROOT}/ops-pve-root-helper.service.d"
     return
   fi
   for path in "${PAYLOAD_DIR}"/app/systemd/*.service \
@@ -273,7 +280,9 @@ snapshot_managed_units() {
     [[ -n "${seen["${path}"]:-}" ]] || snapshot_managed_path "${path}"
     seen["${path}"]=true
   done
-  for existing_dropin in "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf; do
+  for existing_dropin in \
+      "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf \
+      "${UNIT_ROOT}"/agentd-*.service.d/zzzz-ops-agent-*.conf; do
     [[ -e "${existing_dropin}" ]] || continue
     path="$(dirname "${existing_dropin}")"
     [[ -n "${seen["${path}"]:-}" ]] || snapshot_managed_path "${path}"
@@ -834,7 +843,7 @@ if ! command -v openssl >/dev/null 2>&1 || ! command -v diff >/dev/null 2>&1 \
   install_native_dependencies
 fi
 
-required_commands=(systemctl systemd-tmpfiles getent groupadd groupdel useradd userdel usermod install cp cmp mv ln readlink mktemp stat wc openssl sed tr cut grep find sleep diff dirname)
+required_commands=(systemctl systemd-tmpfiles busctl getent groupadd groupdel useradd userdel usermod install cp cmp mv ln readlink mktemp stat wc openssl sed tr cut grep find sleep diff dirname sort paste)
 if [[ "${MODE}" == init ]]; then
   required_commands+=(gpasswd bwrap sha256sum hostname runuser sudo visudo)
 fi
@@ -995,7 +1004,12 @@ if [[ "${MODE}" == join ]]; then
       "${UNIT_ROOT}/agentd-client-gateway.service" \
       "${UNIT_ROOT}/agentd-approval-reviewer.service" \
       "${UNIT_ROOT}/agentd-plugin-lease-broker.service" "${UNIT_ROOT}/ops-agent.target" \
+      "${UNIT_ROOT}/ops-agentd.service.d" "${UNIT_ROOT}/agentd-guardian.service.d" \
+      "${UNIT_ROOT}/agentd-client-gateway.service.d" \
+      "${UNIT_ROOT}/agentd-approval-reviewer.service.d" \
+      "${UNIT_ROOT}/agentd-plugin-lease-broker.service.d" \
       "${UNIT_ROOT}/ops-agent-healthcheck.service" "${UNIT_ROOT}/ops-agent-healthcheck.timer" \
+      "${UNIT_ROOT}/ops-agent-healthcheck.service.d" \
       /usr/local/bin/ops-agent /usr/libexec/pi-ops-agent; do
     if [[ -e "${forbidden_path}" ]] || [[ -L "${forbidden_path}" ]]; then
       printf 'join refuses controller-only surface: %s\n' "${forbidden_path}" >&2
@@ -1288,6 +1302,12 @@ if [[ "${MODE}" == init ]]; then
   install -d -o root -g "${CLIENT_GROUP}" -m 2750 /var/lib/ops-agent/plugins
   install -d -o root -g "${LEASE_GROUP}" -m 0750 \
     /var/lib/ops-agent/plugins/invocation-leases
+  # A newly created child inherits setgid from the client-readable 2750
+  # registry parent on Linux. Clear that bit explicitly: this broker-only
+  # directory must not inherit the client-plane directory semantics.
+  # GNU chmod preserves setgid on directories for a four-digit numeric mode;
+  # the extra leading zero explicitly clears every special bit.
+  chmod 00750 /var/lib/ops-agent/plugins/invocation-leases
   [[ "$(stat -c '%U:%G:%a' /var/lib/ops-agent/plugins/invocation-leases)" \
       == "root:${LEASE_GROUP}:750" ]] || {
     printf 'Plugin invocation lease directory has unsafe ownership or mode.\n' >&2
@@ -2071,7 +2091,15 @@ verify_effective_sudo_policy() {
   probe_requires_password setup-botmux /usr/libexec/pi-ops-agent/setup-botmux
 
   botmux_policy="${INSTALL_TRANSACTION_DIR}/sudo-probe-${BOTMUX_USER}.log"
-  if /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1; then
+  # sudo 1.9 may return status 0 even when its authoritative result is the
+  # single canonical "is not allowed" line. Do not infer policy from status;
+  # require that exact C-locale negative result and reject warnings, defaults,
+  # command listings, or any other extra output.
+  LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1 || true
+  if [[ "$(wc -l <"${botmux_policy}" | tr -d '[:space:]')" != 1 ]] \
+      || ! grep -Eq \
+        "^User ${BOTMUX_USER} is not allowed to run sudo on [A-Za-z0-9][A-Za-z0-9.-]{0,252}\\.$" \
+        "${botmux_policy}"; then
     printf 'Unsafe sudo policy: dedicated BotMux account has at least one sudo rule:\n' >&2
     sed -n '1,10p' "${botmux_policy}" >&2
     return 1
@@ -2165,23 +2193,614 @@ disable_managed_unit_for_cleanup() {
   esac
 }
 
+# Controller init follows the local PVE host fact; join follows the signed
+# enrollment after it has been checked against that same host fact. Keep this
+# decision after enrollment validation so a non-PVE endpoint upgrade can
+# transactionally remove stale managed PVE systemd surfaces without touching
+# historical state, audit, or unrelated third-party drop-ins.
+selected_pve_broker=false
+if { [[ "${MODE}" == init ]] && [[ -x /usr/bin/pvesh ]]; } \
+    || { [[ "${MODE}" == join ]] && [[ "${PVE_ENDPOINT}" == true ]]; }; then
+  selected_pve_broker=true
+fi
+
+validate_stale_pve_unit_for_cleanup() {
+  local path="${UNIT_ROOT}/ops-pve-root-helper.service"
+  if [[ ! -e "${path}" ]] && [[ ! -L "${path}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${path}" ]] || [[ -L "${path}" ]] \
+      || [[ "$(stat -c '%U:%G:%a:%h' "${path}" 2>/dev/null || true)" != root:root:644:1 ]]; then
+    printf 'Refusing to remove an unsafe stale PVE unit surface: %s.\n' "${path}" >&2
+    return 1
+  fi
+}
+
+validate_stale_pve_dropin_for_cleanup() {
+  local directory="${UNIT_ROOT}/ops-pve-root-helper.service.d"
+  local managed="${directory}/zzzz-ops-agent-security.conf"
+  if [[ ! -e "${directory}" ]] && [[ ! -L "${directory}" ]]; then
+    return 0
+  fi
+  if [[ ! -d "${directory}" ]] || [[ -L "${directory}" ]] \
+      || [[ "$(stat -c '%U:%G:%a' "${directory}" 2>/dev/null || true)" != root:root:755 ]]; then
+    printf 'Refusing to traverse an unsafe stale PVE drop-in directory: %s.\n' \
+      "${directory}" >&2
+    return 1
+  fi
+  if [[ -e "${managed}" ]] || [[ -L "${managed}" ]]; then
+    if [[ ! -f "${managed}" ]] || [[ -L "${managed}" ]] \
+        || [[ "$(stat -c '%U:%G:%a:%h' "${managed}" 2>/dev/null || true)" \
+          != root:root:644:1 ]]; then
+      printf 'Refusing to remove an unsafe stale PVE managed drop-in: %s.\n' \
+        "${managed}" >&2
+      return 1
+    fi
+  fi
+}
+
+installed_unit_property() {
+  local unit="$1"
+  local property="$2"
+  local value
+  if ! value="$(systemctl show --no-pager --property="${property}" --value "${unit}")"; then
+    printf 'PID 1 did not return %s for installed unit %s.\n' "${property}" "${unit}" >&2
+    return 1
+  fi
+  if [[ "${value}" == *$'\n'* ]]; then
+    printf 'PID 1 returned a multi-line %s for installed unit %s.\n' \
+      "${property}" "${unit}" >&2
+    return 1
+  fi
+  printf '%s' "${value}"
+}
+
+installed_unit_bus_path() {
+  local unit="$1"
+  local payload
+  payload="$(busctl --json=short call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "${unit}")"
+  printf '%s' "${payload}" | "${release_dir}/runtime/node" -e '
+    const fs = require("node:fs");
+    const value = JSON.parse(fs.readFileSync(0, "utf8"));
+    if (value?.type !== "o" || !Array.isArray(value.data) || value.data.length !== 1
+        || typeof value.data[0] !== "string"
+        || !/^\/org\/freedesktop\/systemd1\/unit\/[A-Za-z0-9_]+$/u.test(value.data[0])) {
+      throw new Error("systemd LoadUnit returned an invalid object path");
+    }
+    process.stdout.write(value.data[0]);
+  '
+}
+
+installed_unit_bus_property() {
+  local object_path="$1"
+  local interface="$2"
+  local property="$3"
+  busctl --json=short get-property org.freedesktop.systemd1 \
+    "${object_path}" "${interface}" "${property}"
+}
+
+verify_installed_unit_typed_vectors() {
+  local unit="$1"
+  local unit_path="$2"
+  local object_path conditions asserts load load_encrypted set set_encrypted import
+  object_path="$(installed_unit_bus_path "${unit}")"
+  conditions="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Unit Conditions)"
+  asserts="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Unit Asserts)"
+  load="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service LoadCredential)"
+  load_encrypted="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service LoadCredentialEncrypted)"
+  set="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service SetCredential)"
+  set_encrypted="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service SetCredentialEncrypted)"
+  import="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service ImportCredential)"
+
+  "${release_dir}/runtime/node" -e '
+    const fs = require("node:fs");
+    const [unitPath, conditionsText, assertsText, loadText, loadEncryptedText,
+      setText, setEncryptedText, importText] = process.argv.slice(1);
+    const source = fs.readFileSync(unitPath, "utf8");
+    const expectedConditions = [];
+    const expectedAsserts = [];
+    const expectedLoad = [];
+    const expectedLoadEncrypted = [];
+    let section = "";
+    for (const rawLine of source.split("\n")) {
+      if (rawLine.includes("\r")) throw new Error("unit contains a carriage return");
+      if (/^\[[A-Za-z]+\]$/u.test(rawLine)) {
+        section = rawLine.slice(1, -1);
+        continue;
+      }
+      if (rawLine === "" || rawLine.startsWith("#")) continue;
+      const separator = rawLine.indexOf("=");
+      if (separator < 1) continue;
+      const name = rawLine.slice(0, separator);
+      let value = rawLine.slice(separator + 1);
+      if (section === "Unit" && (name.startsWith("Condition") || name.startsWith("Assert"))) {
+        let trigger = false;
+        let negate = false;
+        while (value.startsWith("|") || value.startsWith("!")) {
+          if (value[0] === "|") trigger = true;
+          else negate = true;
+          value = value.slice(1);
+        }
+        if (value === "") throw new Error(`release unit resets ${name}`);
+        (name.startsWith("Condition") ? expectedConditions : expectedAsserts)
+          .push([name, trigger, negate, value]);
+      }
+      if (section === "Service" && (name === "LoadCredential"
+          || name === "LoadCredentialEncrypted")) {
+        const colon = value.indexOf(":");
+        if (colon < 1 || colon === value.length - 1) {
+          throw new Error(`release unit has unsupported ${name} syntax`);
+        }
+        const pair = [value.slice(0, colon), value.slice(colon + 1)];
+        (name === "LoadCredential" ? expectedLoad : expectedLoadEncrypted).push(pair);
+      }
+    }
+    const canonical = (entries) => entries.map((entry) => JSON.stringify(entry)).sort();
+    const equal = (left, right) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+    const typed = (text, expectedType, label) => {
+      const value = JSON.parse(text);
+      if (value?.type !== expectedType || !Array.isArray(value.data)) {
+        throw new Error(`${label} returned an invalid typed value`);
+      }
+      return value.data;
+    };
+    const actualConditions = (text, label) => typed(text, "a(sbbsi)", label).map((entry) => {
+      if (!Array.isArray(entry) || entry.length !== 5 || typeof entry[0] !== "string"
+          || typeof entry[1] !== "boolean" || typeof entry[2] !== "boolean"
+          || typeof entry[3] !== "string" || !Number.isInteger(entry[4])) {
+        throw new Error(`${label} contains an invalid condition tuple`);
+      }
+      return entry.slice(0, 4);
+    });
+    const actualPairs = (text, label) => typed(text, "a(ss)", label).map((entry) => {
+      if (!Array.isArray(entry) || entry.length !== 2
+          || typeof entry[0] !== "string" || typeof entry[1] !== "string") {
+        throw new Error(`${label} contains an invalid credential tuple`);
+      }
+      return entry;
+    });
+    if (!equal(actualConditions(conditionsText, "Conditions"), expectedConditions)) {
+      throw new Error("effective Conditions differ from the exact release unit");
+    }
+    if (!equal(actualConditions(assertsText, "Asserts"), expectedAsserts)) {
+      throw new Error("effective Asserts differ from the exact release unit");
+    }
+    if (!equal(actualPairs(loadText, "LoadCredential"), expectedLoad)) {
+      throw new Error("effective LoadCredential differs from the exact release unit");
+    }
+    if (!equal(actualPairs(loadEncryptedText, "LoadCredentialEncrypted"),
+        expectedLoadEncrypted)) {
+      throw new Error("effective LoadCredentialEncrypted differs from the exact release unit");
+    }
+    for (const [text, type, label] of [
+      [setText, "a(say)", "SetCredential"],
+      [setEncryptedText, "a(say)", "SetCredentialEncrypted"],
+      [importText, "as", "ImportCredential"],
+    ]) {
+      if (typed(text, type, label).length !== 0) {
+        throw new Error(`effective ${label} must be empty`);
+      }
+    }
+  ' "${unit_path}" "${conditions}" "${asserts}" "${load}" "${load_encrypted}" \
+    "${set}" "${set_encrypted}" "${import}"
+}
+
+verify_allowed_host_service_dropin() {
+  local path="$1"
+  local section='' line
+  declare -A seen=()
+  if [[ ! -f "${path}" ]] || [[ -L "${path}" ]] \
+      || [[ "$(stat -c '%U:%G:%a:%h' "${path}" 2>/dev/null || true)" != root:root:644:1 ]]; then
+    printf 'Host-wide service drop-in has unsafe metadata: %s.\n' "${path}" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" != *$'\r'* ]] || {
+      printf 'Host-wide service drop-in contains a carriage return: %s.\n' "${path}" >&2
+      return 1
+    }
+    case "${line}" in
+      ''|'#'*) continue ;;
+      '[Service]') section=service; continue ;;
+      '['*']')
+        printf 'Host-wide service drop-in uses an unsupported section: %s.\n' "${path}" >&2
+        return 1
+        ;;
+    esac
+    [[ "${section}" == service && -z "${seen["${line}"]:-}" ]] || {
+      printf 'Host-wide service drop-in has an unsafe or duplicate directive: %s.\n' \
+        "${path}" >&2
+      return 1
+    }
+    case "${line}" in
+      'ProcSubset=all'|'ProtectProc=default'|'ProtectControlGroups=no'|\
+      'ProtectKernelTunables=no'|'NoNewPrivileges=no'|'LoadCredential='|\
+      'PrivateNetwork=no'|'ProtectHome=no'|'ProtectSystem=no'|\
+      'PrivateDevices=no'|'PrivateTmp=no'|'ProtectKernelLogs=no'|\
+      'ProtectKernelModules=no'|'ReadWritePaths='|'ReadOnlyPaths='|\
+      'SupplementaryGroups='|'ImportCredential='|'TimeoutStopFailureMode=abort') ;;
+      *)
+        printf 'Host-wide service drop-in contains an unverified directive %s: %s.\n' \
+          "${line%%=*}" "${path}" >&2
+        return 1
+        ;;
+    esac
+    seen["${line}"]=true
+  done <"${path}"
+}
+
+verify_installed_unit_dropin_closure() {
+  local unit="$1"
+  local security_dropin="$2"
+  local credential_dropin="${3:-}"
+  local raw path
+  local -a paths=()
+  raw="$(installed_unit_property "${unit}" DropInPaths)"
+  # Drop-in filenames are root-controlled but are still policy input. Parse the
+  # manager's whitespace-delimited escaped paths without shell glob expansion;
+  # otherwise a loaded name containing [*?] could expand to a different file
+  # and evade the complete-content verifier below.
+  read -r -a paths <<<"${raw}"
+  for path in "${paths[@]}"; do
+    if [[ "${path}" == "${security_dropin}" ]] \
+        || { [[ -n "${credential_dropin}" ]] && [[ "${path}" == "${credential_dropin}" ]]; }; then
+      continue
+    fi
+    case "${path}" in
+      /run/systemd/system/service.d/*.conf|/usr/lib/systemd/system/service.d/*.conf|/lib/systemd/system/service.d/*.conf)
+        verify_allowed_host_service_dropin "${path}"
+        ;;
+      *)
+        printf 'Installed unit %s has an unverified extra drop-in: %s.\n' \
+          "${unit}" "${path}" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+require_installed_unit_property() {
+  local unit="$1"
+  local property="$2"
+  local expected="$3"
+  local actual
+  actual="$(installed_unit_property "${unit}" "${property}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'Unsafe effective %s for installed unit %s: expected %q, got %q.\n' \
+      "${property}" "${unit}" "${expected}" "${actual}" >&2
+    return 1
+  fi
+}
+
+normalized_unit_word_set() (
+  set -f
+  local value="$1"
+  local -a words=()
+  read -r -a words <<<"${value}"
+  if ((${#words[@]} > 0)); then
+    printf '%s\n' "${words[@]}" | LC_ALL=C sort -u | paste -sd' ' -
+  fi
+)
+
+require_installed_unit_word_set() {
+  local unit="$1"
+  local property="$2"
+  local expected="$3"
+  local actual actual_normalized expected_normalized
+  actual="$(installed_unit_property "${unit}" "${property}")"
+  actual_normalized="$(normalized_unit_word_set "${actual}")"
+  expected_normalized="$(normalized_unit_word_set "${expected}")"
+  if [[ "${actual_normalized}" != "${expected_normalized}" ]]; then
+    printf 'Unsafe effective %s set for installed unit %s: expected %q, got %q.\n' \
+      "${property}" "${unit}" "${expected_normalized}" "${actual_normalized}" >&2
+    return 1
+  fi
+}
+
+unit_file_single_value() {
+  local unit_path="$1"
+  local property="$2"
+  local default_value="$3"
+  local -a values=()
+  mapfile -t values < <(sed -n "s/^${property}=//p" "${unit_path}")
+  if ((${#values[@]} > 1)); then
+    printf 'Installed unit has duplicate %s directives: %s.\n' "${property}" "${unit_path}" >&2
+    return 1
+  fi
+  if ((${#values[@]} == 0)); then
+    printf '%s' "${default_value}"
+  else
+    printf '%s' "${values[0]}"
+  fi
+}
+
+normalized_unit_bytes() {
+  local value="$1"
+  local number multiplier
+  case "${value}" in
+    *K) number="${value%K}"; multiplier=1024 ;;
+    *M) number="${value%M}"; multiplier=1048576 ;;
+    *G) number="${value%G}"; multiplier=1073741824 ;;
+    *T) number="${value%T}"; multiplier=1099511627776 ;;
+    *) number="${value}"; multiplier=1 ;;
+  esac
+  [[ "${number}" =~ ^[0-9]+$ ]] || {
+    printf 'Unsupported unit byte-size value: %s.\n' "${value}" >&2
+    return 1
+  }
+  printf '%s' "$((10#${number} * multiplier))"
+}
+
+verify_effective_unit_lifecycle() {
+  local unit="$1"
+  local unit_path="${UNIT_ROOT}/${unit}"
+  local source_path="${release_dir}/systemd/${unit}"
+  local property expected executable actual extended environment_file
+  local -a environment_files=()
+  [[ -f "${unit_path}" && ! -L "${unit_path}" ]] \
+    && [[ "$(stat -c '%U:%G:%a:%h' "${unit_path}")" == root:root:644:1 ]] \
+    && cmp -s "${source_path}" "${unit_path}" || {
+      printf 'Installed unit is not the exact root-owned release file: %s.\n' "${unit}" >&2
+      return 1
+    }
+  require_installed_unit_property "${unit}" LoadState loaded
+  require_installed_unit_property "${unit}" FragmentPath "${unit_path}"
+  # systemctl renders typed arrays such as Conditions, Asserts, and credential
+  # vectors as "[unprintable]" on supported systemd releases. Query PID 1 over
+  # D-Bus and compare the complete typed values with the exact release unit.
+  verify_installed_unit_typed_vectors "${unit}" "${unit_path}"
+  for property in User Group Type UMask; do
+    expected="$(unit_file_single_value "${unit_path}" "${property}" '')"
+    [[ -n "${expected}" ]] || {
+      printf 'Installed unit is missing required %s: %s.\n' "${property}" "${unit}" >&2
+      return 1
+    }
+    require_installed_unit_property "${unit}" "${property}" "${expected}"
+  done
+  expected="$(unit_file_single_value "${unit_path}" Restart no)"
+  require_installed_unit_property "${unit}" Restart "${expected}"
+  expected="$(unit_file_single_value "${unit_path}" RestartSec '')"
+  if [[ -n "${expected}" ]]; then
+    require_installed_unit_property "${unit}" RestartUSec "${expected}"
+  fi
+  expected="$(unit_file_single_value "${unit_path}" TimeoutStopSec '')"
+  if [[ -n "${expected}" ]]; then
+    require_installed_unit_property "${unit}" TimeoutStopUSec "${expected}"
+  fi
+  require_installed_unit_property "${unit}" KillMode control-group
+  require_installed_unit_property "${unit}" ExecCondition ''
+  require_installed_unit_property "${unit}" ExecStartPre ''
+  require_installed_unit_property "${unit}" ExecStartPost ''
+  require_installed_unit_property "${unit}" ExecReload ''
+  require_installed_unit_property "${unit}" ExecStop ''
+  require_installed_unit_property "${unit}" ExecStopPost ''
+  expected="$(sed -n 's/^Environment=//p' "${unit_path}" | paste -sd' ' -)"
+  require_installed_unit_word_set "${unit}" Environment "${expected}"
+  mapfile -t environment_files < <(sed -n 's/^EnvironmentFile=//p' "${unit_path}")
+  expected=''
+  for environment_file in "${environment_files[@]}"; do
+    if [[ "${environment_file}" == -* ]]; then
+      expected+="${expected:+ }${environment_file#-} (ignore_errors=yes)"
+    else
+      expected+="${expected:+ }${environment_file} (ignore_errors=no)"
+    fi
+  done
+  require_installed_unit_property "${unit}" EnvironmentFiles "${expected}"
+  expected="$(unit_file_single_value "${unit_path}" WorkingDirectory '')"
+  if [[ -n "${expected}" ]]; then
+    require_installed_unit_property "${unit}" WorkingDirectory "${expected}"
+  fi
+  expected="$(unit_file_single_value "${unit_path}" TasksMax '')"
+  if [[ -n "${expected}" ]]; then
+    require_installed_unit_property "${unit}" TasksMax "${expected}"
+  fi
+  expected="$(unit_file_single_value "${unit_path}" LimitNOFILE '')"
+  if [[ -n "${expected}" ]]; then
+    [[ "${expected}" =~ ^[0-9]+$ ]] || {
+      printf 'Installed unit has an unsupported LimitNOFILE value: %s.\n' "${unit}" >&2
+      return 1
+    }
+    require_installed_unit_property "${unit}" LimitNOFILE "${expected}"
+    require_installed_unit_property "${unit}" LimitNOFILESoft "${expected}"
+  fi
+  expected="$(unit_file_single_value "${unit_path}" MemoryMax '')"
+  if [[ -n "${expected}" ]]; then
+    require_installed_unit_property "${unit}" MemoryMax \
+      "$(normalized_unit_bytes "${expected}")"
+  fi
+  expected="$(sed -n 's/^SuccessExitStatus=//p' "${unit_path}" | paste -sd' ' -)"
+  require_installed_unit_word_set "${unit}" SuccessExitStatus "${expected}"
+  expected="$(unit_file_single_value "${unit_path}" ExecStart '')"
+  [[ -n "${expected}" ]] || {
+    printf 'Installed unit is missing its single ExecStart: %s.\n' "${unit}" >&2
+    return 1
+  }
+  executable="${expected%% *}"
+  actual="$(installed_unit_property "${unit}" ExecStart)"
+  case "${actual}" in
+    "{ path=${executable} ; argv[]=${expected} ; ignore_errors=no ; "*) ;;
+    *)
+      printf 'Unsafe effective ExecStart for installed unit %s: %q.\n' "${unit}" "${actual}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${actual}" == *'} {'* ]] || [[ "${actual}" == *'/bin/true'* ]]; then
+    printf 'Effective ExecStart for installed unit %s contains another command.\n' "${unit}" >&2
+    return 1
+  fi
+  extended="$(installed_unit_property "${unit}" ExecStartEx)"
+  case "${extended}" in
+    "{ path=${executable} ; argv[]=${expected} ; flags= ; "*) ;;
+    *)
+      printf 'Unsafe effective ExecStartEx for installed unit %s: %q.\n' \
+        "${unit}" "${extended}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${extended}" == *'} {'* ]] || [[ "${extended}" == *'/bin/true'* ]]; then
+    printf 'Effective ExecStartEx for installed unit %s contains another command.\n' \
+      "${unit}" >&2
+    return 1
+  fi
+}
+
+verify_effective_security_dropin() {
+  local unit="$1"
+  local dropin_dir="${UNIT_ROOT}/${unit}.d"
+  local dropin="${dropin_dir}/zzzz-ops-agent-security.conf"
+  local source_dropin="${release_dir}/systemd/${unit}.d/zzzz-ops-agent-security.conf"
+  local dropin_paths section='' line property expected actual denied actual_lower
+  local credential_dropin=''
+  declare -A seen=()
+
+  verify_effective_unit_lifecycle "${unit}"
+  [[ -f "${dropin}" && ! -L "${dropin}" ]] \
+    && [[ "$(stat -c '%U:%G:%a:%h' "${dropin}")" == root:root:644:1 ]] \
+    && cmp -s "${source_dropin}" "${dropin}" || {
+      printf 'Installed security drop-in is not the exact root-owned release file: %s.\n' \
+        "${unit}" >&2
+      return 1
+    }
+  dropin_paths=" $(installed_unit_property "${unit}" DropInPaths) "
+  case "${dropin_paths}" in
+    *" ${dropin} "*) ;;
+    *)
+      printf 'PID 1 did not load the final security drop-in for %s.\n' "${unit}" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "${unit}" == ops-agentd.service ]]; then
+    credential_dropin="${dropin_dir}/zzzz-ops-agent-credential.conf"
+    [[ -f "${credential_dropin}" && ! -L "${credential_dropin}" ]] \
+      && [[ "$(stat -c '%U:%G:%a:%h' "${credential_dropin}")" == root:root:644:1 ]] \
+      && cmp -s "${credential_dropin}" <(printf '%s\n' \
+        '[Service]' \
+        'LoadCredentialEncrypted=deepseek_api_key:/etc/ops-agent/credentials/deepseek_api_key.cred') || {
+      printf 'Installed credential drop-in is not the exact root-owned policy file: %s.\n' \
+        "${unit}" >&2
+      return 1
+    }
+    case "${dropin_paths}" in
+      *" ${credential_dropin} "*) ;;
+      *)
+        printf 'PID 1 did not load the final credential drop-in for %s.\n' "${unit}" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" != *$'\r'* ]] || {
+      printf 'Security drop-in contains a carriage return: %s.\n' "${dropin}" >&2
+      return 1
+    }
+    case "${line}" in
+      ''|'#'*) continue ;;
+      '[Service]') section=service; continue ;;
+      '['*']') section=other; continue ;;
+    esac
+    [[ "${section}" == service && "${line}" == *=* ]] || {
+      printf 'Security drop-in contains an unexpected line: %s.\n' "${dropin}" >&2
+      return 1
+    }
+    property="${line%%=*}"
+    expected="${line#*=}"
+    [[ "${property}" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] \
+      && [[ -z "${seen["${property}"]:-}" ]] || {
+        printf 'Security drop-in has an unsafe or duplicate property %s: %s.\n' \
+          "${property}" "${dropin}" >&2
+        return 1
+      }
+    seen["${property}"]=true
+    case "${property}" in
+      SupplementaryGroups|RestrictAddressFamilies|ReadOnlyPaths|ReadWritePaths|InaccessiblePaths)
+        require_installed_unit_word_set "${unit}" "${property}" "${expected}"
+        ;;
+      RestrictNamespaces)
+        if [[ "${expected}" == yes || "${expected}" == no ]]; then
+          require_installed_unit_property "${unit}" "${property}" "${expected}"
+        else
+          require_installed_unit_word_set "${unit}" "${property}" "${expected}"
+        fi
+        ;;
+      LimitNOFILE)
+        require_installed_unit_property "${unit}" LimitNOFILE "${expected}"
+        require_installed_unit_property "${unit}" LimitNOFILESoft "${expected}"
+        ;;
+      MemoryMax)
+        require_installed_unit_property "${unit}" MemoryMax \
+          "$(normalized_unit_bytes "${expected}")"
+        ;;
+      CapabilityBoundingSet)
+        actual="$(installed_unit_property "${unit}" "${property}")"
+        if [[ "${expected}" == '~'* ]]; then
+          actual_lower=" ${actual,,} "
+          for denied in ${expected#~}; do
+            if [[ "${actual_lower}" == *" ${denied,,} "* ]]; then
+              printf 'Effective CapabilityBoundingSet for %s retained denied %s.\n' \
+                "${unit}" "${denied}" >&2
+              return 1
+            fi
+          done
+        else
+          if [[ "$(normalized_unit_word_set "${actual,,}")" \
+              != "$(normalized_unit_word_set "${expected,,}")" ]]; then
+            printf 'Unsafe effective CapabilityBoundingSet for %s.\n' "${unit}" >&2
+            return 1
+          fi
+        fi
+        ;;
+      *) require_installed_unit_property "${unit}" "${property}" "${expected}" ;;
+    esac
+  done <"${dropin}"
+  if [[ -z "${seen[ReadWritePaths]:-}" ]]; then
+    # An omitted write-path directive means this unit has no writable host
+    # path through the systemd mount namespace. Reject inherited or later
+    # drop-ins that silently add authority outside the release policy.
+    require_installed_unit_word_set "${unit}" ReadWritePaths ''
+  fi
+  if [[ -z "${seen[SupplementaryGroups]:-}" ]]; then
+    # SupplementaryGroups is additive authority. Units whose release policy
+    # omits it must not inherit arbitrary local groups from another drop-in.
+    require_installed_unit_word_set "${unit}" SupplementaryGroups ''
+  fi
+  # Every additional loaded service drop-in must either be an exact managed
+  # policy file or a root-owned host-wide compatibility reset whose complete
+  # syntax is in the narrow allowlist above. This closes execution-view and
+  # writable-directory authority that individual property comparisons cannot
+  # safely infer from an unknown drop-in.
+  verify_installed_unit_dropin_closure "${unit}" "${dropin}" "${credential_dropin}"
+}
+
 for unit in "${release_dir}"/systemd/*.service "${release_dir}"/systemd/*.timer "${release_dir}"/systemd/*.target; do
   [[ -f "${unit}" ]] || continue
   unit_name="$(basename "${unit}")"
-  if [[ "${MODE}" == join ]]; then
-    case "${unit_name}" in
-      ops-agent-server.service|ops-root-helper.service) ;;
-      ops-pve-root-helper.service)
-        [[ "${PVE_ENDPOINT}" == true ]] || continue
-        ;;
-      *) continue ;;
-    esac
-  elif [[ "${unit_name}" == ops-pve-root-helper.service ]] && [[ ! -x /usr/bin/pvesh ]]; then
-    # The PVE broker is not part of a non-PVE host's installed unit set. Keep
-    # any historical state/audit, but remove a stale managed unit on upgrade.
+  if [[ "${unit_name}" == ops-pve-root-helper.service ]] \
+      && [[ "${selected_pve_broker}" != true ]]; then
+    # Older endpoint releases could leave the managed PVE unit on a non-PVE
+    # enrollment. The complete unit path was snapshotted before enrollment, so
+    # disable/removal remains rollback-safe. State and audit are not removed.
+    validate_stale_pve_unit_for_cleanup
+    validate_stale_pve_dropin_for_cleanup
     disable_managed_unit_for_cleanup "${unit_name}"
     rm -f -- "${UNIT_ROOT}/${unit_name}"
     continue
+  fi
+  if [[ "${MODE}" == join ]]; then
+    case "${unit_name}" in
+      ops-agent-server.service|ops-root-helper.service) ;;
+      ops-pve-root-helper.service) ;;
+      *) continue ;;
+    esac
   fi
   install -o root -g root -m 0644 "${unit}" "${UNIT_ROOT}/${unit_name}"
 done
@@ -2193,7 +2812,9 @@ if [[ "${MODE}" == init ]] && [[ ! -f "${release_dir}/systemd/ops-systemd-helper
   rm -f -- "${UNIT_ROOT}/ops-systemd-helper.service"
 fi
 if [[ "${MODE}" == init ]]; then
-for existing_dropin in "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf; do
+for existing_dropin in \
+    "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf \
+    "${UNIT_ROOT}"/agentd-*.service.d/zzzz-ops-agent-*.conf; do
   [[ -f "${existing_dropin}" ]] || continue
   dropin_directory="$(basename "$(dirname "${existing_dropin}")")"
   dropin_name="$(basename "${existing_dropin}")"
@@ -2204,8 +2825,27 @@ for existing_dropin in "${UNIT_ROOT}"/ops-*.service.d/zzzz-ops-agent-*.conf; do
     rm -f -- "${existing_dropin}"
   fi
 done
+fi
 for dropin_dir in "${release_dir}"/systemd/*.service.d; do
   [[ -d "${dropin_dir}" ]] || continue
+  if [[ "$(basename "${dropin_dir}")" == ops-pve-root-helper.service.d ]] \
+      && [[ "${selected_pve_broker}" != true ]]; then
+    # Remove only our exact managed policy. A third-party drop-in keeps the
+    # directory non-empty and is deliberately preserved; state/audit live
+    # outside this systemd surface and are never part of this cleanup.
+    validate_stale_pve_dropin_for_cleanup
+    pve_managed_dropin="${UNIT_ROOT}/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf"
+    rm -f -- "${pve_managed_dropin}"
+    rmdir -- "${UNIT_ROOT}/ops-pve-root-helper.service.d" 2>/dev/null || true
+    continue
+  fi
+  if [[ "${MODE}" == join ]]; then
+    case "$(basename "${dropin_dir}")" in
+      ops-agent-server.service.d|ops-root-helper.service.d) ;;
+      ops-pve-root-helper.service.d) ;;
+      *) continue ;;
+    esac
+  fi
   destination_dropin="${UNIT_ROOT}/$(basename "${dropin_dir}")"
   install -d -o root -g root -m 0755 "${destination_dropin}"
   for dropin in "${dropin_dir}"/*.conf; do
@@ -2213,6 +2853,21 @@ for dropin_dir in "${release_dir}"/systemd/*.service.d; do
     install -o root -g root -m 0644 "${dropin}" "${destination_dropin}/$(basename "${dropin}")"
   done
 done
+if [[ "${MODE}" == init ]]; then
+# Workload Source hosts need both the outer and inner bubblewrap processes to
+# see the read-only non-PID procfs files used to construct the second fixed
+# user namespace. Require that the final name-specific security drop-in says
+# ProcSubset=all. LXC hosts may also install type-wide service drop-ins such as
+# zzz-lxc-service.conf, so neither filenames nor file contents are execution
+# evidence. The runtime preflight below copies this exact installed file and
+# then treats only PID 1's normalized effective policy as authoritative.
+agentd_security_dropin="${UNIT_ROOT}/ops-agentd.service.d/zzzz-ops-agent-security.conf"
+if [[ ! -f "${agentd_security_dropin}" ]] || [[ -L "${agentd_security_dropin}" ]] \
+    || [[ "$(grep -Fxc 'ProcSubset=all' "${agentd_security_dropin}" || true)" != 1 ]] \
+    || grep -Eq '^ProcSubset=(pid|default)$' "${agentd_security_dropin}"; then
+  printf 'Installed ops-agentd security drop-in cannot support nested bubblewrap.\n' >&2
+  exit 1
+fi
 install -d -o root -g root -m 0755 "${UNIT_ROOT}/ops-agentd.service.d"
 cat >"${UNIT_ROOT}/ops-agentd.service.d/zzzz-ops-agent-credential.conf" <<'EOF'
 [Service]
@@ -2269,6 +2924,30 @@ maybe_inject_install_failure activation
 
 systemd-tmpfiles --create "${TMPFILES_ROOT}/ops-agent.conf"
 systemctl daemon-reload
+
+if [[ "${MODE}" == init ]]; then
+  effective_units=(
+    agentd-approval-reviewer.service
+    agentd-client-gateway.service
+    agentd-guardian.service
+    agentd-plugin-lease-broker.service
+    ops-agentd.service
+    ops-agent-server.service
+    ops-root-helper.service
+    ops-agent-healthcheck.service
+  )
+  if [[ -x /usr/bin/pvesh ]]; then
+    effective_units+=(ops-pve-root-helper.service)
+  fi
+else
+  effective_units=(ops-agent-server.service ops-root-helper.service)
+  if [[ "${PVE_ENDPOINT}" == true ]]; then
+    effective_units+=(ops-pve-root-helper.service)
+  fi
+fi
+for effective_unit in "${effective_units[@]}"; do
+  verify_effective_security_dropin "${effective_unit}"
+done
 
 stage_bundled_source_plugin() {
   local source_name="$1"
@@ -2440,33 +3119,483 @@ if [[ "${MODE}" == init ]]; then
 fi
 maybe_inject_install_failure plugins
 
+run_bwrap_service_preflight() (
+  set -euo pipefail
+
+  local bwrap_probe_unit_path=""
+  local bwrap_probe_unit=""
+  local bwrap_probe_dropin_dir=""
+  local bwrap_probe_security_dropin=""
+  local bwrap_probe_lifecycle_dropin=""
+  local bwrap_probe_driver=""
+  local bwrap_probe_nonce=""
+  local bwrap_probe_nonce_value=""
+  local bwrap_probe_loaded=false
+
+  cleanup_bwrap_service_preflight() {
+    local status="$1"
+    local cleanup_failed=false
+    local load_state=""
+    trap - EXIT HUP INT TERM
+    set +e
+    if [[ "${bwrap_probe_loaded}" == true ]]; then
+      systemctl stop "${bwrap_probe_unit}" >/dev/null 2>&1 || cleanup_failed=true
+      systemctl reset-failed "${bwrap_probe_unit}" >/dev/null 2>&1 \
+        || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_lifecycle_dropin}" ]]; then
+      rm -f -- "${bwrap_probe_lifecycle_dropin}" || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_security_dropin}" ]]; then
+      rm -f -- "${bwrap_probe_security_dropin}" || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_dropin_dir}" ]] && [[ -d "${bwrap_probe_dropin_dir}" ]]; then
+      rmdir -- "${bwrap_probe_dropin_dir}" || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_unit_path}" ]]; then
+      rm -f -- "${bwrap_probe_unit_path}" || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_driver}" ]]; then
+      rm -f -- "${bwrap_probe_driver}" || cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_nonce}" ]]; then
+      rm -f -- "${bwrap_probe_nonce}" || cleanup_failed=true
+    fi
+    if { [[ -n "${bwrap_probe_lifecycle_dropin}" ]] \
+          && { [[ -e "${bwrap_probe_lifecycle_dropin}" ]] \
+            || [[ -L "${bwrap_probe_lifecycle_dropin}" ]]; }; } \
+        || { [[ -n "${bwrap_probe_security_dropin}" ]] \
+          && { [[ -e "${bwrap_probe_security_dropin}" ]] \
+            || [[ -L "${bwrap_probe_security_dropin}" ]]; }; } \
+        || { [[ -n "${bwrap_probe_dropin_dir}" ]] \
+          && { [[ -e "${bwrap_probe_dropin_dir}" ]] || [[ -L "${bwrap_probe_dropin_dir}" ]]; }; } \
+        || { [[ -n "${bwrap_probe_unit_path}" ]] \
+          && { [[ -e "${bwrap_probe_unit_path}" ]] || [[ -L "${bwrap_probe_unit_path}" ]]; }; }; then
+      cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_driver}" ]] \
+        && { [[ -e "${bwrap_probe_driver}" ]] || [[ -L "${bwrap_probe_driver}" ]]; }; then
+      cleanup_failed=true
+    fi
+    if [[ -n "${bwrap_probe_nonce}" ]] \
+        && { [[ -e "${bwrap_probe_nonce}" ]] || [[ -L "${bwrap_probe_nonce}" ]]; }; then
+      cleanup_failed=true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
+    if [[ -n "${bwrap_probe_unit}" ]]; then
+      load_state="$(systemctl show --no-pager --property=LoadState --value \
+        "${bwrap_probe_unit}" 2>/dev/null || true)"
+      [[ "${load_state}" == not-found ]] || cleanup_failed=true
+    fi
+    if [[ "${cleanup_failed}" == true ]]; then
+      printf 'Could not completely remove the static bubblewrap preflight unit.\n' >&2
+      status=1
+    fi
+    exit "${status}"
+  }
+
+  pid1_unit_property() {
+    local unit="$1"
+    local property="$2"
+    local value
+    if ! value="$(systemctl show --no-pager --property="${property}" --value "${unit}")"; then
+      printf 'PID 1 did not return %s for %s.\n' "${property}" "${unit}" >&2
+      return 1
+    fi
+    if [[ "${value}" == *$'\n'* ]]; then
+      printf 'PID 1 returned a multi-line %s for %s.\n' "${property}" "${unit}" >&2
+      return 1
+    fi
+    printf '%s' "${value}"
+  }
+
+  require_pid1_unit_property() {
+    local unit="$1"
+    local property="$2"
+    local expected="$3"
+    local actual
+    actual="$(pid1_unit_property "${unit}" "${property}")"
+    if [[ "${actual}" != "${expected}" ]]; then
+      printf 'Unsafe effective %s for %s: expected %q, got %q.\n' \
+        "${property}" "${unit}" "${expected}" "${actual}" >&2
+      return 1
+    fi
+  }
+
+  pid1_word_sets_equal() {
+    local left="$1"
+    local right="$2"
+    local word existing seen
+    local -a left_words=()
+    local -a right_words=()
+    local -a left_unique=()
+    local -a right_unique=()
+    read -r -a left_words <<<"${left}"
+    read -r -a right_words <<<"${right}"
+    if ((${#left_words[@]} > 0)); then
+      for word in "${left_words[@]}"; do
+        [[ -n "${word}" ]] || continue
+        seen=false
+        if ((${#left_unique[@]} > 0)); then
+          for existing in "${left_unique[@]}"; do
+            if [[ "${existing}" == "${word}" ]]; then
+              seen=true
+              break
+            fi
+          done
+        fi
+        [[ "${seen}" == true ]] || left_unique+=("${word}")
+      done
+    fi
+    if ((${#right_words[@]} > 0)); then
+      for word in "${right_words[@]}"; do
+        [[ -n "${word}" ]] || continue
+        seen=false
+        if ((${#right_unique[@]} > 0)); then
+          for existing in "${right_unique[@]}"; do
+            if [[ "${existing}" == "${word}" ]]; then
+              seen=true
+              break
+            fi
+          done
+        fi
+        [[ "${seen}" == true ]] || right_unique+=("${word}")
+      done
+    fi
+    ((${#left_unique[@]} == ${#right_unique[@]})) || return 1
+    if ((${#left_unique[@]} > 0)); then
+      for word in "${left_unique[@]}"; do
+        seen=false
+        for existing in "${right_unique[@]}"; do
+          if [[ "${existing}" == "${word}" ]]; then
+            seen=true
+            break
+          fi
+        done
+        [[ "${seen}" == true ]] || return 1
+      done
+    fi
+    return 0
+  }
+
+  require_pid1_unit_word_set() {
+    local unit="$1"
+    local property="$2"
+    local expected="$3"
+    local actual
+    actual="$(pid1_unit_property "${unit}" "${property}")"
+    if ! pid1_word_sets_equal "${actual}" "${expected}"; then
+      printf 'Unsafe effective %s for %s: expected set %q, got %q.\n' \
+        "${property}" "${unit}" "${expected}" "${actual}" >&2
+      return 1
+    fi
+  }
+
+  require_pid1_unit_word_sets_equal() {
+    local left_unit="$1"
+    local right_unit="$2"
+    local property="$3"
+    local left right
+    left="$(pid1_unit_property "${left_unit}" "${property}")"
+    right="$(pid1_unit_property "${right_unit}" "${property}")"
+    if ! pid1_word_sets_equal "${left}" "${right}"; then
+      printf 'Effective %s differs between %s (%q) and %s (%q).\n' \
+        "${property}" "${left_unit}" "${left}" "${right_unit}" "${right}" >&2
+      return 1
+    fi
+  }
+
+  require_pid1_unit_exec_start() {
+    local unit="$1"
+    local executable="$2"
+    local expected_argv="$3"
+    local actual extended
+    actual="$(pid1_unit_property "${unit}" ExecStart)"
+    case "${actual}" in
+      "{ path=${executable} ; argv[]=${expected_argv} ; ignore_errors=no ; "*) ;;
+      *)
+        printf 'Unsafe effective ExecStart for %s: %q.\n' "${unit}" "${actual}" >&2
+        return 1
+        ;;
+    esac
+    if [[ "${actual}" == *'} {'* ]] || [[ "${actual}" == *'/bin/true'* ]]; then
+      printf 'Effective ExecStart for %s contains another command.\n' "${unit}" >&2
+      return 1
+    fi
+    extended="$(pid1_unit_property "${unit}" ExecStartEx)"
+    case "${extended}" in
+      "{ path=${executable} ; argv[]=${expected_argv} ; flags= ; "*) ;;
+      *)
+        printf 'Unsafe effective ExecStartEx for %s: %q.\n' "${unit}" "${extended}" >&2
+        return 1
+        ;;
+    esac
+    if [[ "${extended}" == *'} {'* ]] || [[ "${extended}" == *'/bin/true'* ]]; then
+      printf 'Effective ExecStartEx for %s contains another command.\n' "${unit}" >&2
+      return 1
+    fi
+  }
+
+  bwrap_probe_unit_path="$(mktemp /run/systemd/system/ops-agent-bwrap-probe-XXXXXX.service)"
+  bwrap_probe_unit="$(basename "${bwrap_probe_unit_path}")"
+  trap 'cleanup_bwrap_service_preflight "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ ! "${bwrap_probe_unit}" =~ ^ops-agent-bwrap-probe-[A-Za-z0-9]+\.service$ ]]; then
+    printf 'mktemp returned an unsafe static bubblewrap probe unit name.\n' >&2
+    return 1
+  fi
+
+  bwrap_probe_dropin_dir="/run/systemd/system/${bwrap_probe_unit}.d"
+  bwrap_probe_security_dropin="${bwrap_probe_dropin_dir}/zzzz-ops-agent-security.conf"
+  bwrap_probe_lifecycle_dropin="${bwrap_probe_dropin_dir}/zzzz-ops-agent-zz-preflight.conf"
+  bwrap_probe_driver="/run/systemd/system/${bwrap_probe_unit%.service}-driver"
+  bwrap_probe_nonce="$(mktemp /run/ops-agent/agentd/.install-bwrap-probe-XXXXXX.nonce)"
+  bwrap_probe_nonce_value="ops-agent-nested-bwrap:${bwrap_probe_unit}"
+  chown root:"${SERVICE_GROUP}" "${bwrap_probe_nonce}"
+  chmod 0620 "${bwrap_probe_nonce}"
+  install -d -o root -g root -m 0755 "${bwrap_probe_dropin_dir}"
+  install -o root -g root -m 0644 "${agentd_security_dropin}" \
+    "${bwrap_probe_security_dropin}"
+  cmp -s "${agentd_security_dropin}" "${bwrap_probe_security_dropin}" || {
+    printf 'Static bubblewrap probe did not receive the final ops-agentd security policy.\n' >&2
+    return 1
+  }
+
+  # Keep the executed payload in a unique root-owned file so PID 1's normalized
+  # ExecStart has one short, exact argv to validate. The inner read-only root
+  # exposes exactly one pre-created root-owned nonce file as writable; direct
+  # exact content plus post-run type/owner/mode checks prove the probe actually
+  # executed rather than being skipped by a global condition. The nested shell
+  # receives literal `$$` from this file directly; there is no systemd dollar
+  # expansion between the driver and the inner shell.
+  cat >"${bwrap_probe_driver}" <<EOF
+#!/bin/sh
+exec /usr/bin/bwrap --die-with-parent --sync-fd 1 --unshare-user --unshare-ipc --unshare-pid --unshare-net --cap-drop ALL --bind / / --proc /proc --dev /dev -- /usr/bin/bwrap --die-with-parent --new-session --unshare-user --unshare-ipc --unshare-pid --unshare-net --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --bind ${bwrap_probe_nonce} ${bwrap_probe_nonce} --proc /proc --dev /dev --clearenv -- ${SANDBOX_PRLIMIT} --as=1073741824:1073741824 --core=0:0 --cpu=5:5 --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/sh -ceu '[ "\$\$" -eq 1 ]; /bin/sleep 300 & printf %s ${bwrap_probe_nonce_value} > ${bwrap_probe_nonce}'
+EOF
+  chown root:root "${bwrap_probe_driver}"
+  chmod 0755 "${bwrap_probe_driver}"
+
+  # This is a real static service fragment under /run, not a transient unit.
+  cat >"${bwrap_probe_unit_path}" <<'EOF'
+[Unit]
+Description=Pi Ops Agent nested bubblewrap installation preflight
+
+[Service]
+EOF
+
+  # The probe owns a unit-name-specific override, but file names and ordering
+  # are not accepted as proof. Empty assignments reset inherited conditions and
+  # exec command lists before pinning the root-owned driver; PID 1's effective
+  # properties and the nonce below remain the only execution evidence.
+  # ExitType=cgroup keeps the unit active until the complete nested process tree
+  # is gone; RuntimeMaxSec and TimeoutStopSec bound a stuck probe and cleanup.
+  cat >"${bwrap_probe_lifecycle_dropin}" <<EOF
+[Unit]
+ConditionPathExists=
+AssertPathExists=
+
+[Service]
+Type=exec
+ExitType=cgroup
+User=ops-agent
+Group=ops-agent
+UMask=0077
+RemainAfterExit=no
+Restart=no
+TimeoutStartSec=10s
+RuntimeMaxSec=30s
+TimeoutStopSec=10s
+KillMode=control-group
+ExecCondition=
+ExecStartPre=
+ExecStart=
+ExecStart=${bwrap_probe_driver}
+ExecStartPost=
+EOF
+  chown root:root "${bwrap_probe_unit_path}"
+  chmod 0644 "${bwrap_probe_unit_path}"
+  chown root:root "${bwrap_probe_lifecycle_dropin}"
+  chmod 0644 "${bwrap_probe_lifecycle_dropin}"
+  if [[ "$(stat -c '%U:%G:%a' "${bwrap_probe_unit_path}")" != root:root:644 ]] \
+      || [[ "$(stat -c '%U:%G:%a' "${bwrap_probe_dropin_dir}")" != root:root:755 ]] \
+      || [[ "$(stat -c '%U:%G:%a' "${bwrap_probe_security_dropin}")" != root:root:644 ]] \
+      || [[ "$(stat -c '%U:%G:%a' "${bwrap_probe_lifecycle_dropin}")" != root:root:644 ]] \
+      || [[ "$(stat -c '%U:%G:%a' "${bwrap_probe_driver}")" != root:root:755 ]] \
+      || [[ "$(stat -c '%U:%G:%a:%h:%s' "${bwrap_probe_nonce}")" \
+        != "root:${SERVICE_GROUP}:620:1:0" ]]; then
+    printf 'Static bubblewrap preflight unit metadata is unsafe.\n' >&2
+    return 1
+  fi
+
+  systemctl daemon-reload
+  bwrap_probe_loaded=true
+  require_pid1_unit_property "${bwrap_probe_unit}" FragmentPath "${bwrap_probe_unit_path}"
+  require_pid1_unit_property ops-agentd.service FragmentPath \
+    "${UNIT_ROOT}/ops-agentd.service"
+  local probe_dropin_paths
+  probe_dropin_paths=" $(pid1_unit_property "${bwrap_probe_unit}" DropInPaths) "
+  for expected_dropin in "${bwrap_probe_security_dropin}" \
+      "${bwrap_probe_lifecycle_dropin}"; do
+    case "${probe_dropin_paths}" in
+      *" ${expected_dropin} "*) ;;
+      *)
+        printf 'PID 1 did not load expected bubblewrap probe drop-in %s.\n' \
+          "${expected_dropin}" >&2
+        return 1
+        ;;
+    esac
+  done
+  case " $(pid1_unit_property ops-agentd.service DropInPaths) " in
+    *" ${agentd_security_dropin} "*) ;;
+    *)
+      printf 'PID 1 did not load the final ops-agentd security drop-in.\n' >&2
+      return 1
+      ;;
+  esac
+
+  local -a fixed_effective_properties=(
+    "User=${SERVICE_USER}"
+    "Group=${SERVICE_GROUP}"
+    "UMask=0077"
+    "NoNewPrivileges=yes"
+    "PrivateTmp=yes"
+    "PrivateDevices=yes"
+    "ProtectSystem=strict"
+    "ProtectHome=yes"
+    "ProtectKernelTunables=yes"
+    "ProtectKernelModules=yes"
+    "ProtectKernelLogs=yes"
+    "ProtectControlGroups=yes"
+    "ProtectClock=yes"
+    "ProtectHostname=yes"
+    "ProtectProc=invisible"
+    "ProcSubset=all"
+    "RestrictRealtime=yes"
+    "RestrictSUIDSGID=yes"
+    "LockPersonality=yes"
+    "SystemCallArchitectures=native"
+  )
+  local -a equivalent_effective_properties=(
+    User Group UMask NoNewPrivileges PrivateTmp PrivateDevices
+    ProtectSystem ProtectHome ProtectKernelTunables ProtectKernelModules ProtectKernelLogs
+    ProtectControlGroups ProtectClock ProtectHostname ProtectProc ProcSubset RestrictRealtime
+    RestrictSUIDSGID LockPersonality SystemCallArchitectures
+  )
+  local -a fixed_effective_word_sets=(
+    "SupplementaryGroups=ops-agent-client"
+    "RestrictNamespaces=user ipc net mnt pid"
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+    "CapabilityBoundingSet="
+    "ReadWritePaths=/run/ops-agent/agentd /var/lib/ops-agent/workspaces /var/lib/ops-agent/sessions /var/lib/ops-agent/registry /var/lib/ops-agent/machines /var/lib/ops-agent/pi /var/log/ops-agent/agentd /proc/sys/user/max_user_namespaces"
+    "ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent"
+    "InaccessiblePaths=-/run/ops-agent/helper -/etc/ops-agent/workloads -/etc/pve -/run/docker.sock -/var/run/docker.sock"
+  )
+  local expectation property expected agentd_value probe_value
+  for expectation in "${fixed_effective_properties[@]}"; do
+    property="${expectation%%=*}"
+    expected="${expectation#*=}"
+    require_pid1_unit_property ops-agentd.service "${property}" "${expected}"
+    require_pid1_unit_property "${bwrap_probe_unit}" "${property}" "${expected}"
+  done
+  for expectation in "${fixed_effective_word_sets[@]}"; do
+    property="${expectation%%=*}"
+    expected="${expectation#*=}"
+    require_pid1_unit_word_set ops-agentd.service "${property}" "${expected}"
+    require_pid1_unit_word_set "${bwrap_probe_unit}" "${property}" "${expected}"
+    require_pid1_unit_word_sets_equal ops-agentd.service "${bwrap_probe_unit}" \
+      "${property}"
+  done
+  require_pid1_unit_property ops-agentd.service Type simple
+  require_pid1_unit_property ops-agentd.service ExitType main
+  require_pid1_unit_property ops-agentd.service KillMode control-group
+  require_pid1_unit_property ops-agentd.service Restart always
+  require_pid1_unit_property ops-agentd.service TimeoutStopUSec 20s
+  require_pid1_unit_property ops-agentd.service WorkingDirectory /var/lib/ops-agent
+  require_pid1_unit_property ops-agentd.service ExecCondition ''
+  require_pid1_unit_property ops-agentd.service ExecStartPre ''
+  require_pid1_unit_property ops-agentd.service ExecStartPost ''
+  require_pid1_unit_property ops-agentd.service EnvironmentFiles ''
+  require_pid1_unit_word_set ops-agentd.service Environment \
+    'NODE_ENV=production OPS_AGENT_CONFIG=/etc/ops-agent/agentd.json'
+  require_pid1_unit_exec_start ops-agentd.service \
+    /opt/pi-ops-agent/current/runtime/node \
+    '/opt/pi-ops-agent/current/runtime/node /opt/pi-ops-agent/current/dist/agentd/index.js'
+  require_pid1_unit_property "${bwrap_probe_unit}" Type exec
+  require_pid1_unit_property "${bwrap_probe_unit}" ExitType cgroup
+  require_pid1_unit_property "${bwrap_probe_unit}" KillMode control-group
+  require_pid1_unit_property "${bwrap_probe_unit}" RemainAfterExit no
+  require_pid1_unit_property "${bwrap_probe_unit}" Restart no
+  require_pid1_unit_property "${bwrap_probe_unit}" TimeoutStartUSec 10s
+  require_pid1_unit_property "${bwrap_probe_unit}" RuntimeMaxUSec 30s
+  require_pid1_unit_property "${bwrap_probe_unit}" TimeoutStopUSec 10s
+  require_pid1_unit_property "${bwrap_probe_unit}" ExecCondition ''
+  require_pid1_unit_property "${bwrap_probe_unit}" ExecStartPre ''
+  require_pid1_unit_property "${bwrap_probe_unit}" ExecStartPost ''
+  # systemd 255 exposes the complex Conditions/Asserts D-Bus structures as the
+  # literal "[unprintable]", even for an empty list. Do not misrepresent that
+  # value as normalized evidence. The unit-specific empty assignments above
+  # reset inherited probe conditions, and the exact nonce proves that this
+  # probe was not skipped. The real daemon's root-owned unit/drop-ins remain a
+  # deployment configuration boundary; its later start/health gate, rather
+  # than this preflight, detects a host-added condition that skips the daemon.
+  require_pid1_unit_exec_start "${bwrap_probe_unit}" "${bwrap_probe_driver}" \
+    "${bwrap_probe_driver}"
+  for property in "${equivalent_effective_properties[@]}"; do
+    agentd_value="$(pid1_unit_property ops-agentd.service "${property}")"
+    probe_value="$(pid1_unit_property "${bwrap_probe_unit}" "${property}")"
+    if [[ "${agentd_value}" != "${probe_value}" ]]; then
+      printf 'Static bubblewrap probe differs from effective ops-agentd %s.\n' \
+        "${property}" >&2
+      return 1
+    fi
+  done
+
+  if ! systemctl start "${bwrap_probe_unit}"; then
+    printf 'Static bubblewrap preflight service could not be started.\n' >&2
+    return 1
+  fi
+  local attempt active_state
+  active_state="$(pid1_unit_property "${bwrap_probe_unit}" ActiveState)"
+  for ((attempt=0; attempt<600; attempt++)); do
+    case "${active_state}" in
+      inactive|failed) break ;;
+      activating|active|deactivating)
+        sleep 0.1
+        active_state="$(pid1_unit_property "${bwrap_probe_unit}" ActiveState)"
+        ;;
+      *)
+        printf 'Static bubblewrap preflight entered unexpected state %s.\n' \
+          "${active_state}" >&2
+        return 1
+        ;;
+    esac
+  done
+  if ((attempt == 600)); then
+    printf 'Static bubblewrap preflight did not reach a terminal state before its bound.\n' >&2
+    return 1
+  fi
+  require_pid1_unit_property "${bwrap_probe_unit}" ActiveState inactive
+  require_pid1_unit_property "${bwrap_probe_unit}" SubState dead
+  require_pid1_unit_property "${bwrap_probe_unit}" Result success
+  require_pid1_unit_property "${bwrap_probe_unit}" ExecMainStatus 0
+  if [[ "$(stat -c '%U:%G:%a:%h:%s' "${bwrap_probe_nonce}")" \
+      != "root:${SERVICE_GROUP}:620:1:${#bwrap_probe_nonce_value}" ]] \
+      || [[ "$(<"${bwrap_probe_nonce}")" != "${bwrap_probe_nonce_value}" ]]; then
+    printf 'Static bubblewrap preflight did not produce its exact root-owned nonce.\n' >&2
+    return 1
+  fi
+)
+
 if [[ "${MODE}" == init ]]; then
-  # Probe the real service boundary, not merely the service UID. The workload
-  # sandbox needs a narrowly allow-listed set of namespaces and a writable
-  # namespaced user.max_user_namespaces knob so bwrap can deny nesting without
-  # making any host kernel tunable writable to the unprivileged service.
-  bwrap_probe_unit="ops-agent-bwrap-probe-${BASHPID}"
-  if ! systemd-run --quiet --wait --collect --unit="${bwrap_probe_unit}" \
-    --property="User=${SERVICE_USER}" --property="Group=${SERVICE_GROUP}" \
-    --property=NoNewPrivileges=yes --property=PrivateTmp=yes --property=PrivateDevices=yes \
-    --property=ProtectSystem=strict --property=ProtectHome=yes \
-    --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes \
-    --property=ProtectKernelLogs=yes --property=ProtectControlGroups=yes \
-    --property=ProtectClock=yes --property=ProtectHostname=yes \
-    --property=ProtectProc=invisible --property=ProcSubset=pid \
-    --property=RestrictRealtime=yes --property=RestrictSUIDSGID=yes \
-    --property=LockPersonality=yes --property=SystemCallArchitectures=native \
-    --property="RestrictNamespaces=user ipc net mnt pid" \
-    --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" \
-    --property=ReadWritePaths=/proc/sys/user/max_user_namespaces \
-    /usr/bin/bwrap --die-with-parent --new-session \
-    --unshare-user --unshare-ipc --unshare-pid --unshare-net \
-    --as-pid-1 --disable-userns --cap-drop ALL --ro-bind / / --proc /proc --dev /dev \
-    "${SANDBOX_PRLIMIT}" --as=1073741824:1073741824 --core=0:0 --cpu=5:5 \
-    --fsize=67108864:67108864 --nofile=128:128 --nproc=64:64 -- /bin/true \
-    >/dev/null 2>&1; then
+  # Bubblewrap's --disable-userns performs the authoritative postcondition:
+  # after entering the final user namespace it attempts another CLONE_NEWUSER
+  # and fails setup if that succeeds. Do not infer this from a proc sysctl read.
+  if ! run_bwrap_service_preflight; then
     printf '%s\n' \
       'bubblewrap cannot run inside the effective ops-agentd systemd boundary; required Source Workloads cannot run.' \
+      'Nested containment requires an outer bubblewrap PID 1 lifecycle barrier and an inner Source PID 1 with further user namespaces disabled.' \
       'Initialization is rolling back instead of starting without workload.base isolation.' >&2
     exit 1
   fi

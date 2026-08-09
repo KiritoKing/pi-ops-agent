@@ -155,8 +155,17 @@ exact digest 持有 shared invocation lease，直到 Client
 ID/digest；local session gateway 用真实 peer UID 重验 current registration，并把可预测的外部
 Session ID 变换到 UID+Adapter+digest namespace。相同字符串不能让 BotMux 或其他 Adapter 进入
 TUI session，digest 更新也不会继承旧 namespace。可执行 Source Adapter 则经保留网络、宿主用户权限和
-controlling TTY 的 bubblewrap PID namespace 启动；入口是 PID 1，`--die-with-parent
---disable-userns` 保证 detached/unref 后代不能在入口退出后越过 lease。这个 lifecycle
+controlling TTY 的双层固定 bubblewrap PID namespace 启动。outer bwrap 保留自己的默认 PID 1
+reaper，且只启动同一个固定 root-owned inner bwrap；inner 才使用 `--as-pid-1 --disable-userns`，
+让 Source 入口成为 inner PID 1 并关闭后续 userns。outer 以专用 `--sync-fd` 将只有其 PID 1
+持续持有的生命周期管道交给 runner，并通过有界 `--info-fd` 报告这个 init 的宿主 `child-pid`；
+runner 立即绑定该 PID 的 start identity。bubblewrap monitor 即使先返回 initial process 状态，
+Node 的 `close` 也必须等待 sync FD EOF，随后还要等 exact init identity 从 `/proc` 消失（或明确
+发生 PID reuse）。只有这两项都成立才确认 outer namespace（包括 detached/unref 后代）清空并
+释放 lease；sync error 不得让 identity wait 短路，初次 stat 不可读时只接受 PID 后续 ENOENT，
+info 无 authoritative PID 时保持 fail-stop。outer 本身不能使用 `--as-pid-1` 或
+提前 `--disable-userns`。两层都只创建 `user/pid/mnt`，不创建 network namespace；bwrap 的
+`--dev /dev` 自行构造最小 synthetic device view，禁止改成导入宿主 `/dev`。这个 lifecycle
 containment 不是无网络或文件系统 sandbox 声明。runner 不会执行 TUI
 snapshot 源码。唯有这个固定 profile 可请求
 `approval.submit.local`，且仍要求本地 TTY、reviewer 与 PASSWD submitter。BotMux 采用 immutable
@@ -206,13 +215,24 @@ describe 前后复查 current digest；invoke 则必须以真实 runtime UID 连
 为 Session 中的 exact digest 取得跨进程 shared invocation lease，并保持到所有 provider 请求、
 签名 status 处理与本地审计结束；runtime 永不直接读取 broker-only lock directory。Registry 的
 register/activate/deactivate 使用同一 plugin lock 的 non-blocking exclusive 端，因此 `current`
-从 A 切到 B 不可能穿过一个仍以 A 调用 provider 的 Workload invocation。固定 host 是 PID
-namespace 的 PID 1，且 Node permission mode 不开放 child process、namespace
-内禁止嵌套 userns；即使源码利用 runtime 缺陷产生后代，PID 1 退出时内核也会先清理整棵树。
-host 只请求 `user/ipc/pid/net/mnt`；agentd unit 的 `RestrictNamespaces=` 只放行同一集合，继续
+从 A 切到 B 不可能穿过一个仍以 A 调用 provider 的 Workload invocation。固定 host 使用双层
+bubblewrap：outer 的默认 PID 1 reaper 收拢 outer namespace，inner 才让 Source 入口成为 PID 1
+并禁止继续嵌套 userns；outer 在此之前只启动固定 root-owned inner bwrap。outer 还用专用
+`--sync-fd` 与有界 `--info-fd` 提供 PID 1 completion evidence；runner 不把 monitor 的
+initial-process exit 或单独的 FD EOF 当完成，必须继续等 exact init process identity 消失。即使
+源码利用 runtime 缺陷产生 detached 后代，runner 也不会在 outer reaper
+收完进程树前执行 managed release。当前 socket-backed registry lock 不持久跨 broker crash、强制
+断连或 runtime SIGKILL；该异常窗口在引入 supervisor/pidfd 或持久 quarantine 前属于明确限制。
+两层都只请求 `user/ipc/pid/net/mnt`；agentd unit 的 `RestrictNamespaces=` 只放行同一集合，继续
 拒绝 cgroup/UTS/time namespace。`ProtectHostname=yes` 保留 service 级 UTS 隔离；对
-`/proc/sys/user/max_user_namespaces` 的窄 `ReadWritePaths=` 例外只让 bwrap 在新 user namespace
-内把嵌套额度降为 1，非 root agentd 仍无权修改宿主 sysctl。
+`/proc/sys/user/max_user_namespaces` 的窄 `ReadWritePaths=` 例外只让两层固定 bwrap 建立 inner
+user namespace；inner 的 `--disable-userns` 在进入最终 namespace 前设置 namespaced quota，
+并以再次 `unshare(CLONE_NEWUSER)` 必须失败作为 postcondition。最终 procfs 显示的数值不是这条
+deny 的证明，非 root agentd 仍无权修改宿主 sysctl。为让该路径存在，agentd unit 固定使用
+`ProtectProc=invisible` 与 `ProcSubset=all`，不能退回会隐藏非 PID procfs 的 `ProcSubset=pid`。
+这里的 `invisible` 只隐藏其他 UID 的 PID 目录：same-UID 进程目录以及未被其他 hardening 屏蔽的
+非 PID procfs 全局元数据仍可见；后者除上述精确 sysctl 例外外保持只读。这不是 procfs
+confidentiality boundary，`PrivateDevices=yes` 与 `ProtectKernelTunables=yes` 仍必须保留。
 `workload.base`、PVE、
 Hermes/BotMux 运维都走这条 Source host 路径；旧 `.opspkg` catalog 和 OCI
 `managed-workload` executor 仅为 Hermes 兼容恢复保留。两条插件路径的迁移关系见
@@ -267,6 +287,9 @@ External conversation -> Adapter mapping -> AgentSession
 - 通用 `file.write`/`service.action` 的 Source 输入不能自报 provenance；Core 只接受实际
   `workload.base` caller，由 trusted provider 注入当前 plugin ID/digest。对应 standing scope 还要求
   Target 的 `authorization.baseWorkloadDigest` 精确相等；更新源码或换 caller 会安全回落到逐次审批；
+- `file.write` 的 root-owned policy 根本身可以是单独 filesystem 或 bind mount 的挂载点；broker
+  以拒绝 symlink/magic-link 的 `openat2` 取得该精确根的 fd 后，才从这个 fd 开始对所有后代强制
+  `NO_XDEV`，并继续绑定 parent/target 的 device + inode。根以下的嵌套挂载仍然拒绝；
 - 对 Source Workload，实际能力始终是 active plugin ID/kind/digest、descriptor 与 manifest 的
   exact capability 一致性、provider-name policy 的 requested-scope grant、server capability、Target
   资源 allowlist 与 standing scope 的交集；任一项变化都 fail closed。Session 只特判必需的
@@ -275,9 +298,9 @@ External conversation -> Adapter mapping -> AgentSession
 - 每个 Session 有自己的 workspace，bubblewrap 只将其绑定到 `/workspace`；
 - policy/capability revision 会写入受信 workspace context，并在工具调用和审批时再次绑定。
 
-当前 `SessionRegistry` 能原子固定绑定，但**尚未实现跨多个 Client connection 的持久化 writer
-lease**。同一 Session 不应同时由 TUI 和外部 Adapter 写入；Adapter 在现阶段必须自行串行化，
-跨平台 handoff 仍是待实现能力。
+当前 gateway 已在同一进程内为每个 canonical namespace 维护 process-global live-writer lease，
+因此多个 Client connection 不能同时写入同一 namespace。该 lease 不跨 gateway restart、多个 gateway
+实例或 Adapter handoff 持久化；这些场景会断开现有 writer，跨平台 handoff 仍是待实现能力。
 
 ## 一次模型 turn
 
@@ -444,6 +467,13 @@ plugin。初始化还必须先证明真实 bubblewrap/user namespace 可用于 S
 
 - `init`：controller 上安装 `agentd`、guardian、reviewer、TUI、本机 server、本机 core broker；
 - `join`：受管机器只安装 server + core broker，不复制模型、Session、reviewer 或 Adapter；
+- managed service 的磁盘 unit 不是最终执行证据：每个 service 都携带 unit-name-specific final
+  security drop-in，installer 在 `daemon-reload` 后以 PID 1 的 exact fragment/drop-in path、
+  identity/lifecycle/command/environment、typed condition/credential vector 和 security effective
+  vector 验证，并拒绝未落入固定 compatibility-reset allowlist 的额外 loaded drop-in。`init` 的集合是
+  reviewer、gateway、guardian、lease broker、agentd、server、core broker、healthcheck（按本机
+  `/usr/bin/pvesh` 加 PVE）；`join` 只有 server/core（按 signed enrollment + host fact 加 PVE）。
+  host-wide `service.d` override 不能让静态文件检查假通过，且 join 不继承 controller drop-in；
 - `join` 的 bearer bundle 不提供自身信任锚；endpoint 必须从独立已认证渠道取得 controller CA
   SHA-256 pin，并在验证 bundle 签名之前先匹配 bundle CA；
 - fresh `join` 把 controller/endpoint/CA pin/identity/PVE 绑定写入 root-owned
@@ -486,7 +516,7 @@ PVE 操作和当前执行覆盖见[PVE Workload](workloads/pve.md)。
 - 没有任意的进程内 Workload loader：获批 Source Workload 只在无网络 bubblewrap host 中运行，
   并只能调用 manifest requested scopes 获批的 provider-name typed policy；descriptor capability
   仍须与 manifest 精确一致但不产生 provider authority；真实 bwrap/userns 不可用时初始化失败；
-- 没有跨 Adapter 的持久化 Session writer lease；
+- 没有跨 gateway restart、多个 gateway 实例或 Adapter handoff 的持久化 Session writer lease；
 - Adapter inbound `text` 与 session `bind` 已有固定 FD 4 strict consumer；其他 session control、
   通用 outbound action mediator、持久 outbox 与远端 ApprovalIntent 尚未实现；
 - 没有模型 reviewer、命令 AST 拆分或基于 reviewer 风险判断的自动批准；只实现了显式精确

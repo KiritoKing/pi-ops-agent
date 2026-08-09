@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 import { constants } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, open, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runAdapter } from "../dist/runtime/adapter-run.js";
+import { parseProcStartTime } from "../dist/shared/bubblewrap-containment.js";
+
+const DETACHED_CAPTURE_TIMEOUT_MILLISECONDS = 2_000;
+const MAX_HOST_PROC_ENTRIES = 32_768;
+const MAX_HOST_CMDLINE_BYTES = 64 * 1024;
+const MAX_HOST_PROC_METADATA_BYTES = 64 * 1024;
 
 function argument(index, label) {
   const value = process.argv[index];
@@ -19,12 +25,139 @@ async function exists(path) {
   }
 }
 
-function hostProcessExists(pid) {
+function missingProcess(error) {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+async function waitFor(path) {
+  const deadline = Date.now() + DETACHED_CAPTURE_TIMEOUT_MILLISECONDS;
+  for (;;) {
+    if (await exists(path)) return;
+    if (Date.now() >= deadline) {
+      throw new Error("detached Adapter child did not reach its capture barrier");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function readBoundedFile(path, maximumBytes) {
+  const handle = await open(path, "r");
   try {
-    process.kill(pid, 0);
-    return true;
+    const buffer = Buffer.alloc(maximumBytes + 1);
+    let offset = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        offset,
+        buffer.length - offset,
+        null,
+      );
+      offset += bytesRead;
+      if (bytesRead === 0 || offset === buffer.length) break;
+    }
+    if (offset > maximumBytes) throw new Error("host procfs record exceeds its size limit");
+    return buffer.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function captureDetachedHostIdentity(resultDirectory) {
+  const readyPath = join(resultDirectory, "detached-ready");
+  const observedPath = join(resultDirectory, "detached-observed");
+  const token = `ops-agent-adapter-detached:${resultDirectory}`;
+  await waitFor(readyPath);
+  const driverCgroup = await readBoundedFile(
+    "/proc/self/cgroup",
+    MAX_HOST_PROC_METADATA_BYTES,
+  );
+  const driverNamespaces = {
+    pid: await readlink("/proc/self/ns/pid"),
+    mnt: await readlink("/proc/self/ns/mnt"),
+    user: await readlink("/proc/self/ns/user"),
+  };
+
+  const entries = await readdir("/proc");
+  const processEntries = entries.filter((entry) => /^[1-9][0-9]*$/u.test(entry));
+  if (processEntries.length > MAX_HOST_PROC_ENTRIES) {
+    throw new Error("host procfs exceeds the Adapter probe scan limit");
+  }
+  const matches = [];
+  for (const entry of processEntries) {
+    const pid = Number.parseInt(entry, 10);
+    try {
+      const commandLine = await readBoundedFile(
+        `/proc/${pid}/cmdline`,
+        MAX_HOST_CMDLINE_BYTES,
+      );
+      const arguments_ = commandLine.toString("utf8").split("\0").filter(Boolean);
+      if (!arguments_.includes(token)) continue;
+      const candidateCgroup = await readBoundedFile(
+        `/proc/${pid}/cgroup`,
+        MAX_HOST_PROC_METADATA_BYTES,
+      );
+      if (!candidateCgroup.equals(driverCgroup)) continue;
+      const status = (await readBoundedFile(
+        `/proc/${pid}/status`,
+        MAX_HOST_PROC_METADATA_BYTES,
+      )).toString("utf8");
+      const namespacePids = /^NSpid:\s+([^\n]+)/mu.exec(status)?.[1]
+        ?.trim().split(/\s+/u).map((value) => Number.parseInt(value, 10));
+      if (namespacePids === undefined || namespacePids.length < 3
+        || namespacePids[0] !== pid
+        || namespacePids.some((value) => !Number.isSafeInteger(value) || value < 1)) {
+        continue;
+      }
+      const namespaces = {
+        pid: await readlink(`/proc/${pid}/ns/pid`),
+        mnt: await readlink(`/proc/${pid}/ns/mnt`),
+        user: await readlink(`/proc/${pid}/ns/user`),
+      };
+      if (namespaces.pid === driverNamespaces.pid
+        || namespaces.mnt === driverNamespaces.mnt
+        || namespaces.user === driverNamespaces.user) {
+        continue;
+      }
+      const startTimeTicks = parseProcStartTime(
+        (await readBoundedFile(
+          `/proc/${pid}/stat`,
+          MAX_HOST_PROC_METADATA_BYTES,
+        )).toString("utf8"),
+        pid,
+      );
+      matches.push({ pid, startTimeTicks, namespacePids, namespaces });
+    } catch (error) {
+      if (!missingProcess(error)
+        && !(error instanceof Error && "code" in error && error.code === "EACCES")) {
+        throw error;
+      }
+    }
+  }
+  if (matches.length !== 1) {
+    throw new Error(`host procfs found ${matches.length} detached Adapter probe identities`);
+  }
+  const identity = matches[0];
+  await writeFile(
+    observedPath,
+    `${JSON.stringify(identity)}\n`,
+    { mode: 0o600 },
+  );
+  return identity;
+}
+
+async function hostProcessState(pid) {
+  try {
+    const status = await readFile(`/proc/${pid}/status`, "utf8");
+    const name = /^Name:\s+([^\n]+)/mu.exec(status)?.[1] ?? "unknown";
+    const parent = /^PPid:\s+([0-9]+)/mu.exec(status)?.[1] ?? "unknown";
+    const namespacePids = /^NSpid:\s+([^\n]+)/mu.exec(status)?.[1] ?? "unknown";
+    const state = /^State:\s+([A-Z])/mu.exec(status)?.[1] ?? "unknown";
+    const pending = /^SigPnd:\s+([a-f0-9]+)/mu.exec(status)?.[1] ?? "unknown";
+    const sharedPending = /^ShdPnd:\s+([a-f0-9]+)/mu.exec(status)?.[1] ?? "unknown";
+    return `${state};Name=${name};PPid=${parent};NSpid=${namespacePids};SigPnd=${pending};ShdPnd=${sharedPending}`;
   } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH");
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
   }
 }
 
@@ -59,6 +192,11 @@ async function main() {
     entrypoint: "adapter.mjs",
     snapshotPath,
   };
+  const detachedIdentity = captureDetachedHostIdentity(resultDirectory);
+  // The lease release path consumes this promise. Attach a handler now so an
+  // early Adapter failure cannot turn a later capture failure into an
+  // unhandled rejection while cleanup is still in progress.
+  void detachedIdentity.catch(() => undefined);
   let leaseHeld = false;
   let releases = 0;
   const dependencies = {
@@ -91,13 +229,28 @@ async function main() {
             leaseHeld = false;
             return;
           }
-          const hostPidText = await readFile(join(resultDirectory, "detached-host-pid"), "utf8");
-          const hostPid = Number.parseInt(hostPidText.trim(), 10);
-          if (!Number.isSafeInteger(hostPid) || hostPid <= 1) {
-            throw new Error("detached child did not report a valid host PID");
+          const captured = await detachedIdentity;
+          let currentStartTime;
+          try {
+            currentStartTime = parseProcStartTime(
+              await readFile(`/proc/${captured.pid}/stat`, "utf8"),
+              captured.pid,
+            );
+          } catch (error) {
+            if (missingProcess(error)) currentStartTime = undefined;
+            else throw error;
           }
-          if (hostProcessExists(hostPid)) {
-            throw new Error("exact-digest lease released before the PID namespace killed descendants");
+          if (currentStartTime !== captured.startTimeTicks) {
+            leaseHeld = false;
+            await writeFile(join(resultDirectory, "lease-released"), `${plugin.digest}\n`, { mode: 0o600 });
+            return;
+          }
+          const state = await hostProcessState(captured.pid);
+          if (state !== undefined) {
+            throw new Error(
+              `exact-digest lease released while detached host PID ${captured.pid}`
+                + ` starttime ${captured.startTimeTicks} remains in state ${state}`,
+            );
           }
           leaseHeld = false;
           await writeFile(join(resultDirectory, "lease-released"), `${plugin.digest}\n`, { mode: 0o600 });

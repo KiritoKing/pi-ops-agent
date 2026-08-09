@@ -14,8 +14,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const fileWriteResolveFlags = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS |
-	unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV
+const fileWriteRootResolveFlags = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS |
+	unix.RESOLVE_NO_SYMLINKS
+
+const fileWriteResolveFlags = fileWriteRootResolveFlags | unix.RESOLVE_NO_XDEV
 
 func validateAllowedParent(stat unix.Stat_t) error {
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != secureFileRequiredParentUID || stat.Mode&0o022 != 0 {
@@ -35,15 +37,27 @@ func openAllowedFileParent(path string, roots []string) (int, string, unix.Stat_
 	}
 	defer func() { _ = unix.Close(rootFD) }()
 
-	allowedRelative := strings.TrimPrefix(root, "/")
-	if allowedRelative == "" {
-		allowedRelative = "."
+	allowedFD := -1
+	if root == "/" {
+		allowedFD, err = unix.FcntlInt(uintptr(rootFD), unix.F_DUPFD_CLOEXEC, 0)
+	} else {
+		rootParentRelative := strings.TrimPrefix(filepath.Dir(root), "/")
+		if rootParentRelative == "" {
+			rootParentRelative = "."
+		}
+		rootParentFD, parentErr := unix.Openat2(rootFD, rootParentRelative, &unix.OpenHow{
+			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteResolveFlags,
+		})
+		if parentErr != nil {
+			return -1, "", unix.Stat_t{}, errors.New("configured file.write root parent crosses a mount or is not a symlink-free directory")
+		}
+		allowedFD, err = unix.Openat2(rootParentFD, filepath.Base(root), &unix.OpenHow{
+			Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteRootResolveFlags,
+		})
+		_ = unix.Close(rootParentFD)
 	}
-	allowedFD, err := unix.Openat2(rootFD, allowedRelative, &unix.OpenHow{
-		Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: fileWriteResolveFlags,
-	})
 	if err != nil {
-		return -1, "", unix.Stat_t{}, errors.New("configured file.write root is not a symlink-free single-filesystem directory")
+		return -1, "", unix.Stat_t{}, errors.New("configured file.write root is not a symlink-free directory")
 	}
 	defer func() { _ = unix.Close(allowedFD) }()
 

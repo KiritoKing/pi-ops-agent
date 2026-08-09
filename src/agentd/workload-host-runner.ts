@@ -9,6 +9,11 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  monitorBubblewrapReaper,
+  type BubblewrapReaperMonitor,
+  wrapWithBubblewrapProcessReaper,
+} from "../shared/bubblewrap-containment.js";
 import type { ActiveRuntimeSourcePlugin } from "../shared/source-plugin.js";
 import {
   encodeWorkloadFrame,
@@ -28,6 +33,16 @@ const HOST_PATH = fileURLToPath(new URL("../runtime/workload-host.js", import.me
 const STDERR_LIMIT_BYTES = 16 * 1024;
 const DESCRIBE_TIMEOUT_MILLISECONDS = 8_000;
 const INVOKE_TIMEOUT_MILLISECONDS = 135_000;
+
+export function wrapWorkloadHostWithProcessReaper(
+  bwrapPath: string,
+  innerArguments: readonly string[],
+): { executable: string; arguments: string[] } {
+  return wrapWithBubblewrapProcessReaper(bwrapPath, innerArguments, {
+    unshareIpc: true,
+    unshareNetwork: true,
+  });
+}
 
 export interface WorkloadProviderRequest {
   provider: string;
@@ -145,7 +160,7 @@ function sandboxArguments(
   bwrapPath: string,
   hostPath: string,
   expectedOwnerUid: number,
-): { executable: string; args: string[] } {
+): { executable: string; arguments: string[] } {
   if (process.platform !== "linux") {
     throw new Error("source workload execution requires Linux bubblewrap isolation");
   }
@@ -159,7 +174,7 @@ function sandboxArguments(
   const prlimit = fixedExecutable(prlimitCandidate, "prlimit");
   const snapshot = validateSnapshotTree(plugin, expectedOwnerUid);
 
-  const args = [
+  const innerArguments = [
     "--die-with-parent",
     "--new-session",
     // Keep this list aligned with ops-agentd.service RestrictNamespaces=.
@@ -191,15 +206,15 @@ function sandboxArguments(
     "--setenv", "PATH", "/nonexistent",
     "--chdir", "/plugin",
   ];
-  addLibraryMount(args, "/usr/lib");
-  addLibraryMount(args, "/usr/lib64");
-  addLibraryMount(args, "/lib", ["usr/lib", "/usr/lib"]);
-  addLibraryMount(args, "/lib64", ["usr/lib64", "/usr/lib64"]);
+  addLibraryMount(innerArguments, "/usr/lib");
+  addLibraryMount(innerArguments, "/usr/lib64");
+  addLibraryMount(innerArguments, "/lib", ["usr/lib", "/usr/lib"]);
+  addLibraryMount(innerArguments, "/lib64", ["usr/lib64", "/usr/lib64"]);
   if (existsSync("/etc/ld.so.cache")) {
     const cache = fixedExecutable("/etc/ld.so.cache", "dynamic loader cache");
-    args.push("--ro-bind", cache, "/etc/ld.so.cache");
+    innerArguments.push("--ro-bind", cache, "/etc/ld.so.cache");
   }
-  args.push(
+  innerArguments.push(
     "/runtime/prlimit",
     "--as=8589934592:8589934592",
     "--core=0:0",
@@ -223,7 +238,7 @@ function sandboxArguments(
     "--stack-size=512",
     "/runtime/workload-host.js",
   );
-  return { executable: bwrap, args };
+  return wrapWorkloadHostWithProcessReaper(bwrap, innerArguments);
 }
 
 function spawnSandboxedHost(
@@ -231,15 +246,30 @@ function spawnSandboxedHost(
   bwrapPath: string,
   hostPath = HOST_PATH,
   expectedOwnerUid = 0,
-): ChildProcessWithoutNullStreams {
+): { child: ChildProcessWithoutNullStreams; reaperMonitor: BubblewrapReaperMonitor } {
   const command = sandboxArguments(plugin, bwrapPath, hostPath, expectedOwnerUid);
-  return spawn(command.executable, command.args, {
+  const child = spawn(command.executable, command.arguments, {
     cwd: "/",
     env: {},
     shell: false,
     windowsHide: true,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: [
+      "pipe", "pipe", "pipe",
+      "ignore", "ignore", "ignore", "ignore", "ignore",
+      "pipe", "pipe",
+    ],
   });
+  if (child.stdin === null || child.stdout === null || child.stderr === null) {
+    child.kill("SIGKILL");
+    throw new Error("workload host requires piped standard streams");
+  }
+  const pipedChild = child as ChildProcessWithoutNullStreams;
+  try {
+    return { child: pipedChild, reaperMonitor: monitorBubblewrapReaper(child) };
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
 }
 
 export class BubblewrapWorkloadHostRunner implements WorkloadHostRunner {
@@ -300,7 +330,7 @@ export class BubblewrapWorkloadHostRunner implements WorkloadHostRunner {
   }
 
   async #exchange(options: ExchangeOptions): Promise<WorkloadHostMessage> {
-    const child = spawnSandboxedHost(
+    const { child, reaperMonitor } = spawnSandboxedHost(
       options.plugin,
       this.#bwrapPath,
       this.#hostPath,
@@ -421,11 +451,21 @@ export class BubblewrapWorkloadHostRunner implements WorkloadHostRunner {
       // the outer invocation/lease must not settle until that provider chain
       // has also settled.
       child.stdin.on("error", fail);
+      const failReaperMonitor = (): void => {
+        fail(new Error("bubblewrap reaper lifecycle monitoring failed"));
+      };
+      void reaperMonitor.syncEof.catch(failReaperMonitor);
+      void reaperMonitor.identity.catch(failReaperMonitor);
       child.once("error", fail);
       child.once("close", (code) => {
         childClosed = true;
         if (hardKill !== undefined) clearTimeout(hardKill);
-        void chain.catch((error: unknown) => { fail(error); }).then(() => {
+        void chain.catch((error: unknown) => { fail(error); }).then(async () => {
+          try {
+            await reaperMonitor.waitForExit();
+          } catch {
+            failReaperMonitor();
+          }
           if (settled) return;
           settled = true;
           clearTimeout(timer);

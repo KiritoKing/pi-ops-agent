@@ -125,10 +125,46 @@ installation pass. If non-privileged user namespaces are unavailable, the requir
 `workload.base` Source Workload cannot load safely: require `init` to fail closed and roll back
 the complete installation transaction. Do not start a restricted controller or substitute a host
 shell, in-process loader, Docker, sudo, or extra container privileges.
-The preflight must execute bwrap inside an equivalent transient `ops-agentd` systemd boundary, not
-only under the same UID. It must prove the exact `user/ipc/pid/net/mnt` allowlist, nested-userns
-denial, `ProtectHostname=yes`, and the narrowly writable namespaced
-`/proc/sys/user/max_user_namespaces` path work together.
+
+Treat every installer-managed service, not only `ops-agentd`, as a PID 1 effective-policy boundary.
+For `init`, require exact release units plus unit-name-specific final security drop-ins for reviewer,
+client gateway, guardian, plugin lease broker, agentd, server, core broker, and healthcheck; add the
+PVE broker only when `/usr/bin/pvesh` is executable. For `join`, require only server and core broker,
+adding PVE only when the signed enrollment bit and fixed local entrypoint match in both directions.
+Reject controller-only units/drop-ins on join and stale managed PVE units/drop-ins on non-PVE hosts.
+After `daemon-reload`, verify through `systemctl show` that PID 1 loaded the exact root-owned release
+unit/final drop-in and that identity, lifecycle, single ExecStart/argv with empty `ExecStartEx.flags`,
+environment, declared resource limits, scalar/list/path hardening, and capability bounds are exact;
+undeclared `ReadWritePaths` and `SupplementaryGroups` vectors must remain empty. Query typed PID 1
+D-Bus properties for exact Conditions/Asserts and Load/Set/Import credential vectors, verify the
+healthcheck `SuccessExitStatus` and exact agentd credential drop-in, and reject every extra loaded
+drop-in except a root-owned host-wide compatibility reset whose complete syntax is in the fixed
+narrow allowlist. Host-wide `service.d` drift or later unit overrides must fail the transaction;
+`cmp`, `systemctl cat`, and `systemd-analyze verify` alone are not sufficient.
+Keep the mode-applicable unit and drop-in directories inside the same rollback snapshot, including
+the PVE candidates before the conditional enrollment decision.
+
+The preflight must execute the real nested bwrap structure inside a unique, root-owned,
+short-lived static unit under `/run/systemd/system` that copies the final `ops-agentd` security
+drop-in and verifies PID 1's effective configuration, not only under the same UID. It must prove the outer default PID 1
+reaper can create only the exact `user/ipc/pid/net/mnt` set and start the fixed inner bwrap, the
+inner Source is PID 1 and denies later userns, and `ProtectHostname=yes` plus the narrowly writable
+namespaced `/proc/sys/user/max_user_namespaces` path work together. Require
+`PrivateDevices=yes`, `ProtectKernelTunables=yes`, `ProtectProc=invisible`, and `ProcSubset=all` in
+the effective service vector. `ProcSubset=all` is required for that sysctl path and exposes the
+otherwise-unmasked, read-only non-PID procfs metadata; `ProtectProc=invisible` hides only foreign-UID
+PID directories, not same-UID PIDs or that metadata. Treat bubblewrap's own failed
+post-setup `CLONE_NEWUSER` attempt as the deny proof; do not infer it from the numeric value visible
+through the final namespace's procfs. Runtime probes must additionally
+observe the outer PID 1-owned `--sync-fd` EOF and the bounded `--info-fd`-bound exact init process
+identity disappear before treating the process tree as drained. Sync failure must not bypass the
+identity wait; unreadable initial stat evidence requires later PID ENOENT, and missing authoritative
+info must remain fail-stop. Record that the current socket-backed registry lease is not yet
+crash-persistent across broker restart, forced disconnect, hard deadline, or runtime SIGKILL.
+Install a unit-name-specific late drop-in and verify the manager's effective scalar and list-valued
+properties with `systemctl show`; host-wide `service.d` resets must not turn a weakened probe into a
+pass. Remove the exact probe unit, drop-ins, driver, nonce, and manager state before the installation
+transaction completes or rolls back.
 
 Do not derive standing grants during initialization. If an administrator explicitly enables
 standing `file.write` or `service.action`, require `authorization.baseWorkloadDigest` to equal the
@@ -153,7 +189,8 @@ Use the current artifact names from the architecture document. Verify all applic
 
 - Before tagging, run the Linux release verifier for both amd64 and arm64. It must prove the tar
   and Debian versioned payload trees match, all seven current Go commands are static ELF binaries
-  for the declared architecture, the pinned Node 22 LTS runtime loads every compiled entrypoint,
+  for the declared architecture, the pinned Node 22 LTS runtime syntax-checks every compiled
+  JavaScript file and actually executes the Client/Reviewer smoke paths,
   and the payload includes Reviewer/Guardian, Adapter/Workload hosts, PVE, every bundled Source
   Plugin, all three Skills, systemd units and required docs while excluding the retired
   `ops-systemd-helper`. Require the complete two-architecture tar/deb/SBOM and compatibility
@@ -163,10 +200,26 @@ Use the current artifact names from the architecture document. Verify all applic
   group, run `npm run build` and then run `npm run test:adapter-linux-runtime` as root on Linux (or
   invoke the packaged `/opt/pi-ops-agent/current/scripts/probe-adapter-linux-runtime.sh`). Treat exit
   status `77` as unverified, never as pass. The release is blocked until real `/usr/bin/bwrap`
-  preserves the group-readable fixture and group socket, kills the detached child, and only then
-  permits the exact-digest lease to release. The Release workflow must enforce the same probe in a
-  disposable Ubuntu job that creates only the dedicated system identity fixture, leaves the runner's
-  default user unchanged, and is an explicit dependency of `publish`; never use `continue-on-error`.
+  preserves the group-readable fixture and group socket, uses an outer default bwrap reaper around
+  the inner Source PID 1, observes its dedicated lifecycle FD reach EOF and exact init identity disappear, confirms the detached child
+  has disappeared from the host-side driver's `/proc` by exact PID/starttime (never by trusting the
+  inner procfs `NSpid`), and only then permits the exact-digest lease to release. For an installed artifact, verify the wrapper is
+  self-contained and carries its fixture, socket, client and runtime driver scripts; a source-tree
+  probe cannot substitute for that packaged-payload check. The Release workflow must enforce the
+  same probe in a disposable Ubuntu job that creates only the dedicated system identity fixture,
+  leaves the runner's default user unchanged, and is an explicit dependency of `publish`; never use
+  `continue-on-error`. In the temporary read-only runtime, preserve the release module topology:
+  place the driver under `scripts/` and the compiled runner under sibling `dist/runtime/`, so its
+  `../dist/...` import cannot resolve outside the copied artifact or to a nonexistent path.
+- Exercise `file.write` with a root-owned allowed root that is itself a dedicated filesystem or bind
+  mount. The exact policy root may cross that mount boundary, but a symlink root, a nested mount below
+  it, a writable parent, or parent/target device-and-inode drift must still fail closed.
+- Prove the installer validated the complete mode-specific managed service set against PID 1 after
+  daemon reload. Check exact `FragmentPath` and final security `DropInPaths`, one release ExecStart,
+  empty pre/post/reload/stop hooks, exact typed Conditions/Asserts/credential vectors,
+  SuccessExitStatus, identity/environment/lifecycle, and exact scalar/list/path/capability hardening;
+  reject unrecognized extra loaded drop-ins. Do not accept the init union on join, the join intersection
+  on init, or a managed PVE service/drop-in on a non-PVE host.
 - The active release points to the intended immutable version; config and state remain outside
   the release directory.
 - `/usr/lib/ops-agent/agentd-json-config-helper` is a non-symlink `root:root 0755` executable and
@@ -192,12 +245,16 @@ Use the current artifact names from the architecture document. Verify all applic
   group read surface. Only the digest-approved immutable CAS is client-readable.
 - `/var/lib/ops-agent/plugins/invocation-leases` is `root:ops-agent-lease 0750`; every active
   plugin has a `root:ops-agent-lease 0640` lock file. Client-group runtimes must never open these
-  locks. They connect as their real UID to `/run/ops-agent/plugin-lease/lease.sock`, and the
+  locks. Verify the directory is exactly `0750`, not an inherited `2750` from its setgid registry
+  parent; GNU `chmod 0750` preserves directory setgid, so initialization must use an explicit
+  special-bit-clearing mode such as `00750`. They connect as their real UID to
+  `/run/ops-agent/plugin-lease/lease.sock`, and the
   peer-authenticated `ops-agent-lease` broker alone opens the lock and returns the exact active
   registration under a shared lease. Prove a Workload holds that connection through
   its provider call and a concurrent register fails before switching `current`, then succeeds only
   after the invocation drains. Also prove executable Adapter runner holds the exact digest lease
-  until its complete bubblewrap PID namespace exits (including a detached-child probe), and the
+  until the outer PID 1-owned sync FD and exact init identity prove its complete nested bubblewrap PID namespace has drained
+  (including a detached-child probe), and the
   compiled TUI Client holds its own lease if the runner exits. An old-digest pending plan must not
   be approved after a new digest is current. Also exercise the root submitter directly: after its
   first signed status it must extract one canonical runtime workload ID/digest and hold a separate
@@ -211,13 +268,16 @@ Use the current artifact names from the architecture document. Verify all applic
   then request and await the outer runner lease release before submit. The old Client must exit on
   both submit success and failure; a second TUI lease must still block the exclusive update.
   Also prove BotMux setup holds the exact `adapter.botmux` digest lease across setup, the approved
-  snapshot hardener, and restart; run the hardener as bubblewrap PID 1 so detached descendants are
-  gone before release, and prove lease loss aborts the current command and skips all later steps.
+  snapshot hardener, and restart; run the hardener as inner bubblewrap PID 1 with an outer default
+  reaper plus lifecycle-FD barrier so detached descendants are gone before release, and prove lease
+  loss aborts the current command and skips all later steps.
   Never loosen the lock directory DAC, delete a lease file, or stop isolation to force an update.
 - The complete sudo policy passes `visudo -cf`; after invalidating the timestamp, non-interactive
   probes for both fixed root helpers fail specifically because a password is required. A fragment-
   only syntax check is not sufficient. A root-side `sudo -U ops-agent-botmux -l` probe must also
-  confirm that the dedicated Adapter account has no sudo rule at all.
+  confirm that the dedicated Adapter account has no sudo rule at all. Do not infer this from sudo's
+  exit status: sudo 1.9 can return zero for the canonical negative result. Require exactly one
+  C-locale `is not allowed to run sudo` line and reject warnings, Defaults or command listings.
 - `agentd-server` requires HTTPS/mTLS and exposes only current policy capabilities.
 - The TUI creates an isolated session; model-visible input cannot approve, reject, or roll back.
 - A legacy status is marked `recoveryOnly=true` with no live plan only when the broker can strictly

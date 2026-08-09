@@ -53,6 +53,46 @@ review request 或用户意图。
 | Plugin | 严格 manifest、源码 tree limit、digest、不可变 snapshot、scope grant；独立非 root lease broker 以 `SO_PEERCRED` 绑定 runtime UID/plugin class，client 不可读 lock | 已批准 plugin 代码仍可能恶意；lease broker compromise 可阻塞更新但不能批准或取得 root |
 | Recovery | 写前准备、fsync mutation barrier、验证、自动回滚或 `RECOVERY_REQUIRED` | package/service/PVE 等操作不都是完整事务 |
 
+### systemd effective 配置也是安全边界
+
+Repository 内的 base unit 不是 PID 1 最终执行配置的充分证据。systemd 会合并 distribution、container
+runtime、`service.d` 与 unit-specific drop-in；其中一个更晚的 scalar override 或 list reset 就可能把
+`NoNewPrivileges`、`PrivateDevices`、namespace/path allowlist、capability bounding set 或实际
+`ExecStart` 改回更宽权限。攻击者不需要修改 Release 内的文件即可利用这种配置漂移，因此 installer
+不能只做 `cmp`、`systemd-analyze verify` 或检查某个 `zzzz` 文件存在。
+
+每个 installer-managed service 都必须随 Release 提供 unit-name-specific final
+`zzzz-ops-agent-security.conf`。Installer 在 `daemon-reload` 后同时验证两层证据：
+
+1. installed unit/drop-in 是 exact Release 的 `root:root 0644` non-symlink single-link file，PID 1
+   的 `FragmentPath`/`DropInPaths` 也确实引用它们；
+2. PID 1 返回的 lifecycle/identity/command/environment/resource limits 与 security
+   scalar/list/path/capability effective vector 和 Release 预期一致；`ExecStartEx.flags` 必须为空，
+   未声明 `ReadWritePaths`/`SupplementaryGroups` 时相应 effective set 也必须为空，且没有额外
+   pre/post/reload/stop command 或第二个 `ExecStart`。`Conditions`、`Asserts` 与 Load/Set/Import
+   credential vectors 必须通过 PID 1 的 typed D-Bus property 与 exact unit 比较，healthcheck 的
+   `SuccessExitStatus` 也必须精确；agentd generated credential drop-in 必须逐字、metadata 与 loaded
+   path 同时匹配。
+
+`DropInPaths` 不是只检查 final filename 是否出现：除 exact managed security/credential policy 外，
+installer 只接受固定 host-wide `service.d` 位置中 root-owned、non-symlink、single-link 且完整语法落入
+窄 compatibility-reset allowlist 的文件。未知 unit-specific drop-in，或能改变 root/image/bind view、
+新增 runtime/state directory、credential/environment/condition/command authority 的未验证 directive，
+必须在启动前 fail closed。该闭包检查与 effective property matrix 共同生效，不能用其中一层代替另一层。
+
+`init` 验证 controller 的 reviewer、gateway、guardian、lease broker、agentd、server、core broker
+与 healthcheck service；本机存在固定 `/usr/bin/pvesh` 时才验证 PVE broker。`join` 只验证
+server/core broker，signed PVE enrollment 与本机固定入口双向匹配时才加 PVE broker。把 controller
+全集装到 join、让非 PVE endpoint 保留 managed PVE unit/drop-in，或只验证两种 mode 的交集都会
+扩大 endpoint authority，必须 fail closed。PVE broker 的 final drop-in 必须保留唯一精确
+`/etc/pve` 写例外；它不能被复制到 core/server/agentd。
+
+这仍是 installation transaction 中的时点检查，不是对宿主 root 的持续 containment。安装后拥有
+systemd 控制面的主体可以写入更晚 drop-in 并 reload manager；因此该主体和 host root 本来就在此
+模型之外。运维上必须把 OS/container runtime 的 type-wide drop-in 变化当作 security-relevant
+upgrade，重新执行 mode-specific effective validation；静态文件仍逐字正确不能推翻 PID 1 的漂移
+证据。
+
 ## root 权限模型
 
 ### 普通操作
@@ -311,6 +351,11 @@ credential、release/libexec executable payload 与 systemd unit 控制面，也
 mode；Target allowlist 不能取消这些拒绝。此类管理只能新增专用 tagged operation，或在明确
 计划绑定的 manual root capsule 中逐次本地人工批准。
 
+配置的 `file.write` 允许根可以恰好位于独立 filesystem 或 bind mount 的挂载点。broker 从 `/`
+解析这个 root anchor 时拒绝 symlink 与 magic-link，但允许抵达该精确挂载点；取得 fd 以后，所有
+root 内部相对解析继续强制 `RESOLVE_NO_XDEV`，所以嵌套挂载不能扩大 policy。prepare/execute/verify
+仍绑定 parent 与 target 的 device/inode；允许 root 自身跨 mount 不等于允许授权路径在审批后漂移。
+
 Service workload policy 必须把实际 source caller 的 plugin ID 和精确 digest 绑定到 Target
 account、`system|user` manager、完整 unit allowlist 与 `reload|reset-failed|restart|start|stop` 集合；Core 不维护
 Hermes/BotMux 标准 ID 或 unit/path profile。业务 source descriptor 自己校验 profile，通用
@@ -398,9 +443,14 @@ root standing authority。规则是：
     `/run/ops-agent/plugin-lease/lease.sock`。独立的 `ops-agent-lease` broker 用 `SO_PEERCRED` 校验
     principal 与 plugin class，在 client 不可读的 `root:ops-agent-lease` lock directory 中取得 exact
     digest 的 non-blocking shared `flock`，并在同一锁下返回经重验的 runtime registration。Runtime
+    lock directory 必须精确为 `0750`；初始化在 `2750` registry parent 下创建它以后显式清除继承的
+    setgid（GNU `chmod` 需用 `00750` 才明确清零目录 special bits），再做 owner/group/mode 校验，
+    不能把 parent 的 client-plane 目录语义带入 broker-only 边界。
     必须保持 framed connection 到 host、provider、签名 status 处理和 audit 全部 settle，再显式
-    release 并等待 acknowledgement；断连、broker restart 或 hard deadline 都 fail closed。Client、
-    Agent 与 Adapter 永不直接打开 lock，abort 也不能在忽略 abort 的 provider 尚未结束时释放 lease。
+    release 并等待 acknowledgement；断连、broker restart 或 hard deadline 都使调用结果 fail
+    closed并触发 runtime termination。当前 socket lease 不持久跨这些异常，所以这里不声称 registry
+    lock 本身 crash-persistent；managed settlement 必须等 lifecycle barrier，异常残余窗口见“已知限制”。
+    Client、Agent 与 Adapter 永不直接打开 lock，abort 也不能在忽略 abort 的 provider 尚未结束时释放 lease。
 11. register、activate 与 deactivate 必须取得同一 lock 的 non-blocking exclusive `flock`。若 A
     invocation 已开始，更新不能切换 `current`，broker 将 pre-activation failure 幂等恢复为原
     状态；若更新先取得 exclusive lock，新的 A invocation 不能启动。Adapter runner 也必须把
@@ -410,11 +460,25 @@ root standing authority。规则是：
     防御；root submitter 还必须在第一次签名 status 后直接打开固定 registry lock、独立验证并持有
     同一 exact digest shared lease 到最终 action settle。Client 或 lease broker 退出不能缩短该边界，
     且 pending plan 不能获得 standing。
-12. Workload bwrap 只创建 `user/ipc/pid/net/mnt`，agentd systemd unit 的 namespace allowlist 必须
-    与之逐项一致并继续拒绝 cgroup/UTS/time。`ProtectHostname=yes` 不因 sandbox 放宽；
+12. Workload 的 outer/inner bwrap 都只创建 `user/ipc/pid/net/mnt`，agentd systemd unit 的 namespace
+    allowlist 必须与之逐项一致并继续拒绝 cgroup/UTS/time。outer 保留默认 PID 1 reaper，inner 才让
+    Source 成为 PID 1 并禁止后续 userns；outer 在这段窗口内只能启动同一个固定 root-owned inner
+    bwrap。outer 的专用 `--sync-fd` 必须只随 PID 1 生命周期持有；该 init 无论经正常 `ECHILD`
+    收拢还是 parent-death cleanup 终止，有界 `--info-fd` 都同时返回 outer init 的 `child-pid`；
+    runtime 绑定其 start identity，等 FD EOF 后还必须等该 exact process
+    identity 消失，才能把 monitor exit 视为完整完成。sync 失败仍先等 identity disappearance；首次
+    stat 不可读只允许保守等 authoritative PID 出现 ENOENT，info 未给出 PID 则 runtime/lease 保持
+    fail-stop。`ProtectHostname=yes` 不因 sandbox 放宽；
     `ReadWritePaths=/proc/sys/user/max_user_namespaces` 不授予宿主写权限，只允许无 capability 的
-    agentd 在新 user namespace 内让 bwrap 禁止后续嵌套。安装 preflight 必须在等价 transient
-    systemd boundary 内运行完整 bwrap probe，不能只在同 UID 的普通 shell 中探测。
+    agentd 建立这两层固定 user namespace；inner `--disable-userns` 自己以额外
+    `CLONE_NEWUSER` 必须失败验证后续嵌套已关闭，不能把最终 procfs 数值当作证明。service 与安装时
+    唯一、root-owned、位于 `/run/systemd/system` 的短生命周期 static probe 必须同时固定
+    `ProtectProc=invisible`、`ProcSubset=all`、`PrivateDevices=yes`
+    和 `ProtectKernelTunables=yes`；`all` 让 namespaced sysctl 路径存在，`invisible` 只隐藏其他 UID
+    的 PID 目录。same-UID PID 目录和未被其他 mount hardening 屏蔽的只读非 PID procfs 元数据仍
+    可见，不能把该组合描述为完整 `/proc` 隐藏。安装 preflight 必须在复制最终 security drop-in、
+    核验 PID 1 effective 配置且执行后精确清理的短生命周期 static systemd boundary 内运行完整双层
+    bwrap probe，不能只在同 UID 的普通 shell 中探测。
 
 初始化必须安装 `adapter.tui` 与 `workload.base` 才能工作，所以安装器把它们作为**需明确提示
 并批准的必需项**处理。`--approve-required-plugins` 只适用于外部自动化已经批准该 Release
@@ -505,8 +569,18 @@ Client 仍独立重读 active registration 并持 exact digest lease。
 `ops-agent-botmux` UID，且没有 root key/broker socket。批准仍是
 真实的用户级权限授信：TUI Client 可观察终端，BotMux 源码可读取其账号内 secret，因此摘要变化必须
 重新批准，且任何其他 Adapter 都不得继承 TUI 的本地审批能力。可执行 Source Adapter runner
-使用 `--unshare-pid --as-pid-1 --die-with-parent --disable-userns` 收拢完整进程树，再把 exact
-digest lease 持有到 bubblewrap 退出；源码入口的 detached/unref 后代不能越过更新边界。Adapter
+使用双层固定 bwrap 收拢完整进程树：outer 创建 user/PID namespace 并保留默认 PID 1 reaper，
+inner 再创建 user/PID namespace，以 `--as-pid-1 --disable-userns` 让源码入口成为 PID 1 并禁止
+后续嵌套；outer 在 inner 之前只执行同一个固定 root-owned bwrap。outer 以专用 `--sync-fd` 和
+有界 `--info-fd` 提供 PID 1 lifecycle evidence；runtime 不能把 bwrap monitor 先返回的 initial
+status 或 sync EOF 单独当完成，必须继续等 info 绑定的 exact init process identity 消失。exact
+digest lease 持有到该 barrier 确认 namespace 内连 detached/unref 后代都消失；outer 不能使用 `--as-pid-1` 或
+`--disable-userns`。Adapter 由 bwrap 的 `--dev /dev` 自己建立最小 synthetic device view，
+保证 `/dev/null` 等基础 stdio 可用而不重新暴露宿主设备；禁止改用
+`--dev-bind /dev /dev` 导入宿主 device tree；
+BotMux service 与真实 runtime probe 还固定 `ProtectProc=invisible + ProcSubset=all`：前者隐藏
+其他 UID 的 PID 目录，后者保留只读非 PID procfs 可见面并让精确 namespaced sysctl 例外可达；
+该全局 metadata 可见面是已知边界，不得宣称 `/proc` 完全不可见。
 仍保留业务所需网络、宿主文件系统与本地 UID 权限，不能把该 PID containment 夸大为无网络
 sandbox。声明式 TUI 不执行不可信源码，为保留 host sudo/PAM 而直接启动 compiled Client；Client
 自己再持有同一 exact adapter digest lease 到退出，因此 runner 崩溃不会让无租约 Client 留存。
@@ -522,7 +596,9 @@ Source Adapter、第一次 review 或非本地确认都不能触发这项交接�
 必须由目标 Linux 探针证明：专用账号在 primary Adapter group 不变时，经过真实 bwrap 后仍应能
 读取 `root:ops-agent-client 0640` 文件并连接 group `0660` socket。`npm run
 test:adapter-linux-runtime` 还把真实 bwrap 后的 FD 4 分片输入/FD 3 反向 completion 与 detached
-descendant 的宿主 PID 消失作为 lease release 的前置条件；positional argv/`@file` 永远不是备用
+descendant 的宿主 PID/starttime 消失作为 lease release 的前置条件；host-side driver 在 transient
+unit 自己的 procfs 视图中以唯一 argv token、同 cgroup 与嵌套 pid/mnt/user namespace evidence 捕获
+该身份，绝不把 inner `--proc` 所见的 `NSpid` 当作 host PID；positional argv/`@file` 永远不是备用
 消息入口；
 退出码 `77` 是未验证而不是通过。该探针失败时必须阻断发布，不能放宽 client socket/CAS mode 或
 把 Adapter 加入 `ops-agent` service group 来掩盖问题。Release workflow 必须在 disposable Ubuntu
@@ -543,8 +619,13 @@ release binary 应静态构建并排除 AppleDouble `._*` 文件。
 
 尚未实现或尚未完成迁移的安全能力：
 
+- Source Plugin registry lease 的 crash-persistent lifecycle proof：正常及受控错误路径已等待 outer
+  init exact identity 被 reap，但 broker restart、强制 socket 断连、runtime SIGKILL 或 workload
+  hard deadline 会释放当前 socket-backed `flock`。尚无把 supervisor/pidfd completion 或持久
+  quarantine 绑定进 broker unlock 的机制，因此不得把这条异常窗口描述成 crash-safe；
 - 更广的 Hermes/BotMux CLI、conversation 与 config content typed provider；
-- 跨 Client 的 Session writer lease；
+- 同一 gateway 进程内跨 Client connection 的 namespace live-writer lease 已实现，但尚无跨 gateway
+  restart、多个 gateway 实例或 Adapter handoff 的持久化 writer lease；
 - Adapter behavioral unions 已具备 strict parser 和动作级 grant 绑定，但尚无通用 action/session
   transport consumer、持久 outbox 或可信远端 ApprovalIntent；
 - 远端审批 Adapter 的完整可信身份链；

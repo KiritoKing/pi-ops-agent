@@ -58,9 +58,18 @@ registry 可供 agentd/TUI/Adapter 读取，root broker 注册时重新遍历 so
 Registry 只接受 snapshot 内普通文件，Core 不会在 agentd 进程中 import/eval Source Plugin。
 固定 Source Adapter runner 会重验 active runtime view/CAS、探测 strict descriptor、复查 current
 未漂移，再在非 root UID 下以 sanitized env、`shell:false` 运行 `.mjs` entrypoint。可执行 runtime 位于
-保留网络/宿主用户权限/TTY 的 bubblewrap PID namespace；descriptor 探测和正式入口都作为各自
-namespace 的 PID 1 且禁止嵌套 userns；
-这样 detached/unref 后代会在入口退出时由内核清理，不能让 runner 提前释放摘要 lease。精确
+保留网络/宿主用户权限/TTY 的双层 bubblewrap PID namespace；descriptor 探测和正式入口各自都由
+outer 默认 PID 1 reaper 包住固定 inner bwrap，inner 才让 Source 入口作为 PID 1 并禁止继续嵌套
+userns。outer 在 inner 启动前不能执行其他程序，也不能先使用 `--as-pid-1`/`--disable-userns`；
+专用 `--sync-fd` 只随 outer PID 1 生命周期持有；该 init 无论经正常 `ECHILD` 收拢还是
+parent-death cleanup 终止，有界 `--info-fd` 都返回并绑定其 exact process identity；runner 必须等
+EOF 和该 identity 消失，不能只等 monitor status 或 FD close；
+sync pipe 报错只改变运行结果，不能跳过 identity disappearance；首次 stat 不可读会降级为只等该
+authoritative PID 出现 ENOENT，info 连 PID 都无法给出则 invocation 保持 fail-stop，不把证据缺失
+当成清理完成；bwrap 的 `--dev /dev` 自行构造最小 synthetic devices，不能替换为
+`--dev-bind /dev /dev` 恢复宿主设备面；
+FD EOF 只说明 outer init 已终止；再等该 exact `/proc` identity 被回收或明确发生 PID reuse，才
+把 PID namespace 清空作为 lease settlement 证据，不能让 runner 提前释放摘要 lease。精确
 `adapter.tui` 只能提供不可执行 `profile.json`；runner 核对固定 local-TTY profile 与
 `approval.submit.local` grant 后在宿主 TTY 直接启动 compiled Client，Client 自己持有第二份 exact
 TUI digest lease 到退出以保留 sudo/PAM 和 runner-crash 安全性；所有其他 Adapter 强制 status-only。
@@ -84,16 +93,27 @@ lock；它以自身真实 UID 连接固定 `/run/ops-agent/plugin-lease/lease.so
 exact active digest 打开 root-owned `0640 root:ops-agent-lease` per-plugin lock、取得 shared
 `flock` 并返回同一把锁下重验的 runtime registration。Runtime 持有这条 framed connection，直到
 Source host、所有 trusted provider 请求、签名 status 处理和 agentd audit 全部 settle，最后发送
-显式 release 并等待 acknowledgement；断连、broker restart 或 workload hard deadline 都视为 lease
-丢失并 fail closed。Client-group process 永不读取 lock directory，abort 也不能与后台 callback
-竞速并提前释放 lease。Registry 的 register/activate/deactivate 必须取得同一 lock 的 non-blocking
-exclusive `flock`。
+显式 release 并等待 acknowledgement；断连、broker restart 或 workload hard deadline 都让当前
+调用结果 fail closed，并触发 runtime termination。需要区分 operation fail-closed 与 lock
+crash-persistence：当前 broker 的 in-memory socket lease 会在这些异常下释放，尚未把 outer-init
+pidfd/supervisor 或持久 quarantine 纳入 registry unlock 条件，所以只能保证 managed/graceful
+settlement 不早释，不能宣称 broker crash、强制断连或 runtime SIGKILL 下仍绝无短暂更新竞态。
+Client-group process 永不读取 lock directory，abort 也不能与后台 callback 竞速并提前释放 lease。
+Registry 的 register/activate/deactivate 必须取得同一 lock 的 non-blocking exclusive `flock`。
 
-Workload host 只创建 `user/ipc/pid/net/mnt` 五类必需 namespace，并使用
-`--as-pid-1 --die-with-parent --disable-userns`；不创建 cgroup/UTS namespace。`ops-agentd` 的
+Workload host 的 outer/inner 两层都只创建 `user/ipc/pid/net/mnt` 五类必需 namespace；outer
+保留默认 PID 1 reaper并以专用 `--sync-fd` + bounded `--info-fd` 提供 completion evidence，inner 使用
+`--as-pid-1 --die-with-parent --disable-userns`，不创建
+cgroup/UTS namespace。`ops-agentd` 的
 `RestrictNamespaces=` 与这份最小集合一致，`ProtectHostname=yes` 提供 service 级不可变 UTS 视图；
-`/proc/sys/user/max_user_namespaces` 的唯一可写 mount 只供 bwrap 在新 user namespace 内禁止继续嵌套，
-非 root agentd 对宿主 sysctl 没有 DAC/capability。Node permission mode 不开放 child process。
+`/proc/sys/user/max_user_namespaces` 的唯一可写 mount 只供固定 outer 建立 inner user namespace、
+再由 inner `--disable-userns` 设置 namespaced quota，并由 bwrap 自己验证下一次
+`CLONE_NEWUSER` 失败；不能用最终 procfs 显示的数值代替该 postcondition。
+unit 必须同时固定 `ProtectProc=invisible` 与 `ProcSubset=all`；`all` 使该 sysctl 路径存在，
+`invisible` 只隐藏其他 UID 的 PID 目录。same-UID PID 与未被其他 mount hardening 屏蔽的只读非 PID
+procfs 元数据仍可见，不能声称完整隐藏 `/proc`。除精确 sysctl 例外外继续保留
+`ProtectKernelTunables=yes`，并保留 `PrivateDevices=yes`。非 root agentd 对宿主 sysctl 没有
+DAC/capability。Node permission mode 不开放 child process。
 它的 namespace 同时是无网络/只读 CAS sandbox；Adapter 的 PID namespace 只解决进程树生命周期，
 不代表 Adapter 没有网络或宿主用户权限。
 

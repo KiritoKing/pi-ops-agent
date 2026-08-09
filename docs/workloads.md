@@ -52,12 +52,21 @@ typed input
 | `change.status` | `ops_change_status` | 查询 broker 权威状态 |
 | `breakglass.prepare` | `ops_breakglass_prepare` | root Target 的 manual root capsule prepare；永不 standing |
 
-当前 `workload.mjs` 会在一次性、无网络的 bubblewrap host 中加载，输出
+当前 `workload.mjs` 会在一次性、无网络的双层 bubblewrap host 中加载。outer 使用默认 PID 1
+reaper并只启动固定 inner bwrap；inner 才让 Source 成为 PID 1、禁止继续嵌套 userns。outer 的
+专用 `--sync-fd` 只随 PID 1 生命周期持有；该 init 无论经正常 `ECHILD` 收拢还是 parent-death
+cleanup 终止，有界 `--info-fd` 都返回并绑定该 init 的 exact process identity；runtime 必须等
+sync EOF 与该 identity 消失，才结束 invocation 或释放摘要 lease。Source 随后输出
 `agentd.workload/v1` descriptor，并通过 bounded IPC 编排 provider。源码不在 agentd 内 import，
 也不直接获得宿主能力；实际 Machine/Target、sandbox 与 change 行为仍由 Core 的 narrow typed
 provider 执行。Descriptor capability 必须与 manifest capability 精确一致，但 provider authority
 只来自 manifest `requestedScopes`：Core 以 provider name 查 policy，并要求覆盖全部 required scopes。
 Capability 与 provider 同名不会自动授权。
+
+若 sync 失败，runtime 仍先等 exact identity 消失再报告失败；初次 stat 不可读时只接受该 PID
+后续 ENOENT，info 未给出 authoritative PID 时 invocation 保持 fail-stop。该保证覆盖 managed
+settlement；socket lease 在 broker restart、强制断连或 runtime SIGKILL 下尚非 crash-persistent，
+详见[安全模型的已知限制](security-model.md#供应链与已知限制)。
 
 `workload.base` 发起通用 `file.write` 或 `service.action` 时，Source 输入不包含也不能伪造 plugin
 provenance。Core 根据实际 provider caller 注入 `pluginId=workload.base` 与 current digest，并在
@@ -72,9 +81,12 @@ PASSWD sudo 与真实 `/dev/tty` 逐次审批，不能由 Agent、Adapter、revi
 批准。它不是普通 Workload 的免审 root provider，PVE broker 不接受它，且所有 capsule 都明确
 没有自动 rollback。
 
-`ops_bash` 的安全来源是 UID、bubblewrap namespace、只读 bind、无网络与 workspace 隔离；
+`ops_bash` 的安全来源是 UID、双层 bubblewrap namespace、PID 1 lifecycle FD + exact process identity barrier、只读 bind、无网络与 workspace 隔离；
 host 还必须固定 root-owned `bwrap`/`bash`/`prlimit`，清空 namespace capabilities、禁止再创建
-嵌套 user namespace，并限制 CPU、地址空间、进程数、文件大小和 fd。命令黑名单只作为补充。
+嵌套 user namespace，并限制 CPU、地址空间、进程数、文件大小和 fd。agentd service 固定
+`ProtectProc=invisible + ProcSubset=all`：它隐藏其他 UID 的 PID 目录，但为双层 bwrap 保留非 PID
+procfs 与精确 namespaced sysctl 路径；未被其他 hardening 屏蔽的非 PID 全局 metadata 对 Source
+仍是只读可见面，不能把该组合当作 `/proc` confidentiality boundary。命令黑名单只作为补充。
 若这些边界或 user namespace/bubblewrap 不可用，不仅 `ops_bash` 无法注册，必需的
 `workload.base` 源码也无法进入隔离 host；`init` 必须 fail closed 并回滚，不能退化成宿主 shell、
 进程内 loader、Docker 或 sudo 执行。

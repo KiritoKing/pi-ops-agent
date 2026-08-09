@@ -121,12 +121,15 @@ cmp -s "${archive_root}/install-release.sh" "${app_root}/scripts/install-release
 }
 
 required_files=(
+  config/agentd.json
+  config/models.json
   dist/agentd/index.js
   dist/client/index.js
   dist/reviewer/index.js
   dist/runtime/adapter-run.js
   dist/runtime/botmux-setup-run.js
   dist/runtime/workload-host.js
+  dist/shared/bubblewrap-containment.js
   plugins/adapter-tui/manifest.json
   plugins/adapter-tui/profile.json
   plugins/adapter-botmux-source/manifest.json
@@ -141,6 +144,7 @@ required_files=(
   plugins/workload-pve/workload.mjs
   plugins/workload-example/manifest.json
   plugins/workload-example/workload.mjs
+  scripts/probe-adapter-linux-client.mjs
   scripts/probe-adapter-linux-fixture.mjs
   scripts/probe-adapter-linux-runtime.mjs
   scripts/probe-adapter-linux-socket.mjs
@@ -151,13 +155,26 @@ required_files=(
   skills/agentd-workload-dev/SKILL.md
   skills/agentd-workload-dev/agents/openai.yaml
   systemd/agentd-guardian.service
+  systemd/agentd-guardian.service.d/zzzz-ops-agent-security.conf
   systemd/agentd-client-gateway.service
+  systemd/agentd-client-gateway.service.d/zzzz-ops-agent-security.conf
   systemd/agentd-approval-reviewer.service
+  systemd/agentd-approval-reviewer.service.d/zzzz-ops-agent-security.conf
   systemd/agentd-plugin-lease-broker.service
+  systemd/agentd-plugin-lease-broker.service.d/zzzz-ops-agent-security.conf
   systemd/ops-agent-server.service
+  systemd/ops-agent-server.service.d/zzzz-ops-agent-security.conf
   systemd/ops-agentd.service
+  systemd/ops-agentd.service.d/zzzz-ops-agent-security.conf
   systemd/ops-root-helper.service
+  systemd/ops-root-helper.service.d/zzzz-ops-agent-security.conf
+  systemd/ops-agent-healthcheck.service
+  systemd/ops-agent-healthcheck.service.d/zzzz-ops-agent-security.conf
+  systemd/ops-agent-healthcheck.timer
+  systemd/ops-agent.target
+  systemd/ops-agent.tmpfiles.conf
   systemd/ops-pve-root-helper.service
+  systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf
   systemd/ops-agent-endpoint.tmpfiles.conf
   docs/architecture.md
   docs/security-model.md
@@ -190,14 +207,28 @@ unit_grants_read_write_path() {
 }
 
 pve_broker_unit="${app_root}/systemd/ops-pve-root-helper.service"
-grep -Fxq 'ProtectSystem=full' "${pve_broker_unit}" || {
-  printf 'Release PVE broker must retain ProtectSystem=full.\n' >&2
-  exit 1
-}
-unit_grants_read_write_path "${pve_broker_unit}" /etc/pve || {
-  printf 'Release PVE broker is missing the exact /etc/pve pmxcfs write exception.\n' >&2
-  exit 1
-}
+pve_broker_dropin="${app_root}/systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf"
+for pve_broker_surface in "${pve_broker_unit}" "${pve_broker_dropin}"; do
+  grep -Fxq 'ProtectSystem=full' "${pve_broker_surface}" || {
+    printf 'Release PVE broker must retain ProtectSystem=full: %s.\n' \
+      "${pve_broker_surface}" >&2
+    exit 1
+  }
+  unit_grants_read_write_path "${pve_broker_surface}" /etc/pve || {
+    printf 'Release PVE broker is missing the exact /etc/pve pmxcfs write exception: %s.\n' \
+      "${pve_broker_surface}" >&2
+    exit 1
+  }
+  while IFS= read -r read_write_path; do
+    case "${read_write_path}" in
+      /etc/pve) ;;
+      /etc|/etc/*)
+        printf 'Release PVE broker opens a wider /etc path: %s\n' "${read_write_path}" >&2
+        exit 1
+        ;;
+    esac
+  done < <(awk '/^ReadWritePaths=/ { sub(/^ReadWritePaths=/, ""); for (field = 1; field <= NF; field++) print $field }' "${pve_broker_surface}")
+done
 core_broker_unit="${app_root}/systemd/ops-root-helper.service"
 grep -Eq '(^InaccessiblePaths=|[[:space:]])-/etc/pve([[:space:]]|$)' "${core_broker_unit}" || {
   printf 'Release core broker must keep /etc/pve inaccessible.\n' >&2
@@ -213,17 +244,11 @@ for isolated_unit in \
     exit 1
   }
 done
-while IFS= read -r read_write_path; do
-  case "${read_write_path}" in
-    /etc/pve) ;;
-    /etc|/etc/*)
-      printf 'Release PVE broker opens a wider /etc path: %s\n' "${read_write_path}" >&2
-      exit 1
-      ;;
-  esac
-done < <(awk '/^ReadWritePaths=/ { sub(/^ReadWritePaths=/, ""); for (field = 1; field <= NF; field++) print $field }' "${pve_broker_unit}")
 while IFS= read -r other_unit; do
-  [[ "${other_unit}" == "${pve_broker_unit}" ]] && continue
+  if [[ "${other_unit}" == "${pve_broker_unit}" \
+      || "${other_unit}" == "${pve_broker_dropin}" ]]; then
+    continue
+  fi
   if unit_grants_read_write_path "${other_unit}" /etc/pve; then
     printf 'Only the PVE broker may receive the /etc/pve write exception: %s\n' "${other_unit}" >&2
     exit 1

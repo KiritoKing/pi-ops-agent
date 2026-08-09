@@ -20,7 +20,28 @@ func testFileExecutor(t *testing.T) (*OSExecutor, string) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return &OSExecutor{StateDir: t.TempDir(), AllowedRoots: []string{root}}, root
+	allowedRoot := secureFileFixtureAllowedRoot(t, root)
+	return &OSExecutor{StateDir: t.TempDir(), AllowedRoots: []string{allowedRoot}}, root
+}
+
+// secureFileFixtureAllowedRoot keeps the ordinary file.write tests portable to
+// hosts where testing.TempDir is below a separate /tmp mount. Production
+// policy deliberately rejects a configured root below an already-crossed
+// mount, so climb only as far as the first ancestor that is itself a valid
+// anchor for the unique, owner-only fixture directory. Dedicated Linux tests
+// separately lock the exact mount-point and nested-mount behavior.
+func secureFileFixtureAllowedRoot(t *testing.T, root string) string {
+	t.Helper()
+	probe := filepath.Join(root, ".ops-agent-root-probe")
+	backup := filepath.Join(root, ".ops-agent-unused-backup")
+	for candidate := root; ; candidate = filepath.Dir(candidate) {
+		if _, err := captureAllowedFile(probe, []string{candidate}, backup); err == nil {
+			return candidate
+		}
+		if candidate == string(filepath.Separator) || filepath.Dir(candidate) == candidate {
+			t.Fatalf("secure file fixture path is unusable below every ancestor: %s", root)
+		}
+	}
 }
 
 func preparedFileWrite(t *testing.T, executor *OSExecutor, path, content, mode, changeID string) (*protocol.FileWrite, ExecutionScope, ExecutionResult) {

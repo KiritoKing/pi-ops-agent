@@ -45,8 +45,10 @@ Client：Client 先按 descriptor 的原始 wire-byte ceiling 截帧，以 fatal
 duplicate/trailing JSON，再执行 declared union 与 bind/session/ingress replay 校验。FD 3 是反向的
 `completion.v1` 单向流。BotMux 的第一条及后续消息都只能从 stdin 的 bounded bracketed-paste
 frame 进入 Source；Source 与 Client argv 都拒绝 positional/`@file` prompt，不能绕过 raw-byte
-ceiling、fatal UTF-8 与 envelope parser。当前仍没有通用 outbound platform mediator、跨 Client writer lease、
-handoff/compact/clear consumer、持久 outbox 或远端 ApprovalIntent。
+ceiling、fatal UTF-8 与 envelope parser。同一 gateway 进程内跨 Client connection 的 namespace
+live-writer lease 已实现；当前仍没有跨 gateway restart、多个 gateway 实例或 Adapter handoff 的
+持久化 writer lease，也没有通用 outbound platform mediator、handoff/compact/clear consumer、
+持久 outbox 或远端 ApprovalIntent。
 
 Source manifest 使用 `kind: "adapter"`、`adapter.*` ID，并声明精确 capabilities/scopes。参见
 [Source Plugin](plugins.md)与[`adapter.tui` 示例](../plugins/adapter-tui/manifest.json)。当前的
@@ -58,8 +60,16 @@ CAS 与 strict `agentd.adapter/v1` descriptor，并强制非 root、sanitized en
 启动前 runner 以真实 UID 连接固定 `agentd-plugin-lease-broker` socket，为 exact active digest
 取得 registry shared invocation lease，并持有到 Source 与 compiled Client 两个 sibling
 子进程都退出；同一 plugin 的更新只能在旧 runtime 结束后取得 exclusive lease。可执行 Source
-Adapter 的 descriptor 探测和正式入口都会作为各自 bubblewrap PID namespace 的 PID 1 运行，
-`--die-with-parent --disable-userns` 使 detached/unref 后代在入口退出时一起终止。该 namespace 保留 Adapter 的网络、宿主用户权限与
+Adapter 的 descriptor 探测和正式入口都会进入各自的双层 bubblewrap PID namespace。outer 保留
+bwrap 默认 PID 1 reaper且只启动固定 inner bwrap；inner 使用 `--as-pid-1 --disable-userns`，让
+Source 成为 PID 1 并禁止继续嵌套。outer 的 `--sync-fd` 在 initial child 中关闭、只随 outer PID 1
+生命周期持有；该 init 无论经正常 `ECHILD` 收拢还是 parent-death cleanup 终止，runner 都要在
+sync EOF 后继续等待有界 `--info-fd` 返回的 exact `child-pid` + start identity 消失，而不是只等
+monitor status；sync error 仍先等 identity
+disappearance，初始 stat 不可读则只接受该 PID 后续 ENOENT，info 无法给出 PID 时保持 fail-stop，
+因此 managed settlement 的摘要 lease 不会落在进程树清理窗口之前释放。bwrap 自己通过
+`--dev /dev` 构造只含 `/dev/null` 等基础节点的最小 synthetic device view；不得改成把宿主
+`/dev` 重新 `--dev-bind` 进去。该 namespace 保留 Adapter 的网络、宿主用户权限与
 controlling TTY，所以这里只声称生命周期收拢，不声称像 Workload host 一样无网络或只读隔离。
 descriptor 的 `runtimeAuthority` 必须与这个事实逐项一致；它是可审计声明，不会凭空产生更强隔离。
 这里的“宿主用户权限”必须在真实 Linux 上验证，而不能从 argv 推断：非 root bwrap 可能通过 user
@@ -68,11 +78,16 @@ namespace 创建 PID/mount namespace，发行版或内核行为若清除了 supp
 `npm run build`，再由 root 执行 `npm run test:adapter-linux-runtime`；探针创建
 `root:ops-agent-client 0640` 文件与 group `0660` Unix socket，显式降权到 primary group 为
 `ops-agent-botmux`、supplementary group 为 `ops-agent-client` 的真实账号，并同时验证 detached
-child 先被清理、exact digest lease 后释放，以及继承的 FD 3/4 确实穿过真实 bwrap exec 并完成
+child 的真实宿主 PID/starttime 先被清理、exact digest lease 后释放，以及继承的 FD 3/4 确实穿过真实 bwrap exec 并完成
 分片双向传输。探针通过 transient systemd service 复现 BotMux drop-in 的
-`ProtectKernelTunables=yes`、`RestrictNamespaces=user pid mnt` 与精确
+`PrivateDevices=yes`、`ProtectKernelTunables=yes`、`ProtectProc=invisible`、`ProcSubset=all`、
+`RestrictNamespaces=user pid mnt` 与精确
 `/proc/sys/user/max_user_namespaces` 可写例外；该例外只供 bwrap 在新 user namespace 内禁止继续
-嵌套，Adapter UID 对宿主 sysctl 仍没有 DAC/capability。非 Linux、非 root、systemd、账号/组或
+嵌套，Adapter UID 对宿主 sysctl 仍没有 DAC/capability。探针用 unit-name-specific late drop-in
+抵消 host-wide `service.d` 的 list reset，并在执行 Source 前核对 `systemctl show` 的 effective
+vector。`ProcSubset=all` 会保留未被其他 hardening 屏蔽的只读非 PID procfs 全局 metadata，
+`ProtectProc=invisible` 只隐藏其他 UID 的 PID 目录而不隐藏 same-UID PID 或这份 metadata。
+非 Linux、非 root、systemd、账号/组或
 bwrap 缺失会用退出码
 `77` 明确报告 `SKIP`，不计作已验证。
 声明式 TUI 直接运行 compiled Client 以保留 host sudo/PAM；Client 会独立持有 exact TUI digest
@@ -243,8 +258,9 @@ ApprovalIntent。它们是生产化 Adapter 的必需后续项，文档不能把
 `agentd-pluginctl current --runtime` 重新验证 Source registration、snapshot digest 与
 entrypoint，然后只以 `ops-agent-botmux` UID 启动固定 setup runner。Runner 通过固定 lease socket
 取得 exact `adapter.botmux` digest 的 shared lease，并持有到 `botmux setup`、snapshot 中的
-hardener 和 `botmux restart` 全部结束；hardener 作为 bubblewrap PID namespace 的 PID 1 运行，
-detached 后代不能越过 lease；lease 丢失会终止当前进程并禁止后续步骤；
+hardener 和 `botmux restart` 全部结束；hardener 作为 inner bubblewrap PID namespace 的 PID 1
+运行，outer 默认 reaper 的 lifecycle FD 与 exact init identity barrier 等 detached 后代完全消失后才允许 lease 继续；lease 丢失会终止当前进程并
+禁止后续步骤；
 secret 直接进入 BotMux 的交互进程，不进入模型、argv 或 completion。
 
 Wrapper 不读取或执行可编辑 `plugin-sources`，也没有 legacy `.opspkg` runtime fallback。Source

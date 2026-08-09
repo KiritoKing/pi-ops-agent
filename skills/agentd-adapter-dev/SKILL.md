@@ -39,18 +39,42 @@ compiled Client as sibling processes without a shell under
 the caller's non-root UID and a sanitized environment. The runner must connect as that real UID to
 the fixed peer-authenticated lease broker socket and retain an exact-digest shared registry lease
 for the complete runtime; it must never open the broker-only lock directory. Both the descriptor probe and the main source
-entrypoint must launch through their own fixed bubblewrap PID namespace
-(`--unshare-pid --as-pid-1 --die-with-parent --disable-userns`) so detached/unref descendants
-cannot outlive the lease. This preserves the Adapter's business network, host-user
-permissions, and controlling TTY; do not describe it as the no-network Workload sandbox.
+entrypoint must launch through their own fixed, nested bubblewrap PID namespaces. The outer fixed
+bwrap keeps its default PID 1 reaper and may execute only the same fixed root-owned inner bwrap; it
+must not use `--as-pid-1` or `--disable-userns`. The inner bwrap uses
+`--unshare-user --unshare-pid --as-pid-1 --die-with-parent --disable-userns`, makes Source PID 1,
+and denies further nesting. Outer bwrap must also retain a runner-observed `--sync-fd` that only its
+PID 1 owns after launch and emit one bounded `--info-fd` `child-pid`; bind that PID's start identity.
+Do not release the digest lease until the sync FD reaches EOF and the exact init identity disappears
+from `/proc` (or is proven reused) after every detached/unref descendant is reaped. A sync error must
+not short-circuit the identity wait; an unreadable initial stat requires later ENOENT, and missing
+authoritative info keeps the invocation fail-stop. This managed-settlement guarantee is not yet a
+crash-persistent broker guarantee across broker restart, forced disconnect, or runtime SIGKILL.
+This preserves the Adapter's business network, host-user
+permissions, and controlling TTY; do not describe it as the no-network Workload sandbox. Bubblewrap
+itself must use `--dev /dev` to construct a minimal synthetic device view such as `/dev/null`;
+never replace it with `--dev-bind /dev /dev` or otherwise re-bind the host device tree.
 Do not infer supplementary-group preservation from those bwrap arguments. After `npm run build`,
 run `npm run test:adapter-linux-runtime` as root on the target Linux host. It drops to the real
 `ops-agent-botmux` account with primary `ops-agent-botmux` and supplementary `ops-agent-client`,
 inside a transient systemd service that reproduces the BotMux hardening drop-in. The boundary permits
-only `user/pid/mnt` namespaces and keeps `ProtectKernelTunables=yes`; its sole sysctl write exception is
-`/proc/sys/user/max_user_namespaces`, which bwrap needs inside its new user namespace to deny nesting.
+only `user/pid/mnt` namespaces in both layers and keeps `PrivateDevices=yes`,
+`ProtectKernelTunables=yes`, `ProtectProc=invisible`, and `ProcSubset=all`; its sole sysctl write
+exception is `/proc/sys/user/max_user_namespaces`, which the fixed outer needs to create the inner
+namespace and the inner then uses to deny any further nesting. The probe must use a unit-specific
+late drop-in and verify the effective scalar/list/path vector with `systemctl show`, so a host-wide
+`service.d` reset cannot produce a false pass. Be explicit that `ProcSubset=all` leaves otherwise
+unmasked read-only non-PID procfs metadata visible and `ProtectProc=invisible` hides only foreign-UID
+PID directories, not same-UID PIDs or that metadata.
+Do not confuse this transient probe drop-in with the installer-wide service contract. Every managed
+daemon ships its own unit-name-specific final `zzzz-ops-agent-security.conf`, and installation must
+verify PID 1's exact lifecycle/command/environment plus security effective vector after reload.
+Adapter work that changes a controller service or its hardening must update that final drop-in,
+packaging, the mode-specific installer check, docs, and tests together; it must not make the service
+or its drop-in appear on a server-only `join` endpoint.
 The probe then proves access to a `root:ops-agent-client 0640` fixture and group `0660` Unix socket, PID
-namespace cleanup of a detached child, fragmented FD4 input plus reverse FD3 completion through real
+namespace cleanup of a detached child using a host-side exact PID/starttime capture (never inner
+`NSpid` self-reporting), fragmented FD4 input plus reverse FD3 completion through real
 bwrap, and release ordering for the exact-digest lease. Source Adapter messages must use this bounded
 typed channel; positional argv and `@file` prompts are forbidden. Exit status
 `77` means the Linux/root/systemd/account/bwrap prerequisites were absent and is not a passing result. Never

@@ -9,6 +9,11 @@ import {
   type ActiveRuntimeSourcePlugin,
   type ActiveRuntimeSourcePluginLease,
 } from "../shared/source-plugin.js";
+import {
+  monitorBubblewrapReaper,
+  type BubblewrapReaperMonitor,
+  wrapWithBubblewrapProcessReaper,
+} from "../shared/bubblewrap-containment.js";
 
 const BOTMUX_PLUGIN_ID = "adapter.botmux";
 const BOTMUX_USER = "ops-agent-botmux";
@@ -36,6 +41,7 @@ export interface BotMuxSetupCommand {
   executable: string;
   arguments: readonly string[];
   label: string;
+  reaperBarrier?: true;
 }
 
 export interface BotMuxSetupDependencies {
@@ -118,33 +124,47 @@ export async function runBotMuxSourceSetup(
     const invocationSignal = signal === undefined
       ? leaseAbort.signal
       : AbortSignal.any([signal, leaseAbort.signal]);
-    const leaseLost = lease.lost.catch((error: unknown) => {
-      const failure = asError(error, "adapter.botmux exact-digest lease was lost");
-      leaseState.lostError = failure;
-      leaseAbort.abort(failure);
-      throw failure;
-    });
+    const leaseLost = lease.lost.then(
+      () => {
+        const failure = new Error(
+          "adapter.botmux exact-digest lease ended without a loss reason",
+        );
+        leaseState.lostError = failure;
+        leaseAbort.abort(failure);
+        throw failure;
+      },
+      (error: unknown) => {
+        const failure = asError(error, "adapter.botmux exact-digest lease was lost");
+        leaseState.lostError = failure;
+        leaseAbort.abort(failure);
+        throw failure;
+      },
+    );
     const workflow = (async (): Promise<void> => {
+      const hardenerCommand = wrapWithBubblewrapProcessReaper(dependencies.bwrapPath, [
+        "--die-with-parent",
+        "--unshare-user",
+        "--unshare-pid",
+        "--as-pid-1",
+        "--disable-userns",
+        "--cap-drop", "ALL",
+        "--bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--chdir", lease.registration.snapshotPath,
+        "--",
+        dependencies.nodePath,
+        hardener,
+        dependencies.configPath,
+        "0",
+      ]);
       const commands: readonly BotMuxSetupCommand[] = [
         { executable: dependencies.botmuxPath, arguments: ["setup"], label: "BotMux setup" },
         {
-          executable: dependencies.bwrapPath,
-          arguments: [
-            "--die-with-parent",
-            "--unshare-pid",
-            "--as-pid-1",
-            "--disable-userns",
-            "--cap-drop", "ALL",
-            "--bind", "/", "/",
-            "--proc", "/proc",
-            "--chdir", lease.registration.snapshotPath,
-            "--",
-            dependencies.nodePath,
-            hardener,
-            dependencies.configPath,
-            "0",
-          ],
+          executable: hardenerCommand.executable,
+          arguments: hardenerCommand.arguments,
           label: "approved BotMux configuration hardener",
+          reaperBarrier: true,
         },
         { executable: dependencies.botmuxPath, arguments: ["restart"], label: "BotMux restart" },
       ];
@@ -230,12 +250,22 @@ function executeCommand(
       cwd: "/",
       env: environment,
       shell: false,
-      stdio: "inherit",
+      stdio: command.reaperBarrier === true
+        ? [
+            "inherit", "inherit", "inherit",
+            "ignore", "ignore", "ignore", "ignore", "ignore",
+            "pipe", "pipe",
+          ]
+        : "inherit",
       windowsHide: true,
     });
     let settled = false;
     let stopping = false;
+    let childClosed = false;
     let stopTimer: NodeJS.Timeout | undefined;
+    let processError: Error | undefined;
+    let reaperMonitorError: Error | undefined;
+    let reaperMonitor: BubblewrapReaperMonitor | undefined;
     const settle = (callback: () => void): void => {
       if (settled) return;
       settled = true;
@@ -244,23 +274,57 @@ function executeCommand(
       callback();
     };
     const stop = (): void => {
-      if (stopping) return;
+      if (stopping || childClosed) return;
       stopping = true;
       child.kill("SIGTERM");
       stopTimer = setTimeout(() => { child.kill("SIGKILL"); }, CHILD_STOP_GRACE_MILLISECONDS);
       stopTimer.unref();
     };
+    const failReaperMonitor = (): void => {
+      reaperMonitorError ??= new Error("BotMux reaper lifecycle monitoring failed");
+      stop();
+    };
+    if (command.reaperBarrier === true) {
+      try {
+        reaperMonitor = monitorBubblewrapReaper(child);
+        void reaperMonitor.syncEof.catch(failReaperMonitor);
+        void reaperMonitor.identity.catch(failReaperMonitor);
+      } catch {
+        failReaperMonitor();
+      }
+    }
     signal.addEventListener("abort", stop, { once: true });
     if (signal.aborted) stop();
-    child.once("error", (error) => { settle(() => { reject(error); }); });
+    child.once("error", (error) => {
+      processError = error;
+      stop();
+    });
     child.once("close", (code, childSignal) => {
-      settle(() => {
-        if (signal.aborted) {
-          reject(asError(signal.reason, `${command.label} was aborted`));
-          return;
+      childClosed = true;
+      void (async (): Promise<void> => {
+        if (reaperMonitor !== undefined) {
+          try {
+            await reaperMonitor.waitForExit();
+          } catch {
+            failReaperMonitor();
+          }
         }
-        resolve(code ?? (childSignal === null ? 1 : 128));
-      });
+        settle(() => {
+          if (reaperMonitorError !== undefined) {
+            reject(reaperMonitorError);
+            return;
+          }
+          if (processError !== undefined) {
+            reject(processError);
+            return;
+          }
+          if (signal.aborted) {
+            reject(asError(signal.reason, `${command.label} was aborted`));
+            return;
+          }
+          resolve(code ?? (childSignal === null ? 1 : 128));
+        });
+      })();
     });
   });
 }

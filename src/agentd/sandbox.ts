@@ -2,10 +2,25 @@ import { spawn } from "node:child_process";
 import { existsSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  monitorBubblewrapReaper,
+  type BubblewrapReaperMonitor,
+  wrapWithBubblewrapProcessReaper,
+} from "../shared/bubblewrap-containment.js";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_ADDRESS_SPACE_BYTES = 1024 * 1024 * 1024;
+
+export function wrapSandboxCommandWithProcessReaper(
+  bwrapPath: string,
+  innerArguments: readonly string[],
+): { executable: string; arguments: string[] } {
+  return wrapWithBubblewrapProcessReaper(bwrapPath, innerArguments, {
+    unshareIpc: true,
+    unshareNetwork: true,
+  });
+}
 
 const DENIED_COMMANDS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /(^|[;&|\s])(sudo|doas|pkexec)(\s|$)/i, reason: "privilege escalation" },
@@ -75,7 +90,7 @@ export async function runSandboxedCommand(options: {
   const bashPath = fixedRootExecutable(options.bashPath, "bash");
   const prlimitPath = fixedPrlimit();
 
-  const args = [
+  const innerArguments = [
     "--die-with-parent",
     "--new-session",
     // Keep this list aligned with ops-agentd.service RestrictNamespaces= and
@@ -117,12 +132,12 @@ export async function runSandboxedCommand(options: {
   if (!existsSync("/usr") || lstatSync("/usr").isSymbolicLink()) {
     throw new Error("sandbox requires a real /usr directory");
   }
-  args.push("--ro-bind", "/usr", "/usr");
+  innerArguments.push("--ro-bind", "/usr", "/usr");
   for (const path of ["/bin", "/sbin", "/lib", "/lib64"]) {
     if (!existsSync(path)) continue;
     const stat = lstatSync(path);
     if (!stat.isSymbolicLink()) {
-      args.push("--ro-bind", path, path);
+      innerArguments.push("--ro-bind", path, path);
       continue;
     }
     const target = readlinkSync(path);
@@ -130,13 +145,13 @@ export async function runSandboxedCommand(options: {
     if (target !== expected && target !== `/${expected}`) {
       throw new Error(`sandbox refuses unexpected merged-/usr link: ${path} -> ${target}`);
     }
-    args.push("--symlink", target, path);
+    innerArguments.push("--symlink", target, path);
   }
   for (const path of ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"]) {
-    if (existsSync(path)) args.push("--ro-bind", path, path);
+    if (existsSync(path)) innerArguments.push("--ro-bind", path, path);
   }
   const cpuSeconds = Math.min(125, Math.max(2, options.timeoutSeconds + 2));
-  args.push(
+  innerArguments.push(
     prlimitPath,
     `--as=${MAX_ADDRESS_SPACE_BYTES}:${MAX_ADDRESS_SPACE_BYTES}`,
     "--core=0:0",
@@ -151,16 +166,38 @@ export async function runSandboxedCommand(options: {
     "-lc",
     options.command,
   );
+  const command = wrapSandboxCommandWithProcessReaper(bwrapPath, innerArguments);
+  const child = spawn(command.executable, command.arguments, {
+    stdio: [
+      "ignore", "pipe", "pipe",
+      "ignore", "ignore", "ignore", "ignore", "ignore",
+      "pipe", "pipe",
+    ],
+    env: {},
+  });
+  const childStdout = child.stdout;
+  const childStderr = child.stderr;
+  if (childStdout === null || childStderr === null) {
+    child.kill("SIGKILL");
+    throw new Error("sandbox requires piped output streams");
+  }
+  let reaperMonitor: BubblewrapReaperMonitor;
+  try {
+    reaperMonitor = monitorBubblewrapReaper(child);
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
 
   return await new Promise<SandboxResult>((resolve, reject) => {
-    const child = spawn(bwrapPath, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {},
-    });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let truncated = false;
     let timedOut = false;
+    let reaperMonitorError: Error | undefined;
+    let processError: Error | undefined;
+    let childClosed = false;
+    let hardKill: NodeJS.Timeout | undefined;
 
     const collect = (
       current: Buffer<ArrayBufferLike>,
@@ -174,17 +211,20 @@ export async function runSandboxedCommand(options: {
       if (chunk.length > remaining) truncated = true;
       return Buffer.concat([current, chunk.subarray(0, remaining)]);
     };
-    child.stdout.on("data", (chunk: Buffer) => {
+    childStdout.on("data", (chunk: Buffer) => {
       stdout = collect(stdout, chunk);
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    childStderr.on("data", (chunk: Buffer) => {
       stderr = collect(stderr, chunk);
     });
 
     const terminate = (): void => {
+      if (childClosed) return;
       child.kill("SIGTERM");
-      const hardKill = setTimeout(() => child.kill("SIGKILL"), 1500);
-      hardKill.unref();
+      if (hardKill === undefined) {
+        hardKill = setTimeout(() => child.kill("SIGKILL"), 1500);
+        hardKill.unref();
+      }
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -193,21 +233,40 @@ export async function runSandboxedCommand(options: {
     timer.unref();
     const onAbort = (): void => terminate();
     options.signal?.addEventListener("abort", onAbort, { once: true });
+    const failReaperMonitor = (): void => {
+      reaperMonitorError ??= new Error("bubblewrap reaper lifecycle monitoring failed");
+      terminate();
+    };
+    void reaperMonitor.syncEof.catch(failReaperMonitor);
+    void reaperMonitor.identity.catch(failReaperMonitor);
 
     child.once("error", (error) => {
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      reject(error);
+      processError = error;
+      terminate();
     });
     child.once("close", (code) => {
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve({
-        exitCode: code ?? 128,
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
-        timedOut,
-        truncated,
+      childClosed = true;
+      if (hardKill !== undefined) clearTimeout(hardKill);
+      void reaperMonitor.waitForExit().catch(() => {
+        failReaperMonitor();
+      }).then(() => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+        if (reaperMonitorError !== undefined) {
+          reject(reaperMonitorError);
+          return;
+        }
+        if (processError !== undefined) {
+          reject(processError);
+          return;
+        }
+        resolve({
+          exitCode: code ?? 128,
+          stdout: stdout.toString("utf8"),
+          stderr: stderr.toString("utf8"),
+          timedOut,
+          truncated,
+        });
       });
     });
   });

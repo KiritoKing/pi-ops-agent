@@ -99,6 +99,16 @@ check_metadata() {
   fi
 }
 
+check_absent_path() {
+  local name="$1"
+  local path="$2"
+  if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
+    report FAIL "${name}" "non-PVE endpoint retains managed surface: ${path}"
+  else
+    report PASS "${name}" "absent"
+  fi
+}
+
 printf 'Pi Ops Agent health report\ntime=%s host=%s\n' "$(date --iso-8601=seconds)" "$(hostname)"
 printf 'kernel=%s load=%s\n' "$(uname -r)" "$(cut -d ' ' -f 1-3 /proc/loadavg 2>/dev/null || printf unknown)"
 printf 'memory=%s\n' "$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {available=$2} END {if (total > 0) printf "available=%dMiB total=%dMiB", available/1024, total/1024; else print "unknown"}' /proc/meminfo 2>/dev/null || printf unknown)"
@@ -141,7 +151,10 @@ if [[ "${ENDPOINT}" == true ]]; then
   if [[ -x /usr/bin/pvesh ]]; then
     check_unit ops-pve-root-helper.service
   else
-    report PASS pve-broker "not a PVE host; unit intentionally absent"
+    check_absent_path pve-broker-unit \
+      /etc/systemd/system/ops-pve-root-helper.service
+    check_absent_path pve-broker-security-dropin \
+      /etc/systemd/system/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf
   fi
   check_socket root-helper /run/ops-agent/helper/root-helper.sock root ops-agent-server
   if [[ -x /usr/bin/pvesh ]]; then

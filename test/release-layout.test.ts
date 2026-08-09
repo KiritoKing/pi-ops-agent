@@ -93,12 +93,15 @@ describe("native release layout", () => {
     const verifier = repositoryFile("packaging/verify-release.sh");
 
     for (const path of [
+      "config/agentd.json",
+      "config/models.json",
       "dist/agentd/index.js",
       "dist/client/index.js",
       "dist/reviewer/index.js",
       "dist/runtime/adapter-run.js",
       "dist/runtime/botmux-setup-run.js",
       "dist/runtime/workload-host.js",
+      "dist/shared/bubblewrap-containment.js",
       "plugins/adapter-tui/manifest.json",
       "plugins/adapter-tui/profile.json",
       "plugins/adapter-botmux-source/manifest.json",
@@ -113,6 +116,7 @@ describe("native release layout", () => {
       "plugins/workload-pve/workload.mjs",
       "plugins/workload-example/manifest.json",
       "plugins/workload-example/workload.mjs",
+      "scripts/probe-adapter-linux-client.mjs",
       "scripts/probe-adapter-linux-fixture.mjs",
       "scripts/probe-adapter-linux-runtime.mjs",
       "scripts/probe-adapter-linux-runtime.sh",
@@ -124,10 +128,27 @@ describe("native release layout", () => {
       "skills/agentd-workload-dev/SKILL.md",
       "skills/agentd-workload-dev/agents/openai.yaml",
       "systemd/agentd-approval-reviewer.service",
+      "systemd/agentd-approval-reviewer.service.d/zzzz-ops-agent-security.conf",
       "systemd/agentd-plugin-lease-broker.service",
+      "systemd/agentd-plugin-lease-broker.service.d/zzzz-ops-agent-security.conf",
       "systemd/agentd-guardian.service",
+      "systemd/agentd-guardian.service.d/zzzz-ops-agent-security.conf",
       "systemd/agentd-client-gateway.service",
+      "systemd/agentd-client-gateway.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agentd.service",
+      "systemd/ops-agentd.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-server.service",
+      "systemd/ops-agent-server.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-root-helper.service",
+      "systemd/ops-root-helper.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-healthcheck.service",
+      "systemd/ops-agent-healthcheck.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-healthcheck.timer",
+      "systemd/ops-agent.target",
+      "systemd/ops-agent.tmpfiles.conf",
+      "systemd/ops-agent-endpoint.tmpfiles.conf",
       "systemd/ops-pve-root-helper.service",
+      "systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf",
       "docs/workloads/pve.md",
     ]) {
       expect(packager).toContain(path);
@@ -151,6 +172,9 @@ describe("native release layout", () => {
     expect(repositoryFile("scripts/probe-adapter-linux-runtime.mjs")).toContain(
       "lost: new Promise(() => {}),",
     );
+    expect(packager).toContain(
+      "probe-adapter-linux-client.mjs probe-adapter-linux-fixture.mjs",
+    );
   });
 
   it("checks archive/deb parity and the pinned production runtime before SBOM generation", () => {
@@ -160,6 +184,8 @@ describe("native release layout", () => {
     expect(workflow).toMatch(/NODE_VERSION: 22\.\d+\.\d+/u);
     expect(workflow).toMatch(/GO_VERSION: 1\.\d+\.\d+/u);
     expect(workflow).toContain("packaging/verify-release.sh");
+    expect(workflow).toContain("uses: ./.github/workflows/ci.yml");
+    expect(workflow).toContain("- ci-release-gates");
     expect(workflow).toContain(
       "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
     );
@@ -197,6 +223,58 @@ describe("native release layout", () => {
     expect(publishJob).toMatch(
       /needs:\n\s+- build\n\s+- adapter-linux-runtime\n/u,
     );
+  });
+
+  it("gates releases on a disposable signed non-PVE join and rollback", () => {
+    const workflow = repositoryFile(".github/workflows/ci.yml");
+    const installerStart = workflow.indexOf("  installer-runtime:\n");
+    const joinStart = workflow.indexOf("  join-installer-runtime:\n");
+    expect(installerStart).toBeGreaterThan(0);
+    expect(joinStart).toBeGreaterThan(installerStart);
+
+    const installerJob = workflow.slice(installerStart, joinStart);
+    expect(installerJob).toContain("name: Export the verified installer payload for the join gate");
+    expect(installerJob).toContain("name: installer-runtime-amd64");
+    expect(installerJob).toContain("release/ops-agent-linux-amd64.tar.gz");
+    expect(installerJob).toContain("ops-agent-linux-amd64.tar.gz.sha256");
+    expect(installerJob).toContain("if-no-files-found: error");
+    expect(installerJob).toContain("overwrite: true");
+
+    const joinJob = workflow.slice(joinStart);
+    expect(joinJob).toContain("needs: installer-runtime");
+    expect(joinJob).toContain("runs-on: ubuntu-24.04");
+    expect(joinJob).toContain("name: installer-runtime-amd64");
+    expect(joinJob).toContain("sha256sum --check --strict ops-agent-linux-amd64.tar.gz.sha256");
+    expect(joinJob).not.toContain("actions/checkout@");
+    expect(joinJob).not.toContain("go build");
+    expect(joinJob).not.toContain("packaging/build-release.sh");
+    expect(joinJob).toContain("ops-agent-server\" \\\n            issue-enrollment");
+    expect(joinJob).toContain("--token-file \"${enrollment_token}\"");
+    expect(joinJob).toContain("issued enrollment is not a signed non-PVE v2 bundle");
+    expect(joinJob).toContain("Disposable join runner unexpectedly has the PVE entrypoint");
+
+    for (const evidence of [
+      "ops-pve-root-helper.service",
+      "multi-user.target.wants/ops-pve-root-helper.service",
+      "zzzz-ops-agent-security.conf",
+      "50-ci-third-party-pve.conf",
+      "/var/lib/ops-agent/pve-root-helper/historical.marker",
+      "/var/log/ops-agent/pve-root-helper/audit.jsonl",
+      "OPS_AGENT_TEST_FAIL_AT=services",
+      "all managed paths, identities and unit state were restored",
+      "upgraded with its validated enrollment unchanged",
+      "systemd-analyze verify",
+      "FragmentPath",
+      "DropInPaths",
+      "ReadWritePaths",
+      "SupplementaryGroups",
+    ]) {
+      expect(joinJob).toContain(evidence);
+    }
+    expect(joinJob.indexOf("OPS_AGENT_TEST_FAIL_AT=services")).toBeLessThan(
+      joinJob.indexOf("Upgrade cleanly and verify the non-PVE join topology"),
+    );
+    expect(joinJob).not.toContain("continue-on-error");
   });
 
   it("pins every remote workflow action to a reviewed full commit", () => {
