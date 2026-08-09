@@ -17,7 +17,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "SKIP: run this probe as root so it can create root:ops-agent-client fixtures and drop to ${PROBE_USER}" >&2
   exit "${SKIP_STATUS}"
 fi
-for command in /usr/bin/bwrap /usr/bin/systemd-run /usr/bin/systemctl /usr/bin/getent /usr/bin/id /usr/bin/sleep; do
+for command in /usr/bin/bwrap /usr/bin/busctl /usr/bin/systemd-run /usr/bin/systemctl /usr/bin/getent /usr/bin/id /usr/bin/sleep; do
   if [[ ! -x "${command}" ]]; then
     echo "SKIP: required Linux probe command is unavailable: ${command}" >&2
     exit "${SKIP_STATUS}"
@@ -139,6 +139,7 @@ probe_dropin_owned=1
     'Environment=PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
     'UMask=0077' \
     'NoNewPrivileges=yes' \
+    'AppArmorProfile=-bwrap' \
     'ProtectSystem=strict' \
     'ProtectHome=yes' \
     'ProtectKernelTunables=yes' \
@@ -213,6 +214,33 @@ require_effective_word_member() {
   exit 1
 }
 
+require_effective_apparmor_profile() {
+  local object_payload object_path profile_payload
+  object_payload="$(/usr/bin/busctl --json=short call org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+    LoadUnit s "${probe_unit}.service")"
+  object_path="$("${node_path}" -e '
+    const value = JSON.parse(process.argv[1]);
+    if (value?.type !== "o" || !Array.isArray(value.data)
+        || value.data.length !== 1 || typeof value.data[0] !== "string"
+        || !/^\/org\/freedesktop\/systemd1\/unit\/[A-Za-z0-9_]+$/u.test(value.data[0])) {
+      throw new Error("systemd LoadUnit returned an invalid object path");
+    }
+    process.stdout.write(value.data[0]);
+  ' "${object_payload}")"
+  profile_payload="$(/usr/bin/busctl --json=short get-property \
+    org.freedesktop.systemd1 "${object_path}" \
+    org.freedesktop.systemd1.Service AppArmorProfile)"
+  "${node_path}" -e '
+    const value = JSON.parse(process.argv[1]);
+    if (value?.type !== "(bs)" || !Array.isArray(value.data)
+        || value.data.length !== 2 || value.data[0] !== true
+        || value.data[1] !== "bwrap") {
+      throw new Error("effective AppArmorProfile is not exact ignore-missing bwrap");
+    }
+  ' "${profile_payload}"
+}
+
 # Keep one instance alive long enough to inspect the effective manager state.
 # The same name-specific drop-in remains in force for the real invocation below.
 probe_unit_owned=1
@@ -225,6 +253,7 @@ probe_unit_owned=1
   --property="SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
   --property=UMask=0077 \
   --property=NoNewPrivileges=yes \
+  --property=AppArmorProfile=-bwrap \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=ProtectKernelTunables=yes \
@@ -252,6 +281,7 @@ require_effective_word_set Environment \
   PATH=/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 require_effective_property UMask 0077
 require_effective_property NoNewPrivileges yes
+require_effective_apparmor_profile
 require_effective_property ProtectSystem strict
 require_effective_property ProtectHome yes
 require_effective_property ProtectKernelTunables yes
@@ -300,6 +330,7 @@ fi
   --property="SupplementaryGroups=${PROBE_CLIENT_GROUP}" \
   --property=UMask=0077 \
   --property=NoNewPrivileges=yes \
+  --property=AppArmorProfile=-bwrap \
   --property=ProtectSystem=strict \
   --property=ProtectHome=yes \
   --property=ProtectKernelTunables=yes \

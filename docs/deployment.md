@@ -91,11 +91,16 @@ Bootstrap：
 2. 下载当前架构 archive 与 `checksums.txt`；
 3. 解包前验证 SHA-256；
 4. 若存在 `gh`，执行 `gh attestation verify`；
-5. 将已验证 payload 交给同一 Release 内的 `install-release.sh`。
+5. 将控制交给同一 Release 内的 `ops-agent-bootstrap`：`host-policy` 只路由到相邻的
+   AppArmor helper，`init`/`join` 只路由到相邻的 `install-release.sh`；两者不会互相隐式调用。
 
 没有 `gh` 时只验证了 GitHub HTTPS + 同一 Release checksum，不能声称完成独立 provenance
 验证。高价值环境应在管理机验证 attestation 后，将 archive 放入受控镜像，并通过
 `OPS_AGENT_RELEASE_BASE` 使用该镜像。
+
+Release installer 自身不调用 apt/dnf/yum 等包管理器。所有模式都要求 systemd、OpenSSL、diffutils
+等基础命令已由管理员或 image 提供；`init` 还要求固定 `/usr/bin/bwrap`、`sudo`/`visudo` 与 util-linux。
+缺失项在账号、unit 或 policy mutation 前 fail closed。Noble 的额外 AppArmor package 与精确版本见下文。
 
 Release 使用固定的受支持 Go toolchain，以 `CGO_ENABLED=0 -trimpath` 只生成当前七个 Go
 artifact；旧 `ops-systemd-helper` 即使源码仍用于迁移测试，也不会进入 release binary 集合。
@@ -116,8 +121,15 @@ Publish 下载两组 artifact 后、生成 manifest 或 attestation 前再次运
 
 ```bash
 sudo dpkg -i ops-agent-all_X.Y.Z_amd64.deb
+sudo ops-agent-bootstrap host-policy inspect
+sudo ops-agent-bootstrap host-policy install
+sudo ops-agent-bootstrap host-policy status
 sudo ops-agent-bootstrap init --admin-user "$USER"
 ```
+
+前三条只适用于下面所述的 Noble restricted-userns 主机，并且必须在管理员已单独安装固定前置包后
+执行；其他主机直接运行 `init`。Debian package 不把 AppArmor/bwrap 包列为强依赖，因为同一包也用于
+不运行 Source Plugin 的 `join` endpoint，不能为 server-only 节点静默扩大宿主策略面。
 
 发布阻断验收还包括真实 Linux Adapter runtime 探针。Release workflow 在独立 disposable
 Ubuntu job 中只创建 `ops-agent-botmux` 专用系统账号及其两个专用组和工作目录，不修改 runner 默认
@@ -145,11 +157,103 @@ artifact。不得把 driver 平铺到 runtime root 后意外导入宿主源码�
 
 ## `init`
 
+Ubuntu 24.04 Noble 且 `kernel.apparmor_restrict_unprivileged_userns=1` 时，先由管理员安装 helper 的
+明确前置包，再通过固定到同一个 tag 的 Raw bootstrap 运行独立 host-policy 阶段；Agent 和
+`init`/`join` 不会替用户静默执行：
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends \
+  apparmor apparmor-profiles bubblewrap ca-certificates diffutils libcap2-bin \
+  openssl sudo util-linux
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy inspect
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy install
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy status
+```
+
+Raw bootstrap 对 `host-policy`、`init` 和 `join` 都拒绝 `latest`，并核对 archive 的 `payload/VERSION`，
+避免多次调用跨 Release 漂移。离线 tar 不能从用户或 Agent 可写的 checkout/解包目录通过 `sudo` 直接
+执行；先把已独立验证的 archive 由 root 解到独占 staging，再运行同一 release-root wrapper：
+
+```bash
+release_stage="$(sudo mktemp -d /var/tmp/ops-agent-release.XXXXXX)"
+sudo install -d -o root -g root -m 0700 "${release_stage}/root"
+sudo tar -xzf /path/to/verified/ops-agent-linux-amd64.tar.gz -C "${release_stage}/root"
+sudo "${release_stage}/root/ops-agent-bootstrap" host-policy inspect
+sudo "${release_stage}/root/ops-agent-bootstrap" host-policy install
+sudo "${release_stage}/root/ops-agent-bootstrap" host-policy status
+```
+
+wrapper 在 root 执行时会拒绝 symlink、自身整棵 release tree 的非 root owner 或 group/world write，
+并拒绝不具 sticky 保护的可写祖先；因此普通用户目录下的 tar extraction 会 fail closed。`.deb` 使用
+`sudo ops-agent-bootstrap host-policy ...`。三种入口最终都执行 archive/deb versioned release-root 中的
+同一 wrapper 和逐字相同 helper，release verifier 会检查 exact mode、wrapper 审计 hash、tar/deb parity、
+Debian control/postinst bytes 及固定 launcher 路由。完成 `status` 的 `verified-now` 证据后，再用同一个
+`vX.Y.Z` 单独运行 `init`。
+
+`inspect` 只在 `/etc/apparmor.d` 的同一独占目录锁内核对 eligibility，不创建 probe。`status` 不修改
+持久 AppArmor policy，但在 `managed:enforce` 时会持有同一把锁，创建并清理一个新的短生命周期
+`/run/systemd/system` static authority smoke；只有这次实时探针通过才返回 `0` 并输出
+`apparmor-managed-state=verified-now`。`3` 表示安全地不存在，`1` 表示 drift、partial、实时探针失败
+或证据不可访问。当前 Release 只接受
+`apparmor-profiles` 版本 `4.0.1really4.0.1-0ubuntu0.24.04.7` 中 SHA-256
+`11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9` 的发行版 profile，并管理：
+
+```text
+/etc/apparmor.d/bwrap-userns-restrict
+/etc/apparmor.d/local/bwrap-userns-restrict  # exact: /usr/bin/bwrap ix,
+```
+
+source SHA 只是一项输入，不是 approval digest。canonical v1 approval digest 同时绑定
+`package=apparmor-profiles`、exact version、上述 source SHA、exact local-rule bytes，以及批准前完整
+展示的 authority summary；该 summary 的 SHA-256 是
+`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`，当前 approval digest 为
+`sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef`。helper 必须先展示
+host-wide argv-blind `ix`、长期 Core setup-profile authority、BotMux 不支持和不自动移除这四项
+residual，再由 root 从真实 `/dev/tty` 读取 exact
+`INSTALL NOBLE BWRAP APPARMOR sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef`。
+CI/外部变更系统已经完成等价模型外审批时才可传同一 `--approve-digest`；这不是 Agent 自批。
+helper 不 apt/install package、不改 sysctl、不启用 SUID/unconfined，也拒绝 disable/force-complain、
+partial、symlink 或既有内容 drift。AppArmor exact exec rule 只绑定 `/usr/bin/bwrap` path，不绑定本项目
+argv，因此属于 host-wide authority 扩张；发行版 version/hash 变化必须由新 Release 重新 pin、重新
+批准，不能现场放宽。
+
+fresh `install` 在可能已经 load kernel profile 后失败时绝不调用 `apparmor_parser --remove`，否则会
+让 active task 失去 confinement。只有权威 kernel evidence 明确证明 `bwrap` 与 `unpriv_bwrap`
+两者均 absent，helper 才删除本轮新建的 exact managed files；loaded、partial 或 unreadable evidence
+一律保留 files 与 kernel state、报告 `INCOMPLETE`，交由单独主机恢复流程处理。
+若 managed files 已经 exact、kernel profiles 为 absent，重新 load 或后续 smoke 失败也必须保留这些
+既有 files 与任何 kernel evidence；这不是 fresh mutation，不能为了恢复 `absent` 外观而删除证据。
+
+批准界面还必须说明 `AppArmorProfile=-bwrap` 的长期 residual：`ops-agentd` Node 本体会一直处于
+bwrap setup profile。非 root UID、`NoNewPrivileges=yes` 与空 `CapabilityBoundingSet` 继续阻止它
+取得宿主 capability，但被攻陷 Core 可直接尝试该 profile 允许的 userns/mount/network setup
+syscall；AppArmor 不把这份 authority 限定到固定 runner argv。首次 non-bwrap Source exec 才 stack
+`unpriv_bwrap`。接受 canonical digest 即同时接受这份扩大面；将来需要独立 typed spawn supervisor
+才能把 setup authority 收窄到短生命周期。
+
+`ops-agentd.service` 使用 typed ignore-missing `AppArmorProfile=-bwrap`。helper 的 root-owned
+`NoNewPrivileges=yes` static-unit smoke 必须闭世界核对 exact FragmentPath/DropInPaths、唯一且无
+flags 的 `ExecStart`、空 hooks/environment/groups/capabilities，以及完整 PID 1 effective
+security/lifecycle vector；它还必须证明 effective profile、outer→fixed inner、最终
+Source PID 1 label 包含 `unpriv_bwrap`、五组 capability 全零，并且后续 `unshare --user` 与 nested
+bwrap 均失败；hosted gate 未完成这份 exact smoke 前不能发布或宣称 production 支持。这条兼容只
+覆盖直接 Node 的 `ops-agentd`/mandatory `workload.base`，且 host-policy helper 仍只支持 Noble。
+BotMux guard 以实际状态而非发行版标签为准：任何 host 只要读到 restricted-userns=`1` 且
+AppArmor=`Y/y`，都在 wrapper/config mutation、hardener 或 restart 前拒绝；Noble 上 restriction
+evidence 缺失/不可读也拒绝，其他 host 只有该 sysctl 安全不存在时才可跳过。BotMux main→pi wrapper
+若 attach 会先落入 `unpriv_bwrap`、阻断后续 sandbox setup；Adapter direct-Node probe 不能当作
+BotMux production 证据。无法管理宿主 policy 的 LXC/OrbStack 没有降级路径。`join` 不承载 Source
+runtime，永远不安装、更新或删除该宿主 policy。
+
 交互式安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- init
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init
 ```
 
 通过 `sudo` 时 `SUDO_USER` 是本地管理员；root 直接运行必须指定一个现有的非 root 用户：
@@ -286,8 +390,8 @@ endpoint 管理员；不能从 bundle 自身或同一未认证中转消息中提
 ```bash
 controller_ca_sha256='sha256:<从独立渠道核验的 64 位小写十六进制指纹>'
 chmod 600 ./endpoint.opstoken
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- join \
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- join \
       --controller https://controller.example:7443 \
       --controller-ca-sha256 "${controller_ca_sha256}" \
       --token-file ./endpoint.opstoken
@@ -301,8 +405,8 @@ curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/script
 已有完整 endpoint 升级 Release 时仍使用 `join`，但必须省略 `--token-file`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- join \
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- join \
       --controller https://controller.example:7443 \
       --controller-ca-sha256 "${controller_ca_sha256}" \
       --no-start
@@ -460,6 +564,11 @@ PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init ide
 若真实 probe 进入失败终态，安装器会在删除临时 unit 前输出有界 journal 和
 `kernel.apparmor_restrict_unprivileged_userns` 状态；应以其中的实际 bwrap errno/AppArmor 拒绝为准，
 不能把通用的“user namespace 不可用”摘要当作根因，也不能通过关闭 host-wide 限制制造通过。
+尤其不能把普通 shell 下成功的 direct bwrap smoke 当作这个 unit-bound proof。Noble helper 必须
+先在自己的 root-owned `NoNewPrivileges=yes` static unit 中核对 typed `AppArmorProfile=-bwrap`
+effective attachment，再证明最终 `unpriv_bwrap`/zero-cap/nested-userns deny；installer 随后仍运行
+自己的完整 preflight。该证据边界只覆盖直接 Node 的 `ops-agentd`/base Workload，不覆盖未 attach
+的真实 BotMux main→pi wrapper chain。
 
 ## 安装其他 Source Plugin
 
@@ -511,6 +620,15 @@ bracketed-paste stdin 进入，runner/Source/Client 均不得把 positional argv
 不能因此允许 TUI 插件夹带源码。
 
 ## BotMux Source Adapter
+
+BotMux setup 先读取 host evidence，而不是仅按 Ubuntu Noble 标签判断。任何发行版只要实际读取到
+restricted-userns=`1` 且 AppArmor=`Y/y`，wrapper 就必须在 config mutation、digest-approved hardener
+或 restart 前拒绝；Noble 缺少或无法读取 restriction evidence 也拒绝，其他 host 只有该 sysctl 安全
+不存在时才可继续。managed BotMux 的 `NoNewPrivileges=yes` main→pi wrapper 链不能安全取得后续
+bwrap setup profile；不要复制 `ops-agentd` 的 `AppArmorProfile=-bwrap`，否则 wrapper 会过早落入
+`unpriv_bwrap`。Noble helper 仍只解锁 direct Node core/base；direct Adapter CI probe 不能作为
+BotMux production 证据。runtime 也必须保持 fail closed，等待单独经过真实 main→wrapper→sandbox
+链验证的 profile 设计。
 
 BotMux 本体是外部依赖，`init` 不安装。先审批并注册 Source `adapter.botmux`，再在本地 TUI
 输入精确 `/botmux-setup`。Client 只执行固定 argv
@@ -575,5 +693,10 @@ Source Plugin registration；显式 `systemctl status` 仍用于补充查看 uni
 12. PID 1 已对当前 mode 的完整 managed service 集合加载 exact release unit 与 unit-specific final
     security drop-in，并通过 lifecycle/security effective-vector 核验；`init` 与 `join` 的集合不能
     取并集，非 PVE host 不应残留 managed PVE unit/drop-in。
+13. 若 Noble restricted-userns 开启，helper 的 exact managed state、typed ops-agentd profile、
+    `NoNewPrivileges=yes` authority smoke 与 installer preflight 必须全部通过；direct smoke 不能
+    替代它。BotMux 则按实际 evidence 判断：任何 host 的 restricted-userns=`1` + AppArmor enabled
+    都必须在 setup mutation 前报告 unsupported/fail closed；Noble evidence 缺失也拒绝。`join` 不应
+    出现任何项目管理的 AppArmor profile/local rule surface。
 
 使用仓库 Skill 执行这套流程：[`agentd-init`](../skills/agentd-init/SKILL.md)。

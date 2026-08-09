@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -420,7 +421,15 @@ describe("installed client-plane isolation", () => {
     expect(containment).not.toContain('"--new-session"');
   });
 
-  it("keeps restricted Ubuntu user namespaces enabled for real nested-bwrap gates", () => {
+  it("uses one pinned Noble AppArmor helper and an NNP-equivalent static smoke", () => {
+    const helper = repositoryFile("scripts/configure-noble-bwrap-apparmor.sh");
+    const installer = repositoryFile("scripts/install-release.sh");
+    const agentdUnit = repositoryFile("systemd/ops-agentd.service");
+    const agentdDropIn = repositoryFile(
+      "systemd/ops-agentd.service.d/zzzz-ops-agent-security.conf",
+    );
+    const botmuxDropIn = repositoryFile("config/botmux-systemd-dropin.conf");
+    const adapterProbe = repositoryFile("scripts/probe-adapter-linux-runtime.sh");
     const workflows = [
       {
         source: repositoryFile(".github/workflows/ci.yml"),
@@ -431,60 +440,189 @@ describe("installed client-plane isolation", () => {
         after: "name: Create the disposable Adapter identity fixture",
       },
     ];
+    const summaryMatch = /print_authority_summary\(\) \{\n {2}\/bin\/cat <<'EOF'\n(?<summary>[\s\S]*?)\nEOF\n\}/u.exec(
+      helper,
+    );
+    if (summaryMatch?.groups?.summary === undefined) {
+      throw new Error("AppArmor helper authority summary is not canonical");
+    }
+    const summarySha256 = createHash("sha256")
+      .update(`${summaryMatch.groups.summary}\n`)
+      .digest("hex");
+    expect(summarySha256).toBe(
+      "c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c",
+    );
+    const approvalFields = [
+      "ops-agent-noble-bwrap-apparmor/v1",
+      "package=apparmor-profiles",
+      "version=4.0.1really4.0.1-0ubuntu0.24.04.7",
+      "source-sha256=11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9",
+      "local-rule=/usr/bin/bwrap ix,",
+      `authority-summary-sha256=${summarySha256}`,
+    ];
+    const approvalBytes = Buffer.concat(
+      approvalFields.flatMap((field, index) => [
+        Buffer.from(field),
+        Buffer.from(index === approvalFields.length - 1 ? "\n" : "\0"),
+      ]),
+    );
+    expect(`sha256:${createHash("sha256").update(approvalBytes).digest("hex")}`).toBe(
+      "sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef",
+    );
+    const vectorStart = helper.indexOf("verify_probe_effective_vector() {");
+    const vectorEnd = helper.indexOf("cleanup_probe_artifacts() {", vectorStart);
+    expect(vectorStart).toBeGreaterThan(0);
+    expect(vectorEnd).toBeGreaterThan(vectorStart);
+    const effectiveVector = helper.slice(vectorStart, vectorEnd);
+    for (const property of [
+      "User", "Group", "Type", "ExitType", "UMask", "RemainAfterExit", "Restart",
+      "TimeoutStartUSec", "RuntimeMaxUSec", "TimeoutStopUSec",
+      "TimeoutStopFailureMode", "KillMode", "NoNewPrivileges", "PrivateTmp",
+      "PrivateDevices", "ProtectSystem", "ProtectHome", "ProtectKernelTunables",
+      "ProtectKernelModules", "ProtectKernelLogs", "ProtectControlGroups",
+      "ProtectClock", "ProtectHostname", "ProtectProc", "ProcSubset",
+      "RestrictRealtime", "RestrictSUIDSGID", "LockPersonality",
+      "SystemCallArchitectures", "SupplementaryGroups", "CapabilityBoundingSet",
+      "RestrictNamespaces", "RestrictAddressFamilies", "ReadWritePaths",
+      "ExecCondition", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop",
+      "ExecStopPost", "Environment", "EnvironmentFiles",
+    ]) {
+      expect(effectiveVector).toContain(property);
+    }
+    expect(effectiveVector).toContain("require_probe_unit_exec_start");
+    expect(effectiveVector).toContain("verify_probe_dropin_closure");
 
-    for (const { source, after } of workflows) {
-      const start = source.indexOf(
-        "name: Load the distribution nested-bubblewrap AppArmor policy",
+    expect(helper).toContain(
+      'EXPECTED_PACKAGE_VERSION="4.0.1really4.0.1-0ubuntu0.24.04.7"',
+    );
+    expect(helper).toContain(
+      'EXPECTED_PROFILE_SHA256="11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9"',
+    );
+    expect(helper).toContain(
+      'APPROVAL_DIGEST="sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef"',
+    );
+    expect(helper).toContain(
+      'AUTHORITY_SUMMARY_SHA256="c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c"',
+    );
+    expect(helper).toContain("ops-agent-noble-bwrap-apparmor/v1");
+    expect(helper).toContain('"package=${EXPECTED_PACKAGE}"');
+    expect(helper).toContain('"version=${EXPECTED_PACKAGE_VERSION}"');
+    expect(helper).toContain('"source-sha256=${EXPECTED_PROFILE_SHA256}"');
+    expect(helper).toContain('"local-rule=${LOCAL_RULE}"');
+    expect(helper).toContain(
+      '"authority-summary-sha256=${AUTHORITY_SUMMARY_SHA256}"',
+    );
+    expect(helper).toContain('LOCAL_RULE="/usr/bin/bwrap ix,"');
+    expect(helper).toContain('MANAGED_PROFILE="/etc/apparmor.d/bwrap-userns-restrict"');
+    expect(helper).toContain(
+      'MANAGED_LOCAL_RULE="/etc/apparmor.d/local/bwrap-userns-restrict"',
+    );
+    expect(helper).toContain('DISABLE_PROFILE="/etc/apparmor.d/disable/bwrap-userns-restrict"');
+    expect(helper).toContain(
+      'COMPLAIN_PROFILE="/etc/apparmor.d/force-complain/bwrap-userns-restrict"',
+    );
+    expect(helper).toContain("dpkg --verify");
+    expect(helper).toContain("unique dpkg ownership");
+    expect(helper).toContain(
+      '"$(/usr/bin/readlink -- /etc/os-release)" == ../usr/lib/os-release',
+    );
+    expect(helper).toContain(
+      '"$(/usr/bin/realpath -e -- /etc/os-release)" == "${os_release_source}"',
+    );
+    expect(helper).toContain("os_release_size <= 16384");
+    expect(helper).toContain(
+      '"${os_id_count}" -eq 1 && "${os_version_count}" -eq 1',
+    );
+    expect(helper).toContain("/usr/sbin/getcap -n /usr/bin/bwrap");
+    expect(helper).toContain(
+      '[[ "${destination_sha}" == "${EXPECTED_PROFILE_SHA256}" ]]',
+    );
+    expect(helper).toContain(
+      "/usr/sbin/apparmor_parser --config-file /dev/null",
+    );
+    expect(helper).toContain("--skip-read-cache --skip-cache --replace");
+    expect(helper).not.toContain("apparmor_parser --remove");
+    expect(helper).toContain("kernel_profiles_are_proven_absent");
+    expect(helper).toContain(
+      "No profile was unloaded; managed files and kernel state were retained",
+    );
+    expect(helper).toContain("AppArmorProfile=-bwrap");
+    expect(helper).toContain("verify_probe_effective_vector");
+    expect(helper).toContain("verify_probe_dropin_closure");
+    expect(helper).toContain(
+      "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+    );
+    expect(helper).toContain("require_probe_unit_exec_start");
+    expect(helper).toContain('"ExitType=cgroup"');
+    expect(helper).toContain('"TimeoutStopFailureMode=terminate"');
+    expect(helper).toContain("CapabilityBoundingSet ''");
+    expect(helper).toContain("'user ipc pid net mnt'");
+    expect(helper).toContain("'AF_UNIX AF_INET AF_INET6 AF_NETLINK'");
+    expect(helper).toContain("flags= ;");
+    expect(helper).toContain("'a(sbbsi) 0'");
+    expect(helper).toContain("NoNewPrivileges=yes");
+    expect(helper).toContain("PrivateDevices=yes");
+    expect(helper).toContain("ProtectKernelTunables=yes");
+    expect(helper).toContain("ProtectProc=invisible");
+    expect(helper).toContain("ProcSubset=all");
+    expect(helper).toContain("CapInh CapPrm CapEff CapBnd CapAmb");
+    expect(helper).toContain("declare -A capability_values=()");
+    expect(helper).toContain('[[ "${current_label}" == *unpriv_bwrap* ]]');
+    expect(helper).toContain("--as-pid-1 --disable-userns --cap-drop ALL");
+    expect(helper).toContain("unshare --user --map-root-user");
+    expect(helper).toContain("Source obtained nested bubblewrap authority");
+    expect(helper).toContain('profile_reply}" == \'(bs) true "bwrap"\'');
+    expect(helper).toContain("AUTHORITY SUMMARY (non-secret)");
+    expect(helper).toContain("host-wide, argv-blind AppArmor rule");
+    expect(helper).toContain("If Core is");
+    expect(helper).toContain("user-namespace, mount, and network-namespace");
+    expect(helper).toContain("BotMux remains unsupported and fail-closed");
+    expect(helper).toContain("print_authority_summary >&9");
+    expect(helper).toContain("automatic AppArmor policy removal is unavailable");
+    expect(helper).toContain("/usr/bin/flock --exclusive --nonblock 8");
+    expect(helper).toContain("systemctl list-units --all --plain");
+    expect(helper).toContain("Probe cleanup left an exact artifact path behind");
+    expect(helper).toContain('LOCK_DIRECTORY="/etc/apparmor.d"');
+    expect(helper.match(/ {2}acquire_helper_lock\n/g)).toHaveLength(3);
+    expect(helper.match(/ {6}run_authoritative_systemd_smoke\n/g)).toHaveLength(1);
+    expect(helper).toContain("apparmor-managed-state=verified-now");
+    expect(helper).not.toContain("/run/ops-agent-apparmor");
+    expect(helper).not.toContain("active_bwrap_labels_absent");
+    expect(helper).toContain("status returns 0");
+    expect(helper).toContain("and 1 for drift");
+    expect(helper).not.toContain("apt-get");
+    expect(helper).not.toContain("/usr/sbin/sysctl");
+    expect(helper).not.toContain("sysctl -w");
+    expect(helper).not.toContain("AppArmorProfile=unconfined");
+    expect(helper).not.toContain("flags=(unconfined)");
+    expect(helper).not.toContain("chmod u+s");
+
+    for (const { source: workflow, after } of workflows) {
+      const start = workflow.indexOf(
+        "name: Install and verify the pinned nested-bubblewrap AppArmor policy",
       );
-      const end = source.indexOf(after, start);
+      const end = workflow.indexOf(after, start);
       expect(start).toBeGreaterThan(0);
       expect(end).toBeGreaterThan(start);
-      const gate = source.slice(start, end);
-
-      expect(gate).toContain("apparmor_restrict_unprivileged_userns");
-      expect(gate).toContain('test "$(<"${restriction_path}")" = 1');
-      expect(gate).not.toContain("sysctl");
-      expect(gate).not.toContain("unconfined");
-      expect(gate).toContain("dpkg-query --listfiles apparmor-profiles");
-      expect(gate).toContain("dpkg-query --search");
-      expect(gate).toContain("dpkg --verify apparmor-profiles");
-      expect(gate).toContain(
-        "--showformat='${Version}' apparmor-profiles",
-      );
-      expect(gate).toContain('[[ "${profile_source}" == /* ]]');
-      expect(gate).toContain('sha256sum "${profile_source}"');
-      expect(gate).toContain(
-        'test "$(/usr/bin/realpath -e -- "${profile_source}")"',
-      );
-      expect(gate).toContain('= "${profile_source}"');
-      expect(gate).toContain("apparmor-profile-package-version=%s");
-      expect(gate).toContain("apparmor-profile-source=%s");
-      expect(gate).toContain("apparmor-profile-source-sha256=%s");
-      expect(gate).toContain("copied_profile_sha256=");
-      expect(gate).toContain(
-        'test "${copied_profile_sha256}" = "${profile_source_sha256}"',
-      );
-      expect(gate).toContain('"${#profile_sources[@]}" -ne 1');
-      expect(gate).toContain(
-        "IFS=: read -r source_uid source_gid source_mode",
-      );
-      expect(gate).toContain('test "${source_uid}" = 0');
-      expect(gate).toContain('test "${source_gid}" = 0');
-      expect(gate).toContain(
-        "8#${source_mode} & 0022",
-      );
-      expect(gate).not.toContain("profile_component=");
-      expect(gate).not.toContain("forbidden_write_mask=");
-      expect(gate).toContain("'/usr/bin/bwrap ix,'");
-      expect(gate).toContain("apparmor_parser --replace");
-      expect(gate).toContain("'bwrap (enforce)'");
-      expect(gate).toContain("'unpriv_bwrap (enforce)'");
-      expect(gate).toContain('[[ "${current_label}" == *unpriv_bwrap* ]]');
-      expect(gate).toContain("CapInh CapPrm CapEff CapBnd CapAmb");
-      expect(gate).toContain("--as-pid-1 --disable-userns --cap-drop ALL");
-      expect(gate).toContain("unshare --user --map-root-user");
-      expect(gate).toContain("Source obtained nested bubblewrap authority");
+      const gate = workflow.slice(start, end);
+      expect(gate).toContain("configure-noble-bwrap-apparmor.sh inspect");
+      expect(gate).toContain("configure-noble-bwrap-apparmor.sh install");
+      expect(gate).toContain("--approve-digest");
+      expect(gate).toContain("configure-noble-bwrap-apparmor.sh status");
+      expect(gate).not.toContain("apparmor_parser");
+      expect(gate).not.toContain("bwrap-userns-restrict.local");
     }
+
+    expect(agentdUnit).toContain("AppArmorProfile=-bwrap");
+    expect(agentdDropIn).toContain("AppArmorProfile=-bwrap");
+    expect(botmuxDropIn).not.toContain("AppArmorProfile=");
+    expect(installer).toContain("require_installed_unit_apparmor_profile");
+    expect(installer).toContain('value?.type !== "(bs)"');
+    expect(installer).toContain(
+      "require_installed_unit_apparmor_profile ops-agentd.service true bwrap",
+    );
+    expect(adapterProbe).toContain("--property=AppArmorProfile=-bwrap");
+    expect(adapterProbe).toContain("require_effective_apparmor_profile");
   });
 
   it("runs the BotMux Adapter probe inside its exact systemd namespace boundary", () => {
@@ -820,7 +958,10 @@ describe("installed client-plane isolation", () => {
 
     expect(installer).toContain('TRANSACTION_USERS=("${SERVER_USER}")');
     expect(installer).toContain('TRANSACTION_GROUPS=("${SERVER_GROUP}")');
-    expect(installer).toContain("packages+=(bubblewrap sudo)");
+    expect(installer).not.toMatch(
+      /\b(?:apt-get|dnf|yum|zypper|pacman)\b/u,
+    );
+    expect(installer).toContain("Missing installation dependency");
     expect(packager).toContain(
       "Depends: bash, ca-certificates, systemd, openssl, diffutils",
     );

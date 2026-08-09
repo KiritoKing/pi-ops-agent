@@ -138,17 +138,37 @@ flowchart LR
 仅支持 systemd Linux。Raw bootstrap 下载匹配架构的 Release、校验 checksum，并在可用时
 通过 GitHub CLI 验证 attestation；主机修改由 Release 内的版本化安装器完成。
 
+Ubuntu 24.04 且 `kernel.apparmor_restrict_unprivileged_userns=1` 时，初始化前必须先完成独立、
+模型外的 host-policy 阶段；它不会由 Agent 或 `init` 静默批准，也不会替你安装系统包：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- init
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends \
+  apparmor apparmor-profiles bubblewrap ca-certificates diffutils libcap2-bin \
+  openssl sudo util-linux
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy inspect
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy install
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy status
+```
+
+helper 会展示 host-wide AppArmor authority 与长期 residual，并从真实 TTY 读取 exact digest 确认；
+成功后再单独运行 `init`。生产环境应把上述 Raw URL 和 `OPS_AGENT_VERSION` 一起固定到同一 tag。
+Release installer 不调用 apt/dnf 等包管理器；任一 native command 缺失都会在主机变更前 fail closed。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init
 ```
 
 交互式初始化会分别显示 `adapter.tui` 与 `workload.base` 的 digest 和 scopes，并要求输入
 精确确认。自动化环境必须先在变更系统中获得同等的人类授权，再显式传入：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- init --approve-required-plugins
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init --approve-required-plugins
 ```
 
 这个参数不是让 Agent 自批；它表示调用方已经在外部流程中批准安装器刚展示且随 Release

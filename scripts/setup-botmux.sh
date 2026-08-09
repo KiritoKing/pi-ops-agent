@@ -11,6 +11,10 @@ readonly CORE_NODE="/opt/pi-ops-agent/current/runtime/node"
 readonly ADAPTER_RUNNER="/opt/pi-ops-agent/current/dist/runtime/adapter-run.js"
 readonly BOTMUX_SETUP_RUNNER="/opt/pi-ops-agent/current/dist/runtime/botmux-setup-run.js"
 readonly BOTMUX_PATH="/opt/pi-ops-agent/botmux-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+readonly OS_RELEASE_PATH="/etc/os-release"
+readonly APPARMOR_ENABLED_PATH="/sys/module/apparmor/parameters/enabled"
+readonly APPARMOR_RESTRICT_USERNS_PATH="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+readonly MAX_OS_RELEASE_BYTES=65536
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
@@ -24,6 +28,136 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 if [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
   printf 'BotMux setup requires an interactive local TTY.\n' >&2
+  exit 1
+fi
+
+reject_unsupported_restricted_userns_botmux_runtime() {
+  local os_release_size os_identity restriction_state apparmor_state
+  local noble_host=false
+
+  if [[ ! -f "${OS_RELEASE_PATH}" || ! -r "${OS_RELEASE_PATH}" ]]; then
+    printf '%s\n' \
+      'BotMux setup could not prove the host OS release from a bounded readable /etc/os-release.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  if ! os_release_size="$(/usr/bin/stat -Lc '%s' -- "${OS_RELEASE_PATH}" 2>/dev/null)"; then
+    printf '%s\n' \
+      'BotMux setup could not stat the host OS release evidence.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  if [[ ! "${os_release_size}" =~ ^[0-9]+$ ]] \
+      || ((os_release_size <= 0 || os_release_size > MAX_OS_RELEASE_BYTES)); then
+    printf '%s\n' \
+      'BotMux setup found invalid or oversized host OS release evidence.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  if ! os_identity="$(/usr/bin/awk '
+      function decode(value) {
+        if (value ~ /^"[A-Za-z0-9._-]+"$/) {
+          return substr(value, 2, length(value) - 2)
+        }
+        if (value ~ /^[A-Za-z0-9._-]+$/) return value
+        return ""
+      }
+      BEGIN { id_count = 0; version_count = 0; invalid = 0; id = ""; version = "" }
+      /^ID=/ {
+        id_count += 1
+        id = decode(substr($0, 4))
+        if (id == "") invalid = 1
+      }
+      /^VERSION_ID=/ {
+        version_count += 1
+        version = decode(substr($0, 12))
+        if (version == "") invalid = 1
+      }
+      END {
+        if (id_count != 1 || version_count > 1 || invalid != 0) exit 2
+        if (id != "ubuntu") { print "other"; exit 0 }
+        if (version_count != 1) exit 2
+        if (version == "24.04") print "ubuntu-24.04"
+        else print "other"
+      }
+    ' "${OS_RELEASE_PATH}" 2>/dev/null)"; then
+    printf '%s\n' \
+      'BotMux setup could not parse unambiguous host OS release evidence.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  case "${os_identity}" in
+    other) ;;
+    ubuntu-24.04) noble_host=true ;;
+    *)
+      printf '%s\n' \
+        'BotMux setup received an unknown host OS classification.' \
+        'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -r "${APPARMOR_RESTRICT_USERNS_PATH}" ]]; then
+    if [[ -e "${APPARMOR_RESTRICT_USERNS_PATH}" \
+        || -L "${APPARMOR_RESTRICT_USERNS_PATH}" \
+        || "${noble_host}" == true ]]; then
+      printf '%s\n' \
+        'BotMux setup could not read the host restricted-userns state.' \
+        'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+      return 1
+    fi
+    return 0
+  fi
+  if ! restriction_state="$(/usr/bin/head -c 8 -- \
+      "${APPARMOR_RESTRICT_USERNS_PATH}" 2>/dev/null)"; then
+    printf '%s\n' \
+      'BotMux setup could not read the host restricted-userns state.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  case "${restriction_state}" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      printf '%s\n' \
+        'BotMux setup received an invalid host restricted-userns state.' \
+        'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+      return 1
+      ;;
+  esac
+
+  if [[ ! -r "${APPARMOR_ENABLED_PATH}" ]]; then
+    printf '%s\n' \
+      'BotMux setup could not read the host AppArmor state.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  if ! apparmor_state="$(/usr/bin/head -c 8 -- \
+      "${APPARMOR_ENABLED_PATH}" 2>/dev/null)"; then
+    printf '%s\n' \
+      'BotMux setup could not read the host AppArmor state.' \
+      'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+    return 1
+  fi
+  case "${apparmor_state}" in
+    N|n) return 0 ;;
+    Y|y) ;;
+    *)
+      printf '%s\n' \
+        'BotMux setup received an invalid host AppArmor state.' \
+        'Refusing before any wrapper/config mutation, hardener, or restart.' >&2
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' \
+    'BotMux setup is unsupported while AppArmor restricted unprivileged user namespaces are enabled (including Ubuntu 24.04 Noble).' \
+    'The real BotMux main -> /bin/bash -> pi wrapper -> bundled Node chain cannot safely acquire the bubblewrap setup profile after NoNewPrivileges.' \
+    'Attaching bwrap to the BotMux main would instead enter unpriv_bwrap before the fixed outer sandbox; refusing before any wrapper/config mutation, hardener, or restart.' >&2
+  return 1
+}
+
+if ! reject_unsupported_restricted_userns_botmux_runtime; then
   exit 1
 fi
 

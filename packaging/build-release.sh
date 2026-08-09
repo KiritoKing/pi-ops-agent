@@ -55,6 +55,8 @@ required_paths=(
   "${REPOSITORY_ROOT}/dist/shared/bubblewrap-containment.js"
   "${REPOSITORY_ROOT}/node_modules/@earendil-works/pi-coding-agent/package.json"
   "${REPOSITORY_ROOT}/scripts/install-release.sh"
+  "${REPOSITORY_ROOT}/scripts/configure-noble-bwrap-apparmor.sh"
+  "${REPOSITORY_ROOT}/scripts/ops-agent-bootstrap.sh"
   "${REPOSITORY_ROOT}/scripts/ops-agent.sh"
   "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-client.mjs"
   "${REPOSITORY_ROOT}/scripts/probe-adapter-linux-fixture.mjs"
@@ -195,7 +197,7 @@ cp -a "${REPOSITORY_ROOT}/skills/." "${app_root}/skills/"
 "${REPOSITORY_ROOT}/packaging/build-botmux-plugin.sh" "${VERSION}" "${app_root}/catalog"
 "${REPOSITORY_ROOT}/packaging/build-hermes-workload-plugin.sh" "${VERSION}" "${app_root}/catalog"
 "${REPOSITORY_ROOT}/packaging/create-catalog-index.sh" "${app_root}/catalog" "${app_root}/catalog/index.json"
-for script_name in configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh probe-adapter-linux-runtime.sh setup-botmux.sh uninstall.sh; do
+for script_name in configure-noble-bwrap-apparmor.sh configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh probe-adapter-linux-runtime.sh setup-botmux.sh uninstall.sh; do
   install -m 0755 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
 done
 for script_name in check-root-stores-idle.mjs configure-plugin-credentials.mjs initialize-target-policy.mjs probe-adapter-linux-client.mjs probe-adapter-linux-fixture.mjs probe-adapter-linux-runtime.mjs probe-adapter-linux-socket.mjs; do
@@ -207,6 +209,10 @@ done
 install -m 0755 "${NODE_RUNTIME_DIR}/bin/node" "${app_root}/runtime/node"
 install -m 0755 "${REPOSITORY_ROOT}/scripts/ops-agent.sh" "${app_root}/bin/ops-agent"
 install -m 0755 "${REPOSITORY_ROOT}/scripts/install-release.sh" "${archive_root}/install-release.sh"
+install -m 0755 "${REPOSITORY_ROOT}/scripts/configure-noble-bwrap-apparmor.sh" \
+  "${archive_root}/configure-noble-bwrap-apparmor.sh"
+install -m 0755 "${REPOSITORY_ROOT}/scripts/ops-agent-bootstrap.sh" \
+  "${archive_root}/ops-agent-bootstrap"
 install -m 0644 "${REPOSITORY_ROOT}/package.json" "${app_root}/package.json"
 install -m 0644 "${REPOSITORY_ROOT}/package-lock.json" "${app_root}/package-lock.json"
 install -m 0644 "${REPOSITORY_ROOT}/README.md" "${app_root}/README.md"
@@ -244,9 +250,7 @@ EOF
 cat >"${deb_root}/usr/sbin/ops-agent-bootstrap" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-readonly payload="/usr/lib/ops-agent-payload/${VERSION}/payload"
-export OPS_AGENT_PAYLOAD_DIR="\${payload}"
-exec "/usr/lib/ops-agent-payload/${VERSION}/install-release.sh" "\$@"
+exec "/usr/lib/ops-agent-payload/${VERSION}/ops-agent-bootstrap" "\$@"
 EOF
 chmod 0755 "${deb_root}/usr/sbin/ops-agent-bootstrap"
 
@@ -255,6 +259,10 @@ cat >"${deb_root}/DEBIAN/postinst" <<'EOF'
 set -e
 printf '%s\n' \
   'Pi Ops Agent payload installed but not initialized.' \
+  'If Ubuntu 24.04 restricted-userns applies, install the documented packages, then run:' \
+  '  sudo ops-agent-bootstrap host-policy inspect' \
+  '  sudo ops-agent-bootstrap host-policy install' \
+  '  sudo ops-agent-bootstrap host-policy status' \
   'Run: sudo ops-agent-bootstrap init --admin-user <non-root-user>'
 exit 0
 EOF

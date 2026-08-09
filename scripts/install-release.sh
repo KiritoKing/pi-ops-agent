@@ -815,34 +815,6 @@ if [[ "${MODE}" == init ]] && ((${#ENABLED_ARTIFACTS[@]} > 0)); then
   "${preflight_node}" "${preflight_initializer}" "${preflight_args[@]}" >/dev/null
 fi
 
-install_native_dependencies() {
-  local -a packages=(openssl ca-certificates diffutils)
-  if [[ "${MODE}" == init ]]; then
-    packages+=(bubblewrap sudo)
-  fi
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y "${packages[@]}"
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y "${packages[@]}"
-  elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install "${packages[@]}"
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --needed --noconfirm "${packages[@]}"
-  else
-    printf 'Install OpenSSL, CA certificates and diffutils, then retry.\n' >&2
-    return 1
-  fi
-}
-
-if ! command -v openssl >/dev/null 2>&1 || ! command -v diff >/dev/null 2>&1 \
-    || { [[ "${MODE}" == init ]] && { ! command -v bwrap >/dev/null 2>&1 \
-      || ! command -v sudo >/dev/null 2>&1 || ! command -v visudo >/dev/null 2>&1; }; }; then
-  install_native_dependencies
-fi
-
 required_commands=(systemctl systemd-tmpfiles busctl getent groupadd groupdel useradd userdel usermod install cp cmp mv ln readlink mktemp stat wc openssl sed tr cut grep find sleep diff dirname sort paste)
 if [[ "${MODE}" == init ]]; then
   required_commands+=(gpasswd bwrap sha256sum hostname runuser sudo visudo)
@@ -2280,6 +2252,29 @@ installed_unit_bus_property() {
     "${object_path}" "${interface}" "${property}"
 }
 
+require_installed_unit_apparmor_profile() {
+  local unit="$1"
+  local expected_ignore="$2"
+  local expected_profile="$3"
+  local object_path payload
+  object_path="$(installed_unit_bus_path "${unit}")"
+  payload="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Service AppArmorProfile)"
+  "${release_dir}/runtime/node" -e '
+    const [text, expectedIgnore, expectedProfile, unit] = process.argv.slice(1);
+    const value = JSON.parse(text);
+    if (value?.type !== "(bs)" || !Array.isArray(value.data)
+        || value.data.length !== 2 || typeof value.data[0] !== "boolean"
+        || typeof value.data[1] !== "string") {
+      throw new Error(`PID 1 returned invalid AppArmorProfile data for ${unit}`);
+    }
+    if (value.data[0] !== (expectedIgnore === "true")
+        || value.data[1] !== expectedProfile) {
+      throw new Error(`unsafe effective AppArmorProfile for ${unit}`);
+    }
+  ' "${payload}" "${expected_ignore}" "${expected_profile}" "${unit}"
+}
+
 verify_installed_unit_typed_vectors() {
   local unit="$1"
   local unit_path="$2"
@@ -2758,6 +2753,13 @@ verify_effective_security_dropin() {
             return 1
           fi
         fi
+        ;;
+      AppArmorProfile)
+        [[ "${expected}" == -bwrap ]] || {
+          printf 'Unsupported AppArmorProfile in release policy for %s.\n' "${unit}" >&2
+          return 1
+        }
+        require_installed_unit_apparmor_profile "${unit}" true bwrap
         ;;
       *) require_installed_unit_property "${unit}" "${property}" "${expected}" ;;
     esac
@@ -3522,6 +3524,8 @@ EOF
     require_pid1_unit_property ops-agentd.service "${property}" "${expected}"
     require_pid1_unit_property "${bwrap_probe_unit}" "${property}" "${expected}"
   done
+  require_installed_unit_apparmor_profile ops-agentd.service true bwrap
+  require_installed_unit_apparmor_profile "${bwrap_probe_unit}" true bwrap
   for expectation in "${fixed_effective_word_sets[@]}"; do
     property="${expectation%%=*}"
     expected="${expectation#*=}"

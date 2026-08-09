@@ -171,6 +171,75 @@ journal and `kernel.apparmor_restrict_unprivileged_userns` diagnostic before int
 failure. Use the concrete bwrap errno/AppArmor denial as evidence; do not disable a host-wide
 user-namespace restriction or remove namespace/hardening arguments to make initialization pass.
 
+On Ubuntu 24.04 Noble with `kernel.apparmor_restrict_unprivileged_userns=1`, distinguish a direct
+AppArmor experiment from the authoritative install boundary. First have the local administrator
+install the documented `apparmor`, exact `apparmor-profiles`, `bubblewrap`, `ca-certificates`,
+`diffutils`, `libcap2-bin`, `openssl`, `sudo`, and `util-linux` prerequisites outside the Agent
+transaction. The release installer never invokes a package manager; a missing command is a
+fail-closed prerequisite error. Then use the verified Release's explicit
+`ops-agent-bootstrap host-policy inspect` route for locked, probe-free eligibility evidence. Raw
+bootstrap calls must all pin the same `OPS_AGENT_VERSION=vX.Y.Z`; the tar release-root wrapper and
+Debian `/usr/sbin` launcher are already version-bound. Never copy a helper out of an unverified source
+checkout when the matching artifact entry is available. For an offline tar, have root extract the
+verified archive into a root-owned `0700` staging directory; never sudo-execute the wrapper from a
+user/Agent-writable checkout or extraction. The wrapper's root path-chain and release-tree ownership/
+DAC checks must pass before either adjacent executable is reached.
+`status` does not mutate persistent policy, but for `managed:enforce` it holds the same exclusive
+directory lock while creating and cleaning a fresh short-lived static systemd authority smoke. It
+returns 0 with `verified-now` only after that live proof, 3 for safely absent, and 1 for
+drift/partial/probe failure/unavailable evidence. If safely absent, present the host-wide authority
+and have the local administrator run `host-policy install`, then require `host-policy status` to
+return `verified-now` before the separate same-version `init`; never invoke it through Agent or
+sudoers.
+The helper pins the package name, distribution profile exact version/source hash, exact
+`/usr/bin/bwrap ix,` bytes, and the complete pre-confirm authority summary into a separate canonical
+approval digest. Verify authority-summary SHA-256
+`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`, require the helper to disclose
+the host-wide argv-blind rule, long-lived Core setup-profile authority, BotMux unsupported state, and
+no automatic removal, then read the full
+`INSTALL NOBLE BWRAP APPARMOR sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef`
+confirmation from the real `/dev/tty`. Never substitute the source SHA for that approval digest.
+`--approve-digest` is only for an external change system that already recorded equivalent
+model-external approval. Do not install packages, change the sysctl, enable SUID/unconfined bwrap,
+or reduce the two layers.
+If a fresh install fails after either kernel profile may have loaded, never call
+`apparmor_parser --remove`: that can leave active tasks unconfined. Delete this attempt's exact fresh
+files only when authoritative kernel evidence proves both `bwrap` and `unpriv_bwrap` are absent.
+For loaded, partial, or unreadable evidence, preserve the files and kernel state, report
+`INCOMPLETE`, and require a separate host-recovery procedure; do not call it rolled back.
+If exact managed files already exist while both profiles are absent, a reload or smoke failure also
+preserves those files and all kernel evidence; it is not a fresh mutation and must not be cleaned back
+to an apparently absent state.
+
+Show the residual before requesting that approval. `AppArmorProfile=-bwrap` keeps the long-lived
+`ops-agentd` Node process in the bwrap setup profile. Its non-root UID, `NoNewPrivileges=yes`, and
+empty capability bounding set still prevent host-capability acquisition, but a compromised Core can
+attempt the profile's userns/mount/network setup syscalls directly; AppArmor does not bind this
+authority to the runner's fixed argv. Only the first non-bwrap Source exec stacks `unpriv_bwrap`.
+The user's local approval accepts this wider surface. Record that a future independent typed spawn
+supervisor is needed to reduce setup authority to a short-lived process.
+
+Require the helper's root-owned `NoNewPrivileges=yes` static-unit smoke to verify PID 1's typed
+`AppArmorProfile=-bwrap`, outer→fixed inner, final Source PID 1 under `unpriv_bwrap`, all five
+capability sets zero, and later userns/nested-bwrap denial. Then require the installer preflight too.
+The hosted helper-bound gate is still pending for this candidate, so do not claim production
+validation from local `bash -n` or the earlier direct smoke. The helper's supported scope is
+deliberately narrow: Noble direct Node `ops-agentd` and mandatory `workload.base` only. Apply the
+BotMux guard from observed host facts instead of the distro label: any host with readable
+restricted-userns=`1` and AppArmor=`Y/y` refuses before wrapper/config mutation, hardener, or restart;
+Noble also refuses missing/unreadable restriction evidence, while another host may continue only
+when that sysctl is safely absent. The real main→pi wrapper enters `unpriv_bwrap` too early if the
+main service is attached, and a direct Adapter probe cannot be cited as BotMux evidence.
+
+Never invoke host-policy management for `join`; server-only endpoints do not run Source plugins.
+Require a new Release and fresh local approval whenever the pinned distribution profile version/hash
+changes. Preserve host policy on every normal uninstall. This Release's `remove` command always
+fails closed: a userspace active-label scan cannot prevent a new process from entering the setup
+profile before kernel unload, so `--maintenance-safe`/REMOVE approval would be a racy false promise.
+Any future removal needs a separately designed and audited host-maintenance mechanism. An
+LXC/OrbStack guest that cannot manage host policy or pass the real unit probe remains unsupported
+and fail closed.
+
 Do not derive standing grants during initialization. If an administrator explicitly enables
 standing `file.write` or `service.action`, require `authorization.baseWorkloadDigest` to equal the
 current approved `workload.base` registration digest. A plugin update must leave the old Target
@@ -355,6 +424,10 @@ Use the current artifact names from the architecture document. Verify all applic
 - A missing optional adapter does not break core/TUI operation.
 - A failed bubblewrap/user-namespace preflight rolls back the complete `init` transaction and
   does not leave a controller that cannot load the mandatory `workload.base` Source Workload.
+- On Noble restricted-userns hosts, record direct smoke, helper NNP static smoke, installer preflight,
+  and actual runtime evidence separately. All helper/installer checks must pass before core/base is
+  supported. Independently, refuse BotMux setup on every host observed with restricted-userns=`1`
+  and AppArmor enabled; the direct Adapter probe is not BotMux evidence.
 
 Run the repository verification commands from `AGENTS.md` for implementation changes. For a
 real deployment, also run the deployment smoke and recovery checks on the target Linux host.

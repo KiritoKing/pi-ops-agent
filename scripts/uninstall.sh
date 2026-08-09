@@ -430,6 +430,9 @@ fi
 systemctl daemon-reload
 systemctl reset-failed >/dev/null 2>&1 || true
 printf '程序与 unit 已卸载。\n'
+printf '%s\n' \
+  '已保留宿主 AppArmor bwrap compatibility policy；默认卸载不会卸载 kernel profile 或删除 /etc/apparmor.d 中的规则。' \
+  '当前 release 不提供自动 remove，因为用户态进程扫描无法关闭新进程进入 setup profile 的竞态；请保留该策略或使用单独审计的主机维护流程。'
 if [[ "${PURGE_STATE}" != true ]]; then
   printf '已保留 %s、%s、%s；需要永久删除时使用 --purge-state --yes。\n' \
     "${CONFIG_ROOT}" "${STATE_ROOT}" "${LOG_ROOT}"

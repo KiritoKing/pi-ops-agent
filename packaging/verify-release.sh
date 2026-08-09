@@ -7,6 +7,7 @@ NODE_VERSION=""
 ARCHIVE=""
 DEBIAN_PACKAGE=""
 NO_PAYLOAD_EXECUTION=false
+readonly EXPECTED_RELEASE_BOOTSTRAP_SHA256="6742fa80c494ff17c2558240dc31d64dbcaca18cb1884d0508165773280ed966"
 
 usage() {
   cat <<'EOF'
@@ -53,7 +54,7 @@ case "${ARCH}" in
   *) printf 'Invalid --arch: %s\n' "${ARCH}" >&2; exit 2 ;;
 esac
 
-for command_name in tar dpkg-deb diff find readelf grep cmp mktemp mkdir uname; do
+for command_name in tar dpkg-deb diff find readelf grep cmp cut awk mktemp mkdir sha256sum stat uname; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     printf 'Missing release verification dependency: %s\n' "${command_name}" >&2
     exit 1
@@ -65,6 +66,18 @@ for input_path in "${ARCHIVE}" "${DEBIAN_PACKAGE}"; do
     exit 1
   }
 done
+if ! dpkg-deb --fsys-tarfile "${DEBIAN_PACKAGE}" \
+    | tar --numeric-owner -tvf - \
+    | awk 'BEGIN { seen = 0 } { seen = 1; if ($2 != "0/0") exit 1 } END { if (!seen) exit 1 }'; then
+  printf 'Debian data archive contains a non-root numeric owner/group.\n' >&2
+  exit 1
+fi
+if ! dpkg-deb --ctrl-tarfile "${DEBIAN_PACKAGE}" \
+    | tar --numeric-owner -tvf - \
+    | awk 'BEGIN { seen = 0 } { seen = 1; if ($2 != "0/0") exit 1 } END { if (!seen) exit 1 }'; then
+  printf 'Debian control archive contains a non-root numeric owner/group.\n' >&2
+  exit 1
+fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ops-agent-release-verify.XXXXXX")"
 cleanup() {
@@ -75,9 +88,20 @@ trap cleanup EXIT HUP INT TERM
 
 archive_root="${work_dir}/archive"
 deb_root="${work_dir}/deb"
-mkdir -p "${archive_root}" "${deb_root}"
+deb_control_root="${work_dir}/deb-control"
+mkdir -p "${archive_root}" "${deb_root}" "${deb_control_root}"
 tar -xzf "${ARCHIVE}" -C "${archive_root}"
 dpkg-deb -x "${DEBIAN_PACKAGE}" "${deb_root}"
+dpkg-deb -e "${DEBIAN_PACKAGE}" "${deb_control_root}"
+
+require_mode() {
+  local path="$1"
+  local expected_mode="$2"
+  [[ "$(stat -c '%a' -- "${path}")" == "${expected_mode}" ]] || {
+    printf 'Release path has an unexpected mode: %s\n' "${path}" >&2
+    exit 1
+  }
+}
 
 app_root="${archive_root}/payload/app"
 deb_payload_root="${deb_root}/usr/lib/ops-agent-payload/${VERSION}"
@@ -106,8 +130,76 @@ diff --brief --recursive --no-dereference "${archive_root}" "${deb_payload_root}
   printf 'Debian package architecture does not match the release.\n' >&2
   exit 1
 }
-[[ -x "${deb_root}/usr/sbin/ops-agent-bootstrap" ]] || {
+[[ -f "${deb_root}/usr/sbin/ops-agent-bootstrap" \
+    && ! -L "${deb_root}/usr/sbin/ops-agent-bootstrap" \
+    && -x "${deb_root}/usr/sbin/ops-agent-bootstrap" ]] || {
   printf 'Debian package is missing its executable bootstrap.\n' >&2
+  exit 1
+}
+require_mode "${deb_root}/usr/sbin/ops-agent-bootstrap" 755
+/bin/bash -n "${deb_root}/usr/sbin/ops-agent-bootstrap"
+expected_deb_bootstrap="${work_dir}/expected-ops-agent-bootstrap"
+cat >"${expected_deb_bootstrap}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "/usr/lib/ops-agent-payload/${VERSION}/ops-agent-bootstrap" "\$@"
+EOF
+cmp -s "${expected_deb_bootstrap}" "${deb_root}/usr/sbin/ops-agent-bootstrap" || {
+  printf 'Debian bootstrap does not delegate exactly to its versioned release wrapper.\n' >&2
+  exit 1
+}
+
+[[ -f "${deb_control_root}/control" && ! -L "${deb_control_root}/control" ]] || {
+  printf 'Debian package is missing its regular control file.\n' >&2
+  exit 1
+}
+[[ -f "${deb_control_root}/postinst" && ! -L "${deb_control_root}/postinst" \
+    && -x "${deb_control_root}/postinst" ]] || {
+  printf 'Debian package is missing its executable postinst.\n' >&2
+  exit 1
+}
+require_mode "${deb_control_root}/control" 644
+require_mode "${deb_control_root}/postinst" 755
+/bin/sh -n "${deb_control_root}/postinst"
+for forbidden_control in preinst prerm postrm config triggers templates conffiles; do
+  [[ ! -e "${deb_control_root}/${forbidden_control}" \
+      && ! -L "${deb_control_root}/${forbidden_control}" ]] || {
+    printf 'Debian package contains an unexpected control surface: %s\n' \
+      "${forbidden_control}" >&2
+    exit 1
+  }
+done
+expected_deb_control="${work_dir}/expected-deb-control"
+cat >"${expected_deb_control}" <<EOF
+Package: ops-agent-all
+Version: ${VERSION}
+Architecture: ${ARCH}
+Maintainer: Pi Ops Agent maintainers
+Depends: bash, ca-certificates, systemd, openssl, diffutils
+Section: admin
+Priority: optional
+Description: Least-privilege Pi operations agent native release payload
+ Installs a verified, prebuilt payload. Run ops-agent-bootstrap init after dpkg.
+EOF
+cmp -s "${expected_deb_control}" "${deb_control_root}/control" || {
+  printf 'Debian control metadata differs from the audited release contract.\n' >&2
+  exit 1
+}
+expected_deb_postinst="${work_dir}/expected-deb-postinst"
+cat >"${expected_deb_postinst}" <<'EOF'
+#!/bin/sh
+set -e
+printf '%s\n' \
+  'Pi Ops Agent payload installed but not initialized.' \
+  'If Ubuntu 24.04 restricted-userns applies, install the documented packages, then run:' \
+  '  sudo ops-agent-bootstrap host-policy inspect' \
+  '  sudo ops-agent-bootstrap host-policy install' \
+  '  sudo ops-agent-bootstrap host-policy status' \
+  'Run: sudo ops-agent-bootstrap init --admin-user <non-root-user>'
+exit 0
+EOF
+cmp -s "${expected_deb_postinst}" "${deb_control_root}/postinst" || {
+  printf 'Debian postinst differs from the audited non-mutating contract.\n' >&2
   exit 1
 }
 
@@ -119,6 +211,46 @@ cmp -s "${archive_root}/install-release.sh" "${app_root}/scripts/install-release
   printf 'Outer and installed release installers differ.\n' >&2
   exit 1
 }
+require_mode "${archive_root}/install-release.sh" 755
+[[ -f "${archive_root}/configure-noble-bwrap-apparmor.sh" \
+    && ! -L "${archive_root}/configure-noble-bwrap-apparmor.sh" \
+    && -x "${archive_root}/configure-noble-bwrap-apparmor.sh" ]] || {
+  printf 'Archive is missing its executable pre-init host-policy helper.\n' >&2
+  exit 1
+}
+cmp -s "${archive_root}/configure-noble-bwrap-apparmor.sh" \
+  "${app_root}/scripts/configure-noble-bwrap-apparmor.sh" || {
+  printf 'Outer and installed host-policy helpers differ.\n' >&2
+  exit 1
+}
+require_mode "${archive_root}/configure-noble-bwrap-apparmor.sh" 755
+require_mode "${app_root}/scripts/configure-noble-bwrap-apparmor.sh" 755
+[[ -f "${archive_root}/ops-agent-bootstrap" \
+    && ! -L "${archive_root}/ops-agent-bootstrap" \
+    && -x "${archive_root}/ops-agent-bootstrap" ]] || {
+  printf 'Archive is missing its executable release bootstrap.\n' >&2
+  exit 1
+}
+/bin/bash -n "${archive_root}/ops-agent-bootstrap"
+require_mode "${archive_root}/ops-agent-bootstrap" 755
+actual_release_bootstrap_sha256="$(sha256sum "${archive_root}/ops-agent-bootstrap" | cut -d' ' -f1)"
+[[ "${actual_release_bootstrap_sha256}" == "${EXPECTED_RELEASE_BOOTSTRAP_SHA256}" ]] || {
+  printf 'Release bootstrap bytes differ from the audited source contract.\n' >&2
+  exit 1
+}
+grep -Fq 'exec "${host_policy_helper}" "$@"' "${archive_root}/ops-agent-bootstrap" || {
+  printf 'Release bootstrap is missing its fixed host-policy route.\n' >&2
+  exit 1
+}
+grep -Fq 'exec "${installer}" "${mode}" "$@"' "${archive_root}/ops-agent-bootstrap" || {
+  printf 'Release bootstrap is missing its fixed init/join route.\n' >&2
+  exit 1
+}
+if grep -Eq '(^|[^[:alnum:]_])(curl|wget|apt-get)([^[:alnum:]_]|$)' \
+    "${archive_root}/ops-agent-bootstrap"; then
+  printf 'Release bootstrap must not fetch packages or network content.\n' >&2
+  exit 1
+fi
 
 required_files=(
   config/agentd.json
@@ -148,6 +280,7 @@ required_files=(
   scripts/probe-adapter-linux-fixture.mjs
   scripts/probe-adapter-linux-runtime.mjs
   scripts/probe-adapter-linux-socket.mjs
+  scripts/configure-noble-bwrap-apparmor.sh
   skills/agentd-init/SKILL.md
   skills/agentd-init/agents/openai.yaml
   skills/agentd-adapter-dev/SKILL.md
@@ -266,6 +399,7 @@ required_executables=(
   bin/agentd-json-config-helper
   runtime/node
   scripts/healthcheck.sh
+  scripts/configure-noble-bwrap-apparmor.sh
   scripts/install-release.sh
   scripts/probe-adapter-linux-runtime.sh
   scripts/setup-botmux.sh

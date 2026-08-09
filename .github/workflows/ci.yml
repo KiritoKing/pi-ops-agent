@@ -69,145 +69,16 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             apparmor apparmor-profiles binutils bubblewrap ca-certificates \
             coreutils curl diffutils dpkg \
-            findutils gawk grep gzip openssl sudo tar util-linux xz-utils
-      - name: Load the distribution nested-bubblewrap AppArmor policy
+            findutils gawk grep gzip libcap2-bin openssl sudo tar util-linux xz-utils
+      - name: Install and verify the pinned nested-bubblewrap AppArmor policy
         shell: bash
         run: |
           set -euo pipefail
-          restriction_path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
-          test -r "${restriction_path}"
-          test "$(<"${restriction_path}")" = 1
-
-          mapfile -t profile_sources < <(
-            /usr/bin/dpkg-query --listfiles apparmor-profiles \
-              | /usr/bin/awk -F/ '$NF == "bwrap-userns-restrict" { print }'
-          )
-          if [[ "${#profile_sources[@]}" -ne 1 ]]; then
-            printf 'Expected one dpkg-owned bwrap profile, found %s\n' \
-              "${#profile_sources[@]}" >&2
-            exit 1
-          fi
-          profile_source="${profile_sources[0]}"
-          test -f "${profile_source}"
-          test ! -L "${profile_source}"
-          test "$(/usr/bin/realpath -e -- "${profile_source}")" \
-            = "${profile_source}"
-          test "$(/usr/bin/dpkg-query --search "${profile_source}")" \
-            = "apparmor-profiles: ${profile_source}"
-          package_drift="$(sudo /usr/bin/dpkg --verify apparmor-profiles)"
-          test -z "${package_drift}"
-          [[ "${profile_source}" == /* ]]
-          profile_package_version="$(/usr/bin/dpkg-query --show \
-            --showformat='${Version}' apparmor-profiles)"
-          profile_source_sha256="$(/usr/bin/sha256sum "${profile_source}" \
-            | /usr/bin/awk '{ print $1 }')"
-          test -n "${profile_package_version}"
-          [[ "${profile_source_sha256}" =~ ^[0-9a-f]{64}$ ]]
-          printf 'apparmor-profile-package-version=%s\n' \
-            "${profile_package_version}"
-          printf 'apparmor-profile-source=%s\n' "${profile_source}"
-          printf 'apparmor-profile-source-sha256=%s\n' \
-            "${profile_source_sha256}"
-          /usr/bin/grep -Fq \
-            'include if exists <local/bwrap-userns-restrict>' \
-            "${profile_source}"
-          /usr/bin/grep -Eq '^profile bwrap /usr/bin/bwrap ' \
-            "${profile_source}"
-          /usr/bin/grep -Eq '^profile unpriv_bwrap ' "${profile_source}"
-
-          # GitHub's hosted runner deliberately makes /usr/share writable by
-          # the passwordless-sudo runner account. That account is already part
-          # of the trusted job substrate, so ancestor DAC cannot authenticate
-          # package content here. Bind this disposable gate to dpkg's verified
-          # file, its canonical non-symlink path, and the root-only source file;
-          # the loaded copy is then installed under root-owned /etc.
-          IFS=: read -r source_uid source_gid source_mode < <(
-            /usr/bin/stat -c '%u:%g:%a' "${profile_source}"
-          )
-          test "${source_uid}" = 0
-          test "${source_gid}" = 0
-          if (( (8#${source_mode} & 0022) != 0 )); then
-            printf 'Package profile source is group/world writable: %s\n' \
-              "${profile_source}" >&2
-            exit 1
-          fi
-
-          local_rule="${RUNNER_TEMP}/bwrap-userns-restrict.local"
-          printf '%s\n' '/usr/bin/bwrap ix,' >"${local_rule}"
-          for destination in /etc/apparmor.d/bwrap-userns-restrict \
-              /etc/apparmor.d/local/bwrap-userns-restrict; do
-            if sudo /usr/bin/test -e "${destination}" \
-                || sudo /usr/bin/test -L "${destination}"; then
-              printf 'Disposable runner already has AppArmor policy path: %s\n' \
-                "${destination}" >&2
-              exit 1
-            fi
-          done
-          sudo /usr/bin/install -d -o root -g root -m 0755 \
-            /etc/apparmor.d/local
-          sudo /usr/bin/test ! -L /etc/apparmor.d/local
-          test "$(sudo /usr/bin/stat -c '%U:%G:%a' /etc/apparmor.d/local)" \
-            = root:root:755
-          sudo /usr/bin/install -o root -g root -m 0644 \
-            "${profile_source}" /etc/apparmor.d/bwrap-userns-restrict
-          sudo /usr/bin/install -o root -g root -m 0644 \
-            "${local_rule}" /etc/apparmor.d/local/bwrap-userns-restrict
-          sudo /usr/bin/cmp --silent \
-            "${profile_source}" /etc/apparmor.d/bwrap-userns-restrict
-          copied_profile_sha256="$(sudo /usr/bin/sha256sum \
-            /etc/apparmor.d/bwrap-userns-restrict \
-            | /usr/bin/awk '{ print $1 }')"
-          test "${copied_profile_sha256}" = "${profile_source_sha256}"
-          test "$(sudo /usr/bin/cat /etc/apparmor.d/local/bwrap-userns-restrict)" \
-            = '/usr/bin/bwrap ix,'
-          test "$(sudo /usr/bin/stat -c '%U:%G:%a' \
-            /etc/apparmor.d/bwrap-userns-restrict)" = root:root:644
-          test "$(sudo /usr/bin/stat -c '%U:%G:%a' \
-            /etc/apparmor.d/local/bwrap-userns-restrict)" = root:root:644
-          sudo /usr/sbin/apparmor_parser --replace \
-            /etc/apparmor.d/bwrap-userns-restrict
-
-          loaded_profiles="$(sudo /usr/bin/cat \
-            /sys/kernel/security/apparmor/profiles)"
-          /usr/bin/grep -Fqx 'bwrap (enforce)' <<<"${loaded_profiles}"
-          /usr/bin/grep -Fqx 'unpriv_bwrap (enforce)' <<<"${loaded_profiles}"
-          test "$(<"${restriction_path}")" = 1
-
-          smoke_script="${RUNNER_TEMP}/nested-bwrap-apparmor-smoke.sh"
-          cat >"${smoke_script}" <<'EOF'
-          #!/bin/bash
-          set -euo pipefail
-          test "$$" -eq 1
-          current_label="$(</proc/self/attr/current)"
-          [[ "${current_label}" == *unpriv_bwrap* ]]
-          for capability_set in CapInh CapPrm CapEff CapBnd CapAmb; do
-            capability_value="$(/usr/bin/awk -v key="${capability_set}:" \
-              '$1 == key { print $2 }' /proc/self/status)"
-            [[ -n "${capability_value}" && "${capability_value}" =~ ^0+$ ]]
-          done
-          if /usr/bin/unshare --user --map-root-user /bin/true \
-              >/dev/null 2>&1; then
-            echo 'Source created a further user namespace' >&2
-            exit 1
-          fi
-          if /usr/bin/bwrap --die-with-parent --unshare-user --uid 0 --gid 0 \
-              --ro-bind / / -- /bin/true >/dev/null 2>&1; then
-            echo 'Source obtained nested bubblewrap authority' >&2
-            exit 1
-          fi
-          EOF
-          /usr/bin/chmod 0755 "${smoke_script}"
-          /usr/bin/bwrap \
-            --die-with-parent \
-            --unshare-user --unshare-ipc --unshare-pid --unshare-net \
-            --cap-drop ALL --bind / / --proc /proc --dev /dev \
-            -- /usr/bin/bwrap \
-            --die-with-parent --new-session \
-            --unshare-user --unshare-ipc --unshare-pid --unshare-net \
-            --as-pid-1 --disable-userns --cap-drop ALL \
-            --ro-bind / / --proc /proc --dev /dev --clearenv \
-            -- /bin/bash "${smoke_script}"
-          test "$(<"${restriction_path}")" = 1
+          readonly policy_digest="sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef"
+          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh inspect
+          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh install \
+            --approve-digest "${policy_digest}"
+          sudo /bin/bash scripts/configure-noble-bwrap-apparmor.sh status
       - name: Build the native amd64 release payload
         shell: bash
         run: |
@@ -265,6 +136,20 @@ jobs:
           install -d -m 0755 "${install_fixture}"
           tar -xzf release/ops-agent-linux-amd64.tar.gz -C "${install_fixture}"
           test "$(<"${install_fixture}/payload/VERSION")" = "${RELEASE_VERSION}"
+          test -x "${install_fixture}/ops-agent-bootstrap"
+          test -x "${install_fixture}/configure-noble-bwrap-apparmor.sh"
+          cmp -s "${install_fixture}/configure-noble-bwrap-apparmor.sh" \
+            "${install_fixture}/payload/app/scripts/configure-noble-bwrap-apparmor.sh"
+          root_bootstrap_fixture="$(sudo mktemp -d /var/tmp/ops-agent-bootstrap-ci.XXXXXX)"
+          case "${root_bootstrap_fixture}" in
+            /var/tmp/ops-agent-bootstrap-ci.*) ;;
+            *) echo "mktemp returned an unsafe bootstrap fixture" >&2; exit 1 ;;
+          esac
+          sudo tar -xzf release/ops-agent-linux-amd64.tar.gz \
+            -C "${root_bootstrap_fixture}"
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" host-policy status
+          sudo find "${root_bootstrap_fixture}" -xdev -mindepth 1 -depth -delete
+          sudo rmdir "${root_bootstrap_fixture}"
           (
             cd release
             sha256sum ops-agent-linux-amd64.tar.gz \

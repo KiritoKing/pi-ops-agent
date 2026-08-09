@@ -9,8 +9,8 @@
 fresh 主机应在模型外显式授权这个用例；裸 `init` 保持 core-only：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-  | sudo sh -s -- init --enable-artifact workload.hermes
+curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+  | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init --enable-artifact workload.hermes
 ```
 
 已有 policy 不会被安装器扩权；管理员需要从当前 Release catalog 复制并复核完整

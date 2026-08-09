@@ -233,6 +233,40 @@ deny 的证明，非 root agentd 仍无权修改宿主 sysctl。为让该路径�
 这里的 `invisible` 只隐藏其他 UID 的 PID 目录：same-UID 进程目录以及未被其他 hardening 屏蔽的
 非 PID procfs 全局元数据仍可见；后者除上述精确 sysctl 例外外保持只读。这不是 procfs
 confidentiality boundary，`PrivateDevices=yes` 与 `ProtectKernelTunables=yes` 仍必须保留。
+
+Ubuntu 24.04 Noble 的 AppArmor restricted-userns 是这条 runtime contract 之外的宿主前置，而不是
+Core 可以静默修改的 sandbox 参数。独立 `configure-noble-bwrap-apparmor.sh` 只管理发行版
+`bwrap-userns-restrict` exact copy 与 local `/usr/bin/bwrap ix,`；`ops-agentd.service` 再用 typed
+ignore-missing `AppArmorProfile=-bwrap` 进入 setup profile。`inspect` 只在 policy directory 独占锁内
+做 eligibility 检查；`status` 不改变持久 policy，但对 `managed:enforce` 会在同一把锁内创建并清理
+新的 root-owned `NoNewPrivileges=yes` static unit，只有本次实时探针成功才输出 `verified-now`。该
+static unit 闭世界核对 exact fragment/drop-in closure、唯一无 flags ExecStart、空 hook/environment/
+group/capability 与完整 PID 1 effective vector，并验证同一双层结构；最终 Source 必须
+仍处于包含 `unpriv_bwrap` 的 label、五组 capability 全零，且再次 `unshare` 或启动 nested bwrap
+均失败。hosted runner 尚未完成这份 helper-bound smoke，因此发布前不能把本地静态检查扩大为
+production 证据。
+
+exact exec rule 是 host-wide、只绑定 executable path 而不绑定 argv，会扩大宿主执行授权；helper
+`install` 因而只能在 `init` 前由管理员经模型外本地逐次确认运行，并 pin 发行版 profile
+package/version/source hash/local-rule bytes 以及批准前完整展示的 authority-summary hash 的
+canonical digest。Agent、sudoers 与 `join` 都不能调用；它不安装 package、不修改 sysctl，也不启用
+SUID/unconfined 或改变双层结构。此 attachment 只覆盖直接 Node 的 `ops-agentd`/mandatory
+`workload.base`；helper 的平台范围仍只有 Noble。BotMux setup guard 则以事实优先：任何 host 只要
+实际读到 restricted-userns=`1` 且 AppArmor=`Y/y`，都在 wrapper/config mutation、hardener 或 restart
+前拒绝。Noble 缺少/无法读取 restriction evidence 也拒绝；其他 host 只有该 sysctl 安全不存在时才
+跳过。BotMux main service 若 attach，会让 pi wrapper 过早进入 `unpriv_bwrap`、阻断后续 sandbox
+setup；Adapter direct probe 不是 BotMux production chain。无法管理宿主 AppArmor 的 LXC/OrbStack
+也继续 fail closed。
+
+这里还有一个不能被 smoke 隐藏的 residual：`AppArmorProfile=-bwrap` 会让长期运行的
+`ops-agentd` Node 本体处于发行版 bwrap setup profile。`User=ops-agent`、`NoNewPrivileges=yes` 与空
+`CapabilityBoundingSet` 仍阻止它取得宿主 capability，但若 Core 被攻陷，它可以直接尝试该 profile
+允许的 userns/mount/network setup syscall；AppArmor 没有把这份 setup authority 限定到 runner 的
+固定 argv。outer/inner bwrap 的 `ix` 继续继承 setup profile，只有首次 non-bwrap Source exec 才
+stack `unpriv_bwrap`。管理员的模型外 host-policy 批准接受的就是这份扩大面，而不只是 local rule
+文件本身。要把 setup authority 收回到短窗口，需要后续独立、typed、短生命周期 spawn supervisor；
+当前架构不得声称已经做到。
+
 `workload.base`、PVE、
 Hermes/BotMux 运维都走这条 Source host 路径；旧 `.opspkg` catalog 和 OCI
 `managed-workload` executor 仅为 Hermes 兼容恢复保留。两条插件路径的迁移关系见
@@ -481,7 +515,8 @@ plugin。初始化还必须先证明真实 bubblewrap/user namespace 可用于 S
   release 只读验证该 metadata、当前 policy schema、TLS/DAC 与 receipt keypair 后复用原身份；
   partial/damaged topology fail closed 并触发安装事务回滚；
 - `join` 不创建 client group、插件工作树/registry、审批 sudoers、模型配置或 controller health
-  timer，也不创建 `ops-agent.target.wants`；`healthcheck.sh --endpoint` 只检查 endpoint 拓扑；
+  timer，也不创建 `ops-agent.target.wants`，并且永不安装、更新或移除 controller Source runtime
+  所需的宿主 AppArmor policy；`healthcheck.sh --endpoint` 只检查 endpoint 拓扑；
 - PVE：`init` 只按本机固定入口 `/usr/bin/pvesh` 检测是否安装独立
   domain/socket/state/audit 的 PVE broker；`join` 还必须让已签名 enrollment 的 `--pve` 标记与
   该入口双向精确匹配。任一方向不一致都在写 unit 前失败。PVE broker 以固定 API path/argv

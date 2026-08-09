@@ -11,20 +11,32 @@ readonly RELEASE_VERSION="${OPS_AGENT_VERSION:-latest}"
 usage() {
   cat <<'EOF'
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-    | sudo sh -s -- init [--admin-user USER] [--enable-artifact ID ...] [--no-start]
+  # Ubuntu 24.04 restricted-userns host policy is a separate, model-external stage.
+  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- host-policy ACTION
 
-  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-    | sudo sh -s -- join --controller URL --controller-ca-sha256 FINGERPRINT \
+  ACTION is one of:
+    inspect
+    install [--approve-digest sha256:...]
+    status
+
+  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- init \
+      [--admin-user USER] [--enable-artifact ID ...] [--no-start]
+
+  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- join \
+      --controller URL --controller-ca-sha256 FINGERPRINT \
       --token-file PATH [--no-start]
 
   # Existing endpoint release upgrade: validate and reuse its enrollment.
-  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/main/scripts/install.sh \
-    | sudo sh -s -- join --controller URL --controller-ca-sha256 FINGERPRINT \
+  curl -fsSL https://raw.githubusercontent.com/KiritoKing/pi-ops-agent/vX.Y.Z/scripts/install.sh \
+    | sudo OPS_AGENT_VERSION=vX.Y.Z sh -s -- join \
+      --controller URL --controller-ca-sha256 FINGERPRINT \
       [--no-start]
 
 Environment:
-  OPS_AGENT_VERSION=v1.2.3            install a specific GitHub release
+  OPS_AGENT_VERSION=v1.2.3            required explicit GitHub release pin
   OPS_AGENT_GITHUB_REPOSITORY=owner/repo
   OPS_AGENT_RELEASE_BASE=https://...   override the GitHub release base for mirrors/tests
 EOF
@@ -34,11 +46,43 @@ if [ "$#" -eq 0 ]; then
   usage >&2
   exit 2
 fi
-case "$1" in
+mode=$1
+shift
+readonly mode
+case "$mode" in
   init|join) ;;
+  host-policy)
+    if [ "$#" -eq 0 ]; then
+      printf 'host-policy requires inspect, install, or status.\n' >&2
+      usage >&2
+      exit 2
+    fi
+    case "$1" in
+      inspect|install|status) ;;
+      *) printf 'Unknown host-policy action: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    ;;
   -h|--help) usage; exit 0 ;;
-  *) printf 'Unknown mode: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  *) printf 'Unknown mode: %s\n' "$mode" >&2; usage >&2; exit 2 ;;
 esac
+
+if [ "$RELEASE_VERSION" = latest ]; then
+  printf '%s\n' \
+    'The Raw bootstrap requires an explicit OPS_AGENT_VERSION=vX.Y.Z.' \
+    'This binds host-policy, init, or join to one reviewed Release.' >&2
+  exit 2
+fi
+for required_command in awk cat curl grep sha256sum tar mktemp; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'Missing bootstrap dependency: %s\n' "$required_command" >&2
+    exit 1
+  fi
+done
+if ! printf '%s\n' "$RELEASE_VERSION" \
+    | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+  printf 'OPS_AGENT_VERSION must be an explicit v-prefixed semantic version.\n' >&2
+  exit 2
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   printf 'Run the bootstrap as root (normally through sudo).\n' >&2
@@ -55,22 +99,10 @@ case "$(uname -m)" in
   *) printf 'Unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
 esac
 
-for required_command in curl sha256sum tar mktemp; do
-  if ! command -v "$required_command" >/dev/null 2>&1; then
-    printf 'Missing bootstrap dependency: %s\n' "$required_command" >&2
-    exit 1
-  fi
-done
-
 if [ -n "${OPS_AGENT_RELEASE_BASE:-}" ]; then
   release_base=${OPS_AGENT_RELEASE_BASE%/}
-elif [ "$RELEASE_VERSION" = latest ]; then
-  release_base="https://github.com/${REPOSITORY}/releases/latest/download"
 else
-  case "$RELEASE_VERSION" in
-    v*) release_tag=$RELEASE_VERSION ;;
-    *) release_tag="v${RELEASE_VERSION}" ;;
-  esac
+  release_tag=$RELEASE_VERSION
   release_base="https://github.com/${REPOSITORY}/releases/download/${release_tag}"
 fi
 
@@ -113,11 +145,15 @@ fi
 
 mkdir "${bootstrap_tmp}/release"
 tar -xzf "${bootstrap_tmp}/${asset}" -C "${bootstrap_tmp}/release"
-installer="${bootstrap_tmp}/release/install-release.sh"
-payload="${bootstrap_tmp}/release/payload"
-if [ ! -x "$installer" ] || [ ! -d "$payload" ]; then
+release_bootstrap="${bootstrap_tmp}/release/ops-agent-bootstrap"
+payload_version_file="${bootstrap_tmp}/release/payload/VERSION"
+if [ ! -f "$release_bootstrap" ] || [ -L "$release_bootstrap" ] || [ ! -x "$release_bootstrap" ] \
+    || [ ! -f "$payload_version_file" ] || [ -L "$payload_version_file" ]; then
   printf 'Release payload is incomplete.\n' >&2
   exit 1
 fi
-
-OPS_AGENT_PAYLOAD_DIR="$payload" "$installer" "$@"
+if [ "$(cat "$payload_version_file")" != "${RELEASE_VERSION#v}" ]; then
+  printf 'Release payload VERSION does not match OPS_AGENT_VERSION.\n' >&2
+  exit 1
+fi
+"$release_bootstrap" "$mode" "$@"

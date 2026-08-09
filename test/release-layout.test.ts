@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -121,6 +122,7 @@ describe("native release layout", () => {
       "scripts/probe-adapter-linux-runtime.mjs",
       "scripts/probe-adapter-linux-runtime.sh",
       "scripts/probe-adapter-linux-socket.mjs",
+      "scripts/configure-noble-bwrap-apparmor.sh",
       "skills/agentd-init/SKILL.md",
       "skills/agentd-init/agents/openai.yaml",
       "skills/agentd-adapter-dev/SKILL.md",
@@ -174,6 +176,73 @@ describe("native release layout", () => {
     );
     expect(packager).toContain(
       "probe-adapter-linux-client.mjs probe-adapter-linux-fixture.mjs",
+    );
+  });
+
+  it("exposes host policy as an explicit verified pre-init artifact stage", () => {
+    const bootstrap = repositoryFile("scripts/install.sh");
+    const releaseBootstrap = repositoryFile("scripts/ops-agent-bootstrap.sh");
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+    const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
+
+    expect(bootstrap).toContain("host-policy ACTION");
+    expect(bootstrap).toContain("host-policy requires inspect, install, or status");
+    expect(bootstrap).toContain(
+      "The Raw bootstrap requires an explicit OPS_AGENT_VERSION=vX.Y.Z",
+    );
+    expect(bootstrap).toContain(
+      '"$(cat "$payload_version_file")" != "${RELEASE_VERSION#v}"',
+    );
+    expect(bootstrap).toContain(
+      'release_bootstrap="${bootstrap_tmp}/release/ops-agent-bootstrap"',
+    );
+    expect(bootstrap).toContain('"$release_bootstrap" "$mode" "$@"');
+
+    expect(releaseBootstrap).toContain('if [[ "${mode}" == host-policy ]]');
+    expect(releaseBootstrap).toContain('exec "${host_policy_helper}" "$@"');
+    expect(releaseBootstrap).toContain('exec "${installer}" "${mode}" "$@"');
+    expect(releaseBootstrap).toContain("verify_root_release_tree");
+    expect(releaseBootstrap).toContain("-perm /022");
+    expect(releaseBootstrap).not.toContain("curl");
+    expect(releaseBootstrap).not.toContain("apt-get");
+
+    expect(packager).toContain(
+      '"${archive_root}/configure-noble-bwrap-apparmor.sh"',
+    );
+    expect(packager).toContain(
+      '"${archive_root}/ops-agent-bootstrap"',
+    );
+    expect(packager).toContain(
+      'exec "/usr/lib/ops-agent-payload/${VERSION}/ops-agent-bootstrap" "\\$@"',
+    );
+    expect(packager).toContain("sudo ops-agent-bootstrap host-policy install");
+    expect(verifier).toContain("Archive is missing its executable pre-init host-policy helper");
+    expect(verifier).toContain("Outer and installed host-policy helpers differ");
+    expect(verifier).toContain("Archive is missing its executable release bootstrap");
+    const releaseBootstrapSha256 = createHash("sha256")
+      .update(releaseBootstrap)
+      .digest("hex");
+    expect(verifier).toContain(
+      `EXPECTED_RELEASE_BOOTSTRAP_SHA256="${releaseBootstrapSha256}"`,
+    );
+    expect(verifier).toContain(
+      "Debian bootstrap does not delegate exactly to its versioned release wrapper",
+    );
+    expect(verifier).toContain("dpkg-deb -e");
+    expect(verifier).toContain('dpkg-deb --fsys-tarfile "${DEBIAN_PACKAGE}"');
+    expect(verifier).toContain('dpkg-deb --ctrl-tarfile "${DEBIAN_PACKAGE}"');
+    expect(verifier).toContain(
+      "Debian data archive contains a non-root numeric owner/group",
+    );
+    expect(verifier).toContain(
+      "Debian postinst differs from the audited non-mutating contract",
+    );
+    expect(continuousIntegration).toContain(
+      "/var/tmp/ops-agent-bootstrap-ci.XXXXXX",
+    );
+    expect(continuousIntegration).toContain(
+      '"${root_bootstrap_fixture}/ops-agent-bootstrap" host-policy status',
     );
   });
 

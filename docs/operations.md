@@ -415,6 +415,13 @@ lock 或手改 `current`。profile digest 更新
 
 ### BotMux
 
+BotMux setup guard 以实际 host evidence 为准，而不是只识别 Ubuntu Noble。任何 host 读取到
+restricted-userns=`1` 且 AppArmor=`Y/y` 时，真实 `NoNewPrivileges=yes` main→pi wrapper chain 都在
+wrapper/config mutation、hardener 或 restart 前 unsupported/fail closed；Noble 缺少/无法读取
+restriction evidence 也拒绝，其他 host 只有该 sysctl 安全不存在时才可跳过。core/base host-policy
+helper 仍只支持 Noble，且不覆盖 BotMux 链；给 BotMux main 复制 `AppArmorProfile=-bwrap` 会让 wrapper
+过早进入 `unpriv_bwrap`，阻断后续 sandbox setup。direct Adapter probe 成功也不能解除该 guard。
+
 `/botmux-setup` 只在本地 TUI idle 且有 TTY 时运行。Client 固定调用
 `sudo -k -- /usr/libexec/pi-ops-agent/setup-botmux`，wrapper 不接受参数；通过 PAM 后，所有 BotMux
 命令和 Source snapshot 中 digest-approved hardener 都降权到 `ops-agent-botmux`。Wrapper 先用
@@ -506,6 +513,28 @@ Server-only endpoint 使用同一 `join` 入口升级，但不得重新使用或
 Controller 卸载也会精确移除这条 `add-wants` dependency；若 unit-state 卸载事务中断，则先恢复
 原 enable/active 状态和同一条固定 symlink，再报告失败。
 
+Ubuntu Noble restricted-userns 的 AppArmor profile 不是普通 release 文件。升级 controller 前先用
+固定同一新 Release 的 `ops-agent-bootstrap host-policy inspect` 做持锁、无 probe 的只读 eligibility
+核对，再依次运行 `host-policy install` 与 `host-policy status`；Raw 入口必须在每次调用都固定同一个
+`OPS_AGENT_VERSION=vX.Y.Z`，离线 tar 使用 release-root wrapper，`.deb` 使用 `/usr/sbin` launcher。
+离线 archive 必须由 root 解入独占 `0700` staging；禁止从用户/Agent 可写目录 sudo 执行 wrapper，
+其 root path-chain/release-tree owner 与 DAC 校验失败时不得通过复制单个 helper 绕过。
+`status` 不修改持久 policy，但在 `managed:enforce` 时会在同一独占目录锁内创建并清理新的
+短生命周期 static authority smoke，只有输出 `verified-now` 才是当前时点证据。只有 helper pin 的
+package/version/source hash/local-rule bytes、批准前完整展示的 authority-summary hash 与当前 host
+exact 匹配，管理员按 canonical approval digest 在模型外重新确认 `install`，helper 的
+`NoNewPrivileges=yes` authority smoke 和 installer preflight 都通过，才可把 core/base 视为支持。
+任一 version/hash/rule 漂移都必须随新 Release 重新审阅、重新批准；不能用旧 helper 静默覆盖。Agent、
+sudoers 与 `join` 永远不能触发这项宿主 policy 维护，也不能以改 sysctl、SUID/unconfined 或单层
+bwrap 规避失败。该合同不改变事实优先 BotMux guard：任何 host 实际读到 restricted-userns=`1` 且
+AppArmor enabled 时，真实 main→pi wrapper chain 都在 setup mutation 前 unsupported/fail closed；
+direct Node Adapter probe 不能作为升级验收证据。
+若 fresh helper install 在 kernel profile 可能已 load 后失败，恢复绝不自动调用 parser remove；
+只有权威 kernel evidence 证明 `bwrap`/`unpriv_bwrap` 均 absent 才删除本轮 exact fresh files，
+loaded/partial/unreadable 则保留 files 与 kernel state、报告 `INCOMPLETE`，不能把它当作已回滚。
+若状态原本是 exact managed files + kernel absent，reload 或 smoke 失败同样保留既有 files 与 kernel
+evidence；helper 不把它伪装成安全 absent，也不自动卸载 profile。
+
 ### 回退
 
 ```bash
@@ -596,6 +625,17 @@ active/enabled 状态；上述失败会尝试完整恢复，恢复不完整时�
 `/etc/ops-agent`、`/var/lib/ops-agent`、`/var/log/ops-agent`、所有 service accounts，以及
 legacy 恢复所需的 `/opt/pi-ops-agent/plugins`；其余 release、wrapper、unit、drop-in、tmpfiles
 和专用 sudoers 会删除。
+
+默认卸载永久保留 helper 管理的宿主 AppArmor profile/local rule；卸载脚本不会把 host-wide
+authority 当作普通项目文件顺带删除。本 Release 虽保留 `configure-noble-bwrap-apparmor.sh remove`
+命令形状用于明确拒绝，但调用永远 fail closed，不接受 `--maintenance-safe` 或 REMOVE approval。
+原因是用户态扫描“当前没有 active `bwrap`/`unpriv_bwrap` label”后，仍可能有新进程在卸载 kernel
+profile 前进入 setup profile，无法把检查与 unload/remove 原子化。不要用停止已知 service 或重复
+扫描把这条竞态误写成安全。
+
+确需移除时必须另行设计和审计宿主级维护流程，处理新 exec admission、kernel profile unload 与
+文件恢复的一致性；它不属于本 Release 的自动卸载或 helper authority。状态不确定时保留文件与证据
+并 fail closed。`join` endpoint 从不管理这项 policy，因此也没有对应清理动作。
 
 永久清理：
 

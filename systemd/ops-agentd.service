@@ -22,6 +22,7 @@ RestartSec=3s
 TimeoutStopSec=20s
 UMask=0077
 NoNewPrivileges=yes
+AppArmorProfile=-bwrap
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict

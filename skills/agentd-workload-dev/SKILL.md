@@ -74,6 +74,32 @@ Never add a host-shell, in-process loader, Docker, or reduced-isolation fallback
 bubblewrap/user namespaces. Because `workload.base` is mandatory, that condition fails the whole
 initialization transaction rather than merely hiding `ops_bash`.
 
+Keep Ubuntu Noble AppArmor compatibility outside Workload authority. Under
+`kernel.apparmor_restrict_unprivileged_userns=1`, only the version/hash-pinned
+`configure-noble-bwrap-apparmor.sh` and exact host-wide `/usr/bin/bwrap ix,` may prepare the host;
+the rule is path-wide, cannot bind project argv, and requires model-external local approval before
+`init`. The canonical approval digest binds the exact package/version/source/rule and the complete
+pre-confirm authority-summary hash; this Release pins
+`sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef` and summary SHA-256
+`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`. The disclosure must cover
+the argv-blind host rule, long-lived Core setup-profile authority, BotMux unsupported state, and no
+automatic removal. `ops-agentd` then uses typed `AppArmorProfile=-bwrap`. Require the helper's
+root-owned, closed-world `NoNewPrivileges=yes` static smoke plus the installer preflight to prove
+outer→fixed inner, final Source PID 1 under `unpriv_bwrap`, all capability sets zero, and no further
+userns/nested bwrap.
+The hosted helper-bound gate is still pending for this candidate, so keep `init` fail closed unless
+those exact checks succeed; local/static validation is not production evidence.
+
+This Noble-only compatibility covers direct Node `ops-agentd` and mandatory `workload.base`; it does
+not authorize a workload, provider, or Adapter to manage host policy. BotMux guard decisions are
+fact-first: every host with readable restricted-userns=`1` and AppArmor=`Y/y` refuses before setup
+mutation; Noble also refuses missing/unreadable restriction evidence, while another host may continue
+only when that sysctl is safely absent. A direct Adapter probe does not override this. Never
+compensate in a workload descriptor/provider/source, requested scope, install hook, broker arm,
+sysctl, SUID/unconfined setting, or single-layer fallback. Host-policy helper invocation never runs on
+`join`, requires reapproval after distribution profile version/hash/rule/authority-summary drift, and
+preserves policy on default uninstall.
+
 Keep the runtime and unit contract synchronized: both Workload bwrap layers use only
 `user/ipc/pid/net/mnt`,
 while `ops-agentd.service` allow-lists exactly those namespace types. Do not add cgroup, UTS, or time

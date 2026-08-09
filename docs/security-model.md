@@ -479,6 +479,37 @@ root standing authority。规则是：
     可见，不能把该组合描述为完整 `/proc` 隐藏。安装 preflight 必须在复制最终 security drop-in、
     核验 PID 1 effective 配置且执行后精确清理的短生命周期 static systemd boundary 内运行完整双层
     bwrap probe，不能只在同 UID 的普通 shell 中探测。
+13. Ubuntu Noble 的 AppArmor restricted-userns 兼容不能靠“某次 bwrap 能启动”判定。唯一项目管理
+    路径是独立 `configure-noble-bwrap-apparmor.sh`：它 pin 发行版 `bwrap-userns-restrict` exact
+    version/hash、写入 exact `/usr/bin/bwrap ix,`，并要求 `ops-agentd.service` 以 typed
+    ignore-missing `AppArmorProfile=-bwrap` 进入 setup profile。AppArmor exec rule 只绑定 path、不绑定
+    argv，是对宿主所有匹配执行的 authority 扩张，所以 `install` 必须在 `init` 前经过模型外本地
+    逐次审批，不能因来自项目或发行版就默认可信。该 attachment 还让长期 `ops-agentd` Node 本体
+    保持在 bwrap setup profile：非 root UID、`NoNewPrivileges=yes` 与空 capability bounding set 不会
+    让它取得宿主 capability，但被攻陷 Core 可以直接尝试 profile 允许的 userns/mount/network setup
+    syscall，而不是只能执行项目的固定 bwrap argv。outer/inner bwrap 通过 `ix` 继承这份 authority，
+    首次 non-bwrap Source exec 才 stack `unpriv_bwrap`。本地批准必须展示并接受这项 residual；长期
+    最小化需要独立 typed spawn supervisor，本 Release 尚未实现。helper 必须在读取 TTY confirmation
+    或校验 noninteractive approval digest 前完整展示 host-wide argv-blind `ix`、这项长期 Core authority、
+    BotMux 不支持与不自动移除；canonical digest 还要绑定这份 exact authority-summary hash。helper 的
+    root-owned `NoNewPrivileges=yes` static-unit smoke 必须闭世界核对 exact fragment/drop-in closure、
+    唯一无 flags ExecStart、空 hooks/environment/groups/capabilities 与完整 PID 1 effective vector，再
+    核验 effective profile、outer→inner、最终 Source PID 1 的
+    `unpriv_bwrap` label、全零 capability 和后续 userns/nested-bwrap deny；hosted gate 未通过前，
+    本地 `bash -n`/direct smoke 不能支持 production 声明。该兼容仅覆盖直接 Node 的
+    `ops-agentd`/mandatory `workload.base`，helper 仍只支持 Noble。BotMux setup guard 不以发行版
+    label 提前放行：任何 host 实际读到 restricted-userns=`1` 且 AppArmor=`Y/y` 都在 mutation 前拒绝；
+    Noble restriction evidence 缺失/不可读也拒绝，其他 host 仅在该 sysctl 安全不存在时跳过。真实
+    BotMux main→pi wrapper 提前 attach 会先落入 `unpriv_bwrap` 并破坏后续 setup，Adapter direct
+    smoke 不能替代其实际链路。helper 不得由 Agent、sudoers 或 `join` 调用，
+    不得 apt/install package、修改 sysctl、启用 SUID/unconfined 或削弱双层结构。version/hash 漂移
+    必须由新 Release 重新 pin、重新批准。canonical approval digest 必须同时绑定 package 名、exact
+    version/source hash、local-rule bytes 与上述完整 authority-summary hash，不能直接复用 source SHA。
+    `inspect` 只在独占 policy-directory lock 内做无 probe 检查；`status` 不修改持久 policy，但
+    `managed:enforce` 时必须在同一把锁内重跑并清理一份 fresh static smoke，只有 `verified-now` 才是
+    当前证据。默认卸载永久保留宿主 policy；
+    本 Release 的 `remove` 永远 fail closed，因为用户态 active-label scan 无法排除检查后新进程进入
+    setup profile 的竞态。任何移除必须另行设计并审计主机维护流程。
 
 初始化必须安装 `adapter.tui` 与 `workload.base` 才能工作，所以安装器把它们作为**需明确提示
 并批准的必需项**处理。`--approve-required-plugins` 只适用于外部自动化已经批准该 Release
@@ -619,6 +650,11 @@ release binary 应静态构建并排除 AppleDouble `._*` 文件。
 
 尚未实现或尚未完成迁移的安全能力：
 
+- Ubuntu Noble helper 的 hosted authority smoke 与事实优先 BotMux guard：直接 bwrap smoke 已证明 exact `ix`
+  下最终 Source 仍 stack `unpriv_bwrap` 且没有 capability/nested-userns authority；helper 已把
+  `ops-agentd` 的 typed profile attachment 与同一 `NoNewPrivileges=yes` static-unit proof 固化，但
+  hosted runner 尚未给出最终结果。该证据只可能支持直接 Node core/base；BotMux 在任何已观察到
+  restricted-userns=`1` 且 AppArmor enabled 的 host 都于 setup mutation 前拒绝；
 - Source Plugin registry lease 的 crash-persistent lifecycle proof：正常及受控错误路径已等待 outer
   init exact identity 被 reap，但 broker restart、强制 socket 断连、runtime SIGKILL 或 workload
   hard deadline 会释放当前 socket-backed `flock`。尚无把 supervisor/pidfd completion 或持久

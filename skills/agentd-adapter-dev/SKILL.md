@@ -79,6 +79,32 @@ bwrap, and release ordering for the exact-digest lease. Source Adapter messages 
 typed channel; positional argv and `@file` prompts are forbidden. Exit status
 `77` means the Linux/root/systemd/account/bwrap prerequisites were absent and is not a passing result. Never
 replace this check with a fake bwrap or a mocked effective UID/GID.
+
+Do not hide Ubuntu Noble AppArmor failures inside an Adapter change. With
+`kernel.apparmor_restrict_unprivileged_userns=1`, the version/hash-pinned host helper and exact
+host-wide `/usr/bin/bwrap ix,` are an administrator-approved `init` prerequisite only for direct
+Node `ops-agentd`/mandatory `workload.base`. The approval digest must bind the exact package/version/
+source/rule plus the complete pre-confirm authority-summary hash; for this Release they are
+`sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef` and
+`c745e2eb341efc1a26b017e63cc03b284f63f51298036ce58e9e6661d7f7015c`. Its closed-world
+`NoNewPrivileges=yes` static smoke and the direct
+Adapter CI probe can prove the underlying outer→inner mechanism, final `unpriv_bwrap` label, zero
+capabilities, and nested-userns deny; they do not prove an arbitrary Adapter service chain.
+In particular, attaching the real BotMux main service makes its pi wrapper enter `unpriv_bwrap` too
+early and prevents the later sandbox setup. Treat observed host state as authoritative: every host
+with readable restricted-userns=`1` and AppArmor=`Y/y` refuses BotMux before setup mutation;
+Noble also refuses missing/unreadable restriction evidence, while another host may continue only
+when that sysctl is safely absent. This remains fail closed even if the direct Adapter probe passes.
+Never claim otherwise or change Adapter bwrap arguments, use SUID/unconfined, modify the sysctl, or
+remove either layer. The host-policy helper itself remains Noble-only.
+Require the helper to disclose the argv-blind host rule, long-lived Core setup-profile authority,
+BotMux unsupported state, and lack of automatic removal before approval. Host-policy management
+never belongs in Adapter source, lifecycle hooks, requested scopes, Agent
+tools, sudoers, or `join`. It requires model-external local approval of the exact Release/profile
+digest, reapproval after version/hash/rule/authority-summary drift, and default-uninstall
+preservation. The helper-bound
+hosted gate is still pending for this candidate; local/static validation is not production evidence.
+
 `adapter.tui` is instead a non-executable profile: the runner starts the compiled Client directly
 to preserve host sudo/PAM, and that Client independently holds the exact TUI digest lease until it
 exits so runner failure cannot leave an unleased approver. Do not use the TUI exception for source.
