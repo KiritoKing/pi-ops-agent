@@ -281,7 +281,14 @@ describe("native release layout", () => {
     const adapterProbe = repositoryFile("scripts/probe-adapter-linux-runtime.sh");
     const probeJobStart = releaseWorkflow.indexOf("  adapter-linux-runtime:\n");
     const buildJobStart = releaseWorkflow.indexOf("\n  build:\n", probeJobStart);
-    const publishJobStart = releaseWorkflow.indexOf("\n  publish:\n", buildJobStart);
+    const candidateJobStart = releaseWorkflow.indexOf(
+      "\n  release-candidate-verification:\n",
+      buildJobStart,
+    );
+    const publishJobStart = releaseWorkflow.indexOf(
+      "\n  publish:\n",
+      candidateJobStart,
+    );
     const continuousProbeStart = continuousIntegration.indexOf(
       "  adapter-linux-runtime:\n",
     );
@@ -292,7 +299,8 @@ describe("native release layout", () => {
 
     expect(probeJobStart).toBeGreaterThan(0);
     expect(buildJobStart).toBeGreaterThan(probeJobStart);
-    expect(publishJobStart).toBeGreaterThan(buildJobStart);
+    expect(candidateJobStart).toBeGreaterThan(buildJobStart);
+    expect(publishJobStart).toBeGreaterThan(candidateJobStart);
     expect(continuousProbeStart).toBeGreaterThan(0);
     expect(installerStart).toBeGreaterThan(continuousProbeStart);
     const releaseProbeJob = releaseWorkflow.slice(probeJobStart, buildJobStart);
@@ -302,7 +310,10 @@ describe("native release layout", () => {
     );
     expect(releaseProbeJob).toContain("needs: validate");
     expect(releaseProbeJob).toContain(
-      'readonly release_version="${GITHUB_REF_NAME#v}"',
+      "RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}",
+    );
+    expect(releaseProbeJob).toContain(
+      'readonly release_version="${RELEASE_VERSION}"',
     );
     expect(continuousProbeJob).toContain(
       'readonly release_version="${RELEASE_VERSION}"',
@@ -590,11 +601,119 @@ describe("native release layout", () => {
     }
 
     expect(continuousIntegration).toContain("workflow_call:");
+    const candidateJob = releaseWorkflow.slice(candidateJobStart, publishJobStart);
+    expect(candidateJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n/u,
+    );
     const publishJob = releaseWorkflow.slice(publishJobStart);
     expect(publishJob).toMatch(
-      /needs:\n\s+- build\n\s+- adapter-linux-runtime\n/u,
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n\s+- release-candidate-verification\n/u,
     );
-    expect(publishJob).toContain("- ci-release-gates");
+  });
+
+  it("verifies pull-request and manual release candidates without publishing", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    const validateStart = workflow.indexOf("  validate:\n");
+    const adapterStart = workflow.indexOf("\n  adapter-linux-runtime:\n", validateStart);
+    const candidateStart = workflow.indexOf("\n  release-candidate-verification:\n");
+    const publishStart = workflow.indexOf("\n  publish:\n", candidateStart);
+    expect(validateStart).toBeGreaterThan(0);
+    expect(adapterStart).toBeGreaterThan(validateStart);
+    expect(candidateStart).toBeGreaterThan(adapterStart);
+    expect(publishStart).toBeGreaterThan(candidateStart);
+
+    const triggerBlock = workflow.slice(0, workflow.indexOf("permissions:"));
+    expect(triggerBlock).toContain('tags:\n      - "v*.*.*"');
+    expect(triggerBlock).toContain("pull_request:\n    branches:\n      - main");
+    expect(triggerBlock).toContain("workflow_dispatch:");
+
+    const validateJob = workflow.slice(validateStart, adapterStart);
+    for (const output of ["release_version", "release_tag", "source_sha"]) {
+      expect(validateJob).toContain(
+        `${output}: \${{ steps.release_identity.outputs.${output} }}`,
+      );
+      expect(validateJob).toContain(`printf '${output}=%s\\n'`);
+    }
+    expect(validateJob).toContain('source_sha="$(git rev-parse HEAD)"');
+    expect(validateJob).toContain('test "${source_sha}" = "${GITHUB_SHA}"');
+    expect(validateJob).toContain(
+      'release_version="$(node -p \'require("./package.json").version\')"',
+    );
+    expect(validateJob).toContain('expected_release_tag="v${release_version}"');
+    expect(validateJob).toContain('release_tag=""');
+    expect(validateJob).toContain("pull_request|workflow_dispatch)");
+    expect(validateJob).toContain(
+      'test "${GITHUB_REF}" = "refs/tags/${expected_release_tag}"',
+    );
+    expect(validateJob).toContain('release_tag="${expected_release_tag}"');
+
+    const downstream = workflow.slice(adapterStart);
+    expect(downstream).not.toContain("${GITHUB_REF_NAME#v}");
+    expect(downstream).not.toContain('"${GITHUB_SHA}"');
+    expect(downstream).toContain(
+      "RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}",
+    );
+    expect(downstream).toContain(
+      "SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}",
+    );
+
+    const candidateJob = workflow.slice(candidateStart, publishStart);
+    expect(candidateJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n/u,
+    );
+    expect(candidateJob).toContain("pattern: native-*");
+    expect(candidateJob).toContain("merge-multiple: true");
+    expect(candidateJob).toContain("packaging/verify-release.sh");
+    expect(candidateJob).toContain("--no-payload-execution");
+    expect(candidateJob).toContain("packaging/build-botmux-plugin.sh");
+    expect(candidateJob).toContain("packaging/build-hermes-workload-plugin.sh");
+    expect(candidateJob).toContain("packaging/create-release-manifest.sh");
+    expect(candidateJob).toContain("sha256sum -- * | sort -k 2 > checksums.txt");
+    expect(candidateJob).toContain(
+      "name: release-candidate-${{ needs.validate.outputs.source_sha }}",
+    );
+    expect(candidateJob).toContain(
+      "Candidate verified; no release or tag was created.",
+    );
+    expect(candidateJob).not.toContain("permissions:");
+    expect(candidateJob).not.toContain("actions/attest@");
+    expect(candidateJob).not.toContain("gh release create");
+
+    const publishJob = workflow.slice(publishStart);
+    expect(publishJob).toContain("github.event_name == 'push'");
+    expect(publishJob).toContain("github.ref_type == 'tag'");
+    expect(publishJob).toContain(
+      "github.ref_name == needs.validate.outputs.release_tag",
+    );
+    expect(publishJob).toContain(
+      "github.ref == format('refs/tags/{0}', needs.validate.outputs.release_tag)",
+    );
+    expect(publishJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n\s+- release-candidate-verification\n/u,
+    );
+    expect(publishJob).toContain("contents: write");
+    expect(publishJob).toContain("id-token: write");
+    expect(publishJob).toContain("attestations: write");
+    expect(publishJob).toContain("artifact-metadata: write");
+    for (const writePermission of [
+      "contents: write",
+      "id-token: write",
+      "attestations: write",
+      "artifact-metadata: write",
+    ]) {
+      expect(workflow.split(writePermission)).toHaveLength(2);
+    }
+    expect(publishJob).toContain(
+      "name: release-candidate-${{ needs.validate.outputs.source_sha }}",
+    );
+    expect(publishJob).toContain(
+      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+    );
+    expect(publishJob).toContain("node-version: 24");
+    expect(publishJob).toContain("sha256sum --check --strict checksums.txt");
+    expect(publishJob).toContain("packaging/verify-release.sh");
+    expect(publishJob).toContain("actions/attest@");
+    expect(publishJob).toContain('gh release create "${RELEASE_TAG}"');
   });
 
   it("gates releases on a disposable signed non-PVE join and rollback", () => {
@@ -677,38 +796,77 @@ describe("native release layout", () => {
     const packageUploadBlock = workflow.slice(packageUpload, sbom);
     expect(packageUploadBlock).toContain("name: native-packages-${{ matrix.arch }}");
     expect(packageUploadBlock).toContain("ops-agent-linux-${{ matrix.arch }}.tar.gz");
-    expect(packageUploadBlock).toContain("ops-agent-all_${{ steps.native_package.outputs.version }}");
+    expect(packageUploadBlock).toContain(
+      "ops-agent-all_${{ needs.validate.outputs.release_version }}",
+    );
+    expect(packageUploadBlock).toContain("if-no-files-found: error");
+    expect(packageUploadBlock).not.toContain("overwrite: true");
+    expect(packageUploadBlock).not.toContain("overwrite:");
     expect(packageUploadBlock).not.toContain("spdx");
     expect(packageUploadBlock).not.toContain("release/*");
 
-    const sbomUploadBlock = workflow.slice(sbomUpload, workflow.indexOf("publish:"));
+    const candidateStart = workflow.indexOf("release-candidate-verification:");
+    const publishStart = workflow.indexOf("\n  publish:\n", candidateStart);
+    const sbomUploadBlock = workflow.slice(sbomUpload, candidateStart);
     expect(sbomUploadBlock).toContain("name: native-sbom-${{ matrix.arch }}");
     expect(sbomUploadBlock).toContain(
       "path: release/ops-agent-linux-${{ matrix.arch }}.spdx.json",
     );
     expect(sbomUploadBlock).not.toContain(".tar.gz");
     expect(sbomUploadBlock).not.toContain(".deb");
+    expect(sbomUploadBlock).toContain("if-no-files-found: error");
+    expect(sbomUploadBlock).not.toContain("overwrite: true");
+    expect(sbomUploadBlock).not.toContain("overwrite:");
 
-    const publishDownload = workflow.indexOf("actions/download-artifact@");
-    const publishVerify = workflow.indexOf("name: Re-verify downloaded native packages");
-    const manifest = workflow.indexOf("name: Generate release manifest and checksums");
+    const candidateDownload = workflow.indexOf(
+      "actions/download-artifact@",
+      candidateStart,
+    );
+    const candidateVerify = workflow.indexOf(
+      "name: Re-verify downloaded native packages",
+      candidateDownload,
+    );
+    const manifest = workflow.indexOf(
+      "name: Generate release candidate manifest and checksums",
+      candidateVerify,
+    );
+    const candidateUpload = workflow.indexOf(
+      "name: Upload the aggregated verified release candidate",
+      manifest,
+    );
+    const publishDownload = workflow.indexOf("actions/download-artifact@", publishStart);
+    const publishVerify = workflow.indexOf(
+      "name: Verify the aggregated candidate and native packages",
+      publishDownload,
+    );
     const attest = workflow.indexOf("name: Attest release artifacts");
     const publish = workflow.indexOf("name: Publish GitHub Release");
-    expect(publishDownload).toBeGreaterThan(sbomUpload);
-    expect(publishDownload).toBeLessThan(publishVerify);
-    expect(workflow.slice(publishDownload, publishVerify)).toContain(
+    expect(candidateDownload).toBeGreaterThan(sbomUpload);
+    expect(candidateDownload).toBeLessThan(candidateVerify);
+    expect(workflow.slice(candidateDownload, candidateVerify)).toContain(
       "pattern: native-*",
     );
-    expect(workflow.slice(publishDownload, publishVerify)).toContain(
+    expect(workflow.slice(candidateDownload, candidateVerify)).toContain(
       "merge-multiple: true",
     );
-    expect(publishVerify).toBeLessThan(manifest);
-    expect(manifest).toBeLessThan(attest);
+    expect(candidateVerify).toBeLessThan(manifest);
+    expect(manifest).toBeLessThan(candidateUpload);
+    const candidateUploadBlock = workflow.slice(candidateUpload, publishDownload);
+    expect(candidateUploadBlock).toContain("if-no-files-found: error");
+    expect(candidateUploadBlock).not.toContain("overwrite: true");
+    expect(candidateUploadBlock).not.toContain("overwrite:");
+    expect(candidateUpload).toBeLessThan(publishDownload);
+    expect(publishDownload).toBeLessThan(publishVerify);
+    expect(publishVerify).toBeLessThan(attest);
     expect(attest).toBeLessThan(publish);
-    const publishVerifyBlock = workflow.slice(publishVerify, manifest);
-    expect(publishVerifyBlock).toContain("for arch in amd64 arm64");
-    expect(publishVerifyBlock).toContain("packaging/verify-release.sh");
-    expect(publishVerifyBlock).toContain("--no-payload-execution");
+    for (const verificationBlock of [
+      workflow.slice(candidateVerify, manifest),
+      workflow.slice(publishVerify, attest),
+    ]) {
+      expect(verificationBlock).toContain("for arch in amd64 arm64");
+      expect(verificationBlock).toContain("packaging/verify-release.sh");
+      expect(verificationBlock).toContain("--no-payload-execution");
+    }
   });
 
   it("attests every published executable/package class and rejects version drift", () => {

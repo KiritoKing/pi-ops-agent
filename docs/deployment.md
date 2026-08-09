@@ -112,15 +112,25 @@ Node 22 LTS runtime 对所有 compiled JavaScript 做语法检查、实际加载
 同一 job 还会解包 `.tar.gz` 与 `.deb` 并逐字比较 versioned payload，检查 Core、Reviewer、
 Guardian、Adapter/Workload runtime、PVE、Source Plugin、Skills、systemd 和文档表面齐全，且
 不存在旧 helper 或未 prune 的开发依赖。archive 前会删除 AppleDouble `._*` 文件；任一检查
-失败都不会进入 SBOM/attestation/publish。Publish 还要求两个架构的 tar/deb/SBOM 与两个 legacy
-恢复/兼容 `.opspkg` 全部存在；tar、deb、opspkg、SBOM、release manifest 和最终 checksums 都分别纳入
-provenance attestation。CI/Release 引用的远端 GitHub Action 必须固定到审核过的完整 commit SHA，并在
-注释保留对应 release tag。每个 native job 完整运行 `verify-release.sh` 后，先把 tar/deb 上传为独立、
-不可覆盖的 artifact，再运行第三方 SBOM Action；SBOM 只能进入另一个 artifact，不能改写已验证 payload。
-Publish 下载两组 artifact 后、生成 manifest 或 attestation 前再次运行同一个 verifier；这里显式使用
-`--no-payload-execution`，对两个架构做 archive/deb parity、ELF、完整表面和 host-Node JavaScript 语法
-复验，但不在持有 release 写权限的 job 中执行下载来的 payload；bundled Node 与 Client/Reviewer 的实际
-执行证据仍来自对应的低权限 native build job。`.deb` 只安装 payload，不会自动初始化：
+失败都不会进入 release candidate 或 publish。CI/Release 引用的远端 GitHub Action 必须固定到审核过的
+完整 commit SHA，并在注释保留对应 release tag。每个 native job 完整运行 `verify-release.sh` 后，先把
+tar/deb 上传为独立、不可覆盖的 artifact，再运行第三方 SBOM Action；SBOM 只能进入另一个 artifact，
+不能改写已验证 payload。
+
+Release workflow 把候选验证与发布权限分开。面向 `main` 的 `pull_request` 和 `workflow_dispatch`
+止于 non-publishing candidate 路径：`validate` 固定 source SHA 与 package/client/plugin version，随后等待
+完整 CI gates、真实 Linux Adapter runtime probe 以及 amd64/arm64 native build；
+`release-candidate-verification` 下载两组 native artifact，以 `--no-payload-execution` 重新执行 verifier，
+构建两个 legacy 恢复/兼容 `.opspkg`，生成绑定同一 source SHA/version 的 manifest 与最终 checksums，
+再上传一个 aggregate candidate artifact。该路径不做 provenance attestation，不创建 tag，也不创建
+GitHub Release；成功只表示 candidate 已验证。
+
+`publish` 只允许 exact `vX.Y.Z` version tag push，且直接依赖 `validate`、完整 CI gates、真实 Adapter
+probe、两个架构 build 与 aggregate candidate verification 全部成功。它下载同一 source SHA 命名的
+aggregate candidate，复核 checksums、manifest identity 与两个 native package 后，才对 tar、deb、
+opspkg、SBOM、manifest 和 checksums 生成 provenance attestation，并以 `--verify-tag` 创建 GitHub
+Release。持有 release 写权限的 job 不执行下载 payload；bundled Node 与 Client/Reviewer 的实际执行
+证据仍来自对应的低权限 native build job。`.deb` 只安装 payload，不会自动初始化：
 
 ```bash
 sudo dpkg -i ops-agent-all_X.Y.Z_amd64.deb

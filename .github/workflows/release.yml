@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,6 +23,10 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      release_version: ${{ steps.release_identity.outputs.release_version }}
+      release_tag: ${{ steps.release_identity.outputs.release_tag }}
+      source_sha: ${{ steps.release_identity.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -30,15 +38,34 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
       - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
-      - name: Verify tag and manifests use the package version
+      - name: Verify the source identity and release versions
+        id: release_identity
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p 'require("./package.json").version')"
-          test "${version}" = "${package_version}"
+          source_sha="$(git rev-parse HEAD)"
+          test "${source_sha}" = "${GITHUB_SHA}"
+          release_version="$(node -p 'require("./package.json").version')"
+          [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          expected_release_tag="v${release_version}"
+          release_tag=""
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              test "${GITHUB_REF_TYPE}" = "tag"
+              test "${GITHUB_REF}" = "refs/tags/${expected_release_tag}"
+              test "${GITHUB_REF_NAME}" = "${expected_release_tag}"
+              release_tag="${expected_release_tag}"
+              ;;
+            pull_request|workflow_dispatch)
+              ;;
+            *)
+              printf 'Unsupported release workflow event: %s\n' \
+                "${GITHUB_EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
           lock_version="$(node -p 'require("./package-lock.json").packages[""].version')"
-          test "${version}" = "${lock_version}"
+          test "${release_version}" = "${lock_version}"
           NODE_VERSION="${NODE_VERSION}" node <<'NODE'
           const packageDocument = require("./package.json");
           const match = /^>=(\d+)\.(\d+)\.(\d+)$/u.exec(packageDocument.engines?.node ?? "");
@@ -56,11 +83,16 @@ jobs:
           }
           NODE
           client_version="$(sed -n 's/^const VERSION = "\([^"]*\)";$/\1/p' src/client/index.ts)"
-          test "${version}" = "${client_version}"
+          test "${release_version}" = "${client_version}"
           for manifest in plugins/*/manifest.json; do
             plugin_version="$(node -p 'require("./'"${manifest}"'").version')"
-            test "${version}" = "${plugin_version}"
+            test "${release_version}" = "${plugin_version}"
           done
+          {
+            printf 'release_version=%s\n' "${release_version}"
+            printf 'release_tag=%s\n' "${release_tag}"
+            printf 'source_sha=%s\n' "${source_sha}"
+          } >>"${GITHUB_OUTPUT}"
       - run: npm run check
       - run: npm run build
       - run: go vet ./cmd/... ./internal/...
@@ -71,8 +103,13 @@ jobs:
     needs: validate
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -132,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           readonly install_root="/opt/pi-ops-agent"
-          readonly release_version="${GITHUB_REF_NAME#v}"
+          readonly release_version="${RELEASE_VERSION}"
           readonly release_root="${install_root}/releases/${release_version}"
           readonly node_bin="${release_root}/runtime/node"
           readonly current_link="${install_root}/current"
@@ -243,8 +280,13 @@ jobs:
             node_arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -290,33 +332,31 @@ jobs:
           tar -xJf "${node_archive}" --strip-components=1 -C node-runtime
           test "$(node-runtime/bin/node -p 'process.versions.node')" = "${NODE_VERSION}"
       - name: Build native archive and Debian package
-        id: native_package
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
           packaging/build-release.sh \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${RELEASE_VERSION}" \
             --arch "${{ matrix.arch }}" \
             --node-runtime-dir node-runtime \
             --bin-dir release-bin \
             --output-dir release
           packaging/verify-release.sh \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${RELEASE_VERSION}" \
             --arch "${{ matrix.arch }}" \
             --node-version "${NODE_VERSION}" \
             --archive "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" \
-            --deb "release/ops-agent-all_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.deb"
+            --deb "release/ops-agent-all_${RELEASE_VERSION}_${{ matrix.arch }}.deb"
           mkdir -p sbom-root
           tar -xzf "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" -C sbom-root
-          printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
       - name: Isolate verified native packages before SBOM generation
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-packages-${{ matrix.arch }}
           path: |
             release/ops-agent-linux-${{ matrix.arch }}.tar.gz
-            release/ops-agent-all_${{ steps.native_package.outputs.version }}_${{ matrix.arch }}.deb
+            release/ops-agent-all_${{ needs.validate.outputs.release_version }}_${{ matrix.arch }}.deb
           if-no-files-found: error
           retention-days: 7
       - name: Generate installed-payload SPDX SBOM
@@ -335,11 +375,90 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
+  release-candidate-verification:
     needs:
+      - validate
       - build
       - adapter-linux-runtime
       - ci-release-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: candidate
+          merge-multiple: true
+      - name: Re-verify downloaded native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          for arch in amd64 arm64; do
+            packaging/verify-release.sh \
+              --version "${RELEASE_VERSION}" \
+              --arch "${arch}" \
+              --node-version "${NODE_VERSION}" \
+              --archive "candidate/ops-agent-linux-${arch}.tar.gz" \
+              --deb "candidate/ops-agent-all_${RELEASE_VERSION}_${arch}.deb" \
+              --no-payload-execution
+          done
+      - name: Build optional first-party plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/build-botmux-plugin.sh "${RELEASE_VERSION}" candidate
+          packaging/build-hermes-workload-plugin.sh "${RELEASE_VERSION}" candidate
+      - name: Generate release candidate manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/create-release-manifest.sh \
+            candidate "${RELEASE_VERSION}" "${GITHUB_REPOSITORY}" "${SOURCE_SHA}"
+          (
+            cd candidate
+            sha256sum -- * | sort -k 2 > checksums.txt
+          )
+      - name: Upload the aggregated verified release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-${{ needs.validate.outputs.source_sha }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record the non-publishing candidate result
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '## Release candidate verified\n\n'
+            printf -- '- Version: `%s`\n' "${RELEASE_VERSION}"
+            printf -- '- Source SHA: `%s`\n' "${SOURCE_SHA}"
+            printf -- '- Candidate verified; no release or tag was created.\n'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  publish:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_name == needs.validate.outputs.release_tag &&
+      github.ref == format('refs/tags/{0}', needs.validate.outputs.release_tag)
+    needs:
+      - validate
+      - build
+      - adapter-linux-runtime
+      - ci-release-gates
+      - release-candidate-verification
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -347,45 +466,47 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: native-*
+          name: release-candidate-${{ needs.validate.outputs.source_sha }}
           path: release
-          merge-multiple: true
-      - name: Re-verify downloaded native packages
+      - name: Verify the aggregated candidate and native packages
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+          (
+            cd release
+            sha256sum --check --strict checksums.txt
+          )
+          jq -e \
+            --arg version "${RELEASE_VERSION}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit "${SOURCE_SHA}" \
+            '.version == $version and .repository == $repository and .commit == $commit' \
+            release/manifest.json >/dev/null
           for arch in amd64 arm64; do
             packaging/verify-release.sh \
-              --version "${GITHUB_REF_NAME#v}" \
+              --version "${RELEASE_VERSION}" \
               --arch "${arch}" \
               --node-version "${NODE_VERSION}" \
               --archive "release/ops-agent-linux-${arch}.tar.gz" \
-              --deb "release/ops-agent-all_${GITHUB_REF_NAME#v}_${arch}.deb" \
+              --deb "release/ops-agent-all_${RELEASE_VERSION}_${arch}.deb" \
               --no-payload-execution
           done
-      - name: Build optional first-party plugins
-        shell: bash
-        run: |
-          set -euo pipefail
-          packaging/build-botmux-plugin.sh "${GITHUB_REF_NAME#v}" release
-          packaging/build-hermes-workload-plugin.sh "${GITHUB_REF_NAME#v}" release
-      - name: Generate release manifest and checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          packaging/create-release-manifest.sh \
-            release "${GITHUB_REF_NAME#v}" "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
-          (
-            cd release
-            sha256sum -- * | sort -k 2 > checksums.txt
-          )
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -402,9 +523,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            printf 'Release %s already exists; published assets are immutable.\n' "${GITHUB_REF_NAME}" >&2
+          test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            printf 'Release %s already exists; published assets are immutable.\n' "${RELEASE_TAG}" >&2
             exit 1
           fi
-          gh release create "${GITHUB_REF_NAME}" release/* \
-            --verify-tag --generate-notes --title "Pi Ops Agent ${GITHUB_REF_NAME}"
+          gh release create "${RELEASE_TAG}" release/* \
+            --verify-tag --generate-notes --title "Pi Ops Agent ${RELEASE_TAG}"

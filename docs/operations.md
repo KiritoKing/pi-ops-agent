@@ -480,6 +480,12 @@ snapshot 校验失败都直接中止；legacy `.opspkg` 只保留 artifact/chang
 7. 在隔离 systemd 环境做 upgrade + rollback smoke。SBOM 是依赖清单，archive/deb 的逐字内容
    完整性仍以 asset checksum、manifest 和 provenance attestation 为准，不能把 SBOM 当文件签名。
 
+PR 或 `workflow_dispatch` 的 aggregate candidate path 只是 non-publishing 验证：只有 validate、完整
+CI、真实 Adapter probe、amd64/arm64 build 与复验都成功，才上传包含 manifest/checksums 的 candidate；
+该路径不做 provenance attestation，也不创建 exact version tag 或 GitHub Release，不能直接作为生产
+升级来源。生产发布必须来自 exact `vX.Y.Z` tag path；publish job 直接依赖上述全部 gates 和 aggregate
+candidate verification，再次核验 candidate 后才 attestation 并创建 Release。
+
 Installer 会先停 agentd/server ingress、检查两个 broker store，并拒绝仍 active 的 broker；这
 是显式离线升级，不会通过强停 PVE 长任务制造 `RECOVERY_REQUIRED`。随后生成候选 policy，备份
 旧 `targets.json`，再切换 `current`。从账号/组变更开始，
