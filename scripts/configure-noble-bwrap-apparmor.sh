@@ -922,6 +922,8 @@ EOF
       || "$(/usr/bin/systemctl show "${unit}" -p ExecMainStatus --value)" != 0 ]]; then
     /usr/bin/systemctl status "${unit}" --no-pager >&2 || true
     /usr/bin/journalctl --boot -u "${unit}" --no-pager -n 64 -o cat >&2 || true
+    /usr/bin/journalctl --boot -k \
+      --grep='apparmor="DENIED"|apparmor=DENIED' --no-pager -n 64 -o cat >&2 || true
     fail "AppArmor compatibility smoke did not finish successfully"
   fi
   [[ "$(/usr/bin/stat -c '%u:%g:%a:%h:%s' "${nonce}")" \

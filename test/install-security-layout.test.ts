@@ -590,6 +590,9 @@ describe("installed client-plane isolation", () => {
     expect(helper).toContain(
       '/usr/bin/journalctl --boot -u "${unit}" --no-pager -n 64 -o cat',
     );
+    expect(helper).toContain(
+      "--grep='apparmor=\"DENIED\"|apparmor=DENIED' --no-pager -n 64 -o cat",
+    );
     expect(helper).toContain("Probe cleanup left an exact artifact path behind");
     expect(helper).toContain('LOCK_DIRECTORY="/etc/apparmor.d"');
     expect(helper.match(/ {2}acquire_helper_lock\n/g)).toHaveLength(3);
