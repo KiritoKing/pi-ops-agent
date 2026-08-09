@@ -74,6 +74,16 @@ runtime、`service.d` 与 unit-specific drop-in；其中一个更晚的 scalar o
    `SuccessExitStatus` 也必须精确；agentd generated credential drop-in 必须逐字、metadata 与 loaded
    path 同时匹配。
 
+`ImportCredential=` 是 systemd v254 才加入的 service property。对暴露该 property 的 PID 1，installer
+仍要求 typed `as` 且精确为空；property query 的任何失败都不能按错误文本忽略。唯一兼容例外是 PID 1
+的 typed `Manager.Version` 为 canonical 且 major `<254`、同一个已加载 unit object 的
+`Introspect` 明确包含唯一结构化 Service interface、4 个既有 credential property anchor 均以精确
+type/access 唯一存在、但不存在 `ImportCredential` property，并且 exact unit、
+managed drop-in 与完整 PID-1-loaded `DropInPaths` 闭包都只包含空的 `ImportCredential=` reset 或完全
+不包含该 directive。三项证据同时成立时才把缺失 property canonicalize 为 typed empty vector；version
+畸形、未来版本缺 property、introspection 结构/anchor 不符、非空/续行/含混 directive 或任一其他 D-Bus 错误都
+保持 fail closed。
+
 `DropInPaths` 不是只检查 final filename 是否出现：除 exact managed security/credential policy 外，
 installer 只接受固定 host-wide `service.d` 位置中 root-owned、non-symlink、single-link 且完整语法落入
 窄 compatibility-reset allowlist 的文件。未知 unit-specific drop-in，或能改变 root/image/bind view、
@@ -86,6 +96,12 @@ server/core broker，signed PVE enrollment 与本机固定入口双向匹配时�
 全集装到 join、让非 PVE endpoint 保留 managed PVE unit/drop-in，或只验证两种 mode 的交集都会
 扩大 endpoint authority，必须 fail closed。PVE broker 的 final drop-in 必须保留唯一精确
 `/etc/pve` 写例外；它不能被复制到 core/server/agentd。
+
+Installer 的 unit migration 不能把 `systemctl disable` 当作受管 topology 清理器：该命令会删除所有
+匹配 unit 的 link，而不仅是 installer 创建的 link。stale PVE 与 legacy `ops-systemd-helper` 只允许
+删除 allowlist 中 exact persistent/runtime `.wants` path，且 symlink 必须解析到固定的受管 unit；这些
+path 在 mutation 前逐项 snapshot。管理员另建的 custom wants/alias 不属于清理 authority，必须保留；
+路径类型或 target 含混时整轮事务 fail closed。
 
 这仍是 installation transaction 中的时点检查，不是对宿主 root 的持续 containment。安装后拥有
 systemd 控制面的主体可以写入更晚 drop-in 并 reload manager；因此该主体和 host root 本来就在此
@@ -478,7 +494,10 @@ root standing authority。规则是：
     的 PID 目录。same-UID PID 目录和未被其他 mount hardening 屏蔽的只读非 PID procfs 元数据仍
     可见，不能把该组合描述为完整 `/proc` 隐藏。安装 preflight 必须在复制最终 security drop-in、
     核验 PID 1 effective 配置且执行后精确清理的短生命周期 static systemd boundary 内运行完整双层
-    bwrap probe，不能只在同 UID 的普通 shell 中探测。
+    bwrap probe，不能只在同 UID 的普通 shell 中探测。清理必须尝试 `stop` 和 `reset-failed`，但不能
+    解析 stderr 或把 static unit 已卸载后的单步非零状态误当成残留；只有 exact artifacts 全部消失、
+    `daemon-reload` 成功且 PID 1 的成功查询精确返回 `LoadState=not-found` 才是权威闭包。任一最终证据
+    不成立仍 fail closed。
     outer 与 inner 的 procfs 必须分别匹配各自 PID namespace：两层都使用 `--proc /proc`；outer 保留
     默认 PID 1 reaper 与 sync/info/exact-identity completion barrier，inner 继续让最终 Source 只看见
     自己的私有 procfs。outer 若继承 service proc 视图，fixed inner 会因缺少其 namespace FD path 而

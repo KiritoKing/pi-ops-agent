@@ -141,8 +141,20 @@ healthcheck `SuccessExitStatus` and exact agentd credential drop-in, and reject 
 drop-in except a root-owned host-wide compatibility reset whose complete syntax is in the fixed
 narrow allowlist. Host-wide `service.d` drift or later unit overrides must fail the transaction;
 `cmp`, `systemctl cat`, and `systemd-analyze verify` alone are not sufficient.
+For the v254-added `ImportCredential` property only, a pre-v254 PID 1 may map a missing property to
+the canonical empty vector after three independent proofs: a strict scalar typed `Manager.Version`
+with major below 254, one structured Service interface whose four existing credential-property
+anchors have exact unique type/access plus authoritative absence of `ImportCredential`,
+and an exact unit plus complete manager-loaded drop-in closure with no non-empty or ambiguous
+`ImportCredential=` authority. Never infer this from a distro name or error text; v254 and newer,
+malformed version/introspection data, and every other D-Bus failure remain fail closed.
 Keep the mode-applicable unit and drop-in directories inside the same rollback snapshot, including
-the PVE candidates before the conditional enrollment decision.
+the PVE candidates before the conditional enrollment decision. Snapshot each exact persistent link
+that activation can create and every exact persistent/runtime link touched by stale PVE or legacy
+`ops-systemd-helper` cleanup. Remove only an allowlisted `.wants/UNIT` symlink that resolves to the
+fixed managed unit. Never use broad `systemctl disable` for this migration: it also removes
+administrator-created custom wants, aliases, and `Also=` links. Reapply the exact topology after unit
+state restoration, reload PID 1, and verify the original enablement state before claiming rollback.
 
 The preflight must execute the real nested bwrap structure inside a unique, root-owned,
 short-lived static unit under `/run/systemd/system` that copies the final `ops-agentd` security
@@ -168,7 +180,11 @@ crash-persistent across broker restart, forced disconnect, hard deadline, or run
 Install a unit-name-specific late drop-in and verify the manager's effective scalar and list-valued
 properties with `systemctl show`; host-wide `service.d` resets must not turn a weakened probe into a
 pass. Remove the exact probe unit, drop-ins, driver, nonce, and manager state before the installation
-transaction completes or rolls back.
+transaction completes or rolls back. Always attempt both `stop` and `reset-failed`, but do not infer
+residue from either individual status or stderr after PID 1 unloads the short-lived static unit.
+Accept cleanup only when every exact artifact is absent, `daemon-reload` succeeds, and a successful
+authoritative query returns `LoadState=not-found`; any reload, query, or final-evidence failure remains
+fail closed.
 
 If the real bwrap preflight fails after its unit starts, preserve the installer's bounded probe
 journal and `kernel.apparmor_restrict_unprivileged_userns` diagnostic before interpreting the
@@ -317,9 +333,11 @@ Use the current artifact names from the architecture document. Verify all applic
 - The complete sudo policy passes `visudo -cf`; after invalidating the timestamp, non-interactive
   probes for both fixed root helpers fail specifically because a password is required. A fragment-
   only syntax check is not sufficient. A root-side `sudo -U ops-agent-botmux -l` probe must also
-  confirm that the dedicated Adapter account has no sudo rule at all. Do not infer this from sudo's
-  exit status: sudo 1.9 can return zero for the canonical negative result. Require exactly one
-  C-locale `is not allowed to run sudo` line and reject warnings, Defaults or command listings.
+  confirm that the dedicated Adapter account has no sudo rule at all. Sudo 1.9 returns status zero
+  for a successfully completed negative listing, and Debian 12 may wrap that sentence after `on`;
+  require exact status zero, bound the C-locale output, fold only ASCII space/tab/LF, and require the
+  one complete canonical `is not allowed to run sudo` sentence. Reject controls/NUL, warnings,
+  Defaults, malformed hostnames, command listings, oversized output, or any extra prose.
 - `agentd-server` requires HTTPS/mTLS and exposes only current policy capabilities.
 - The TUI creates an isolated session; model-visible input cannot approve, reject, or roll back.
 - A legacy status is marked `recoveryOnly=true` with no live plan only when the broker can strictly

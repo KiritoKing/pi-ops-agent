@@ -766,9 +766,32 @@ describe("native release layout", () => {
       "DropInPaths",
       "ReadWritePaths",
       "SupplementaryGroups",
+      "ops-agent-failed-fresh-join.log",
+      "failed_fresh_status",
+      "fresh-join-token.sha256",
+      "fresh-join-token.stat",
+      "Fresh join rollback retained managed path",
+      "multi-user.target.wants/ops-agent-server.service",
+      "multi-user.target.wants/ops-root-helper.service",
     ]) {
       expect(joinJob).toContain(evidence);
     }
+    const freshFailure = joinJob.indexOf("ops-agent-failed-fresh-join.log");
+    const freshSuccess = joinJob.indexOf("ops-agent-fresh-join.log");
+    expect(freshFailure).toBeGreaterThan(0);
+    expect(freshSuccess).toBeGreaterThan(freshFailure);
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      "OPS_AGENT_TEST_FAIL_AT=services",
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      '--token-file "${enrollment_token}"',
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      'test "${failed_fresh_status}" -eq 97',
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      '[[ -e "${path}" ]] || [[ -L "${path}" ]]',
+    );
     expect(joinJob.indexOf("OPS_AGENT_TEST_FAIL_AT=services")).toBeLessThan(
       joinJob.indexOf("Upgrade cleanly and verify the non-PVE join topology"),
     );

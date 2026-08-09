@@ -657,6 +657,79 @@ jobs:
             }
           ' "${enrollment_token}" "${controller_origin}"
 
+          sudo /usr/bin/sha256sum "${enrollment_token}" \
+            >"${RUNNER_TEMP}/fresh-join-token.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_token}" \
+            >"${RUNNER_TEMP}/fresh-join-token.stat"
+          failed_fresh_log="${RUNNER_TEMP}/ops-agent-failed-fresh-join.log"
+          set +e
+          sudo /usr/bin/env \
+            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
+            OPS_AGENT_TEST_FAIL_AT=services \
+            "${install_fixture}/install-release.sh" join \
+              --controller "${controller_origin}" \
+              --controller-ca-sha256 "${controller_pin}" \
+              --token-file "${enrollment_token}" \
+              --no-start 2>&1 | tee "${failed_fresh_log}"
+          failed_fresh_status="${PIPESTATUS[0]}"
+          set -e
+          test "${failed_fresh_status}" -eq 97
+          grep -Fq 'Injected install failure after stage services.' \
+            "${failed_fresh_log}"
+          grep -Fq \
+            'Installation failed; all managed paths, identities and unit state were restored.' \
+            "${failed_fresh_log}"
+          if grep -Fq 'rollback was incomplete' "${failed_fresh_log}"; then
+            echo "Fresh join failure reported an incomplete rollback" >&2
+            exit 1
+          fi
+
+          fresh_managed_absent=(
+            /opt/pi-ops-agent
+            /etc/ops-agent
+            /var/lib/ops-agent
+            /var/log/ops-agent
+            /run/ops-agent
+            /etc/tmpfiles.d/ops-agent.conf
+            /usr/lib/ops-agent
+            /etc/systemd/system/ops-agent-server.service
+            /etc/systemd/system/ops-agent-server.service.d
+            /etc/systemd/system/ops-root-helper.service
+            /etc/systemd/system/ops-root-helper.service.d
+            /etc/systemd/system/ops-pve-root-helper.service
+            /etc/systemd/system/ops-pve-root-helper.service.d
+            /etc/systemd/system/ops-agent.target.wants
+            /etc/systemd/system/multi-user.target.wants/ops-agent-server.service
+            /etc/systemd/system/multi-user.target.wants/ops-root-helper.service
+            /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service
+          )
+          for path in "${fresh_managed_absent[@]}"; do
+            if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
+              echo "Fresh join rollback retained managed path ${path}" >&2
+              exit 1
+            fi
+          done
+          for identity in ops-agent ops-agent-server ops-agent-reviewer \
+              ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Fresh join rollback retained managed identity ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Fresh join rollback retained ops-agent-client" >&2
+            exit 1
+          fi
+          sudo /usr/bin/sha256sum "${enrollment_token}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/fresh-join-token.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_token}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/fresh-join-token.stat"
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/10-ci-weak-reset.conf" \
+            /run/systemd/system/service.d/10-ci-weak-reset.conf
+          test -z "$(find /var/tmp -maxdepth 1 \
+            -name 'ops-agent-install.*' -print -quit)"
+
           fresh_log="${RUNNER_TEMP}/ops-agent-fresh-join.log"
           sudo /usr/bin/env \
             "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \

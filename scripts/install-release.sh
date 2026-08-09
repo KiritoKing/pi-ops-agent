@@ -6,6 +6,7 @@ readonly RELEASE_ROOT="${APP_ROOT}/releases"
 readonly CURRENT_LINK="${APP_ROOT}/current"
 readonly CONFIG_ROOT="/etc/ops-agent"
 readonly UNIT_ROOT="/etc/systemd/system"
+readonly RUNTIME_UNIT_ROOT="/run/systemd/system"
 readonly TMPFILES_ROOT="/etc/tmpfiles.d"
 readonly OPS_AGENT_TARGET_WANTS_DIR="${UNIT_ROOT}/ops-agent.target.wants"
 readonly PVE_CONTROLLER_TARGET_WANT="${OPS_AGENT_TARGET_WANTS_DIR}/ops-pve-root-helper.service"
@@ -54,6 +55,7 @@ RELEASE_STAGING=""
 OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX=-1
 declare -a TRANSACTION_PATHS=()
 declare -a TRANSACTION_PATH_STATES=()
+declare -a TRANSACTION_ENABLEMENT_LINK_SNAPSHOT_INDICES=()
 declare -a TRANSACTION_UNITS=(
   ops-agent.target
   ops-agentd.service
@@ -133,6 +135,16 @@ remove_managed_path() {
     "${JSON_CONFIG_HELPER}"|\
     "${TMPFILES_ROOT}/ops-agent.conf"|\
     "${APPROVAL_SUDOERS}"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-agent.target"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-agent-server.service"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-root-helper.service"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "${UNIT_ROOT}/timers.target.wants/ops-agent-healthcheck.timer"|\
+    "${UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "${UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"|\
     "${UNIT_ROOT}"/ops-*|\
     "${UNIT_ROOT}"/agentd-*) ;;
     *)
@@ -292,6 +304,79 @@ snapshot_managed_units() {
   [[ -n "${seen["${path}"]:-}" ]] || snapshot_managed_path "${path}"
   path="${UNIT_ROOT}/ops-systemd-helper.service"
   [[ -n "${seen["${path}"]:-}" ]] || snapshot_managed_path "${path}"
+}
+
+snapshot_managed_enablement_link() {
+  local path="$1"
+  local parent index parent_mode
+  case "${path}" in
+    "${UNIT_ROOT}/multi-user.target.wants/ops-agent.target"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-agent-server.service"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-root-helper.service"|\
+    "${UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "${UNIT_ROOT}/timers.target.wants/ops-agent-healthcheck.timer"|\
+    "${UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "${UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service") ;;
+    *)
+      printf 'Refusing to snapshot an unmanaged unit enablement link: %s\n' "${path}" >&2
+      return 1
+      ;;
+  esac
+  parent="$(dirname "${path}")"
+  if [[ -e "${parent}" ]] || [[ -L "${parent}" ]]; then
+    [[ -d "${parent}" ]] && [[ ! -L "${parent}" ]] \
+      && [[ "$(stat -c '%u:%g' "${parent}")" == 0:0 ]] || {
+      printf 'Unit enablement parent is not a root-owned real directory: %s\n' \
+        "${parent}" >&2
+      return 1
+    }
+    parent_mode="$(stat -c '%a' "${parent}")"
+    (( (8#${parent_mode} & 0022) == 0 )) || {
+      printf 'Unit enablement parent is group/world writable: %s\n' "${parent}" >&2
+      return 1
+    }
+  fi
+  if [[ -e "${path}" ]] && [[ ! -L "${path}" ]]; then
+    printf 'Unit enablement path is not a symlink: %s\n' "${path}" >&2
+    return 1
+  fi
+  index="${#TRANSACTION_PATHS[@]}"
+  snapshot_managed_path "${path}"
+  TRANSACTION_ENABLEMENT_LINK_SNAPSHOT_INDICES+=("${index}")
+}
+
+snapshot_managed_enablement_links() {
+  local path
+  local -a paths=()
+  if [[ "${MODE}" == init ]]; then
+    paths=(
+      "${UNIT_ROOT}/multi-user.target.wants/ops-agent.target"
+      "${UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"
+      "${UNIT_ROOT}/timers.target.wants/ops-agent-healthcheck.timer"
+      "${UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"
+      "${UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"
+      "${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"
+      "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"
+      "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"
+    )
+  else
+    # Enrollment is validated after the transaction snapshot, so a join must
+    # conservatively cover the conditional PVE broker link as well.
+    paths=(
+      "${UNIT_ROOT}/multi-user.target.wants/ops-agent-server.service"
+      "${UNIT_ROOT}/multi-user.target.wants/ops-root-helper.service"
+      "${UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"
+      "${UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"
+      "${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"
+      "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"
+    )
+  fi
+  for path in "${paths[@]}"; do
+    snapshot_managed_enablement_link "${path}"
+  done
 }
 
 pve_controller_target_want_is_exact() {
@@ -458,6 +543,7 @@ begin_install_transaction() {
     snapshot_managed_path "${APPROVAL_SUDOERS}"
   fi
   snapshot_managed_units
+  snapshot_managed_enablement_links
   # Older PVE units installed themselves into ops-agent.target even on a
   # server-only join endpoint. Snapshot the complete wants directory so
   # cleanup and controller-only add-wants remain rollback-safe.
@@ -546,38 +632,26 @@ restore_unit_state() {
     enabled="${TRANSACTION_UNIT_ENABLED["${unit}"]}"
     active="${TRANSACTION_UNIT_ACTIVE["${unit}"]}"
     current_enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
-    case "${enabled}" in
-      enabled)
-        if [[ "${current_enabled}" == enabled-runtime ]] \
-            || [[ "${current_enabled}" == linked-runtime ]]; then
-          systemctl disable --runtime "${unit}" >/dev/null 2>&1 \
-            || record_rollback_error "could not clear runtime-only enablement for ${unit}"
-        fi
-        systemctl enable "${unit}" >/dev/null 2>&1 \
-          || record_rollback_error "could not re-enable ${unit}"
-        ;;
-      enabled-runtime)
-        if [[ "${current_enabled}" == enabled ]] || [[ "${current_enabled}" == linked ]] \
-            || [[ "${current_enabled}" == alias ]]; then
-          systemctl disable "${unit}" >/dev/null 2>&1 \
-            || record_rollback_error "could not clear persistent enablement for ${unit}"
-        fi
-        systemctl enable --runtime "${unit}" >/dev/null 2>&1 \
-          || record_rollback_error "could not restore runtime enablement for ${unit}"
-        ;;
-      *)
-        case "${current_enabled}" in
-          enabled|linked|alias)
-            systemctl disable "${unit}" >/dev/null 2>&1 \
-              || record_rollback_error "could not restore disabled state for ${unit}"
-            ;;
-          enabled-runtime|linked-runtime)
-            systemctl disable --runtime "${unit}" >/dev/null 2>&1 \
-              || record_rollback_error "could not restore disabled runtime state for ${unit}"
-            ;;
-        esac
-        ;;
-    esac
+    if [[ "${current_enabled}" != "${enabled}" ]]; then
+      case "${enabled}" in
+        enabled)
+          systemctl enable "${unit}" >/dev/null 2>&1 \
+            || record_rollback_error "could not re-enable ${unit}"
+          ;;
+        enabled-runtime)
+          systemctl enable --runtime "${unit}" >/dev/null 2>&1 \
+            || record_rollback_error "could not restore runtime enablement for ${unit}"
+          ;;
+        *)
+          # Do not use systemctl disable as a rollback primitive here. It can
+          # delete matching administrator-created aliases and Also= links.
+          # Exact release-created persistent links are restored separately;
+          # any remaining state mismatch is therefore an incomplete rollback.
+          record_rollback_error \
+            "unit enablement state for ${unit} is ${current_enabled:-<empty>}, expected ${enabled:-<empty>}"
+          ;;
+      esac
+    fi
     current_active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
     case "${active}" in
       active|reloading|activating)
@@ -593,6 +667,25 @@ restore_unit_state() {
         esac
         ;;
     esac
+  done
+}
+
+restore_managed_enablement_topology() {
+  local index unit expected actual
+  for index in "${TRANSACTION_ENABLEMENT_LINK_SNAPSHOT_INDICES[@]}"; do
+    restore_managed_path_snapshot "${index}"
+  done
+  if ((OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX >= 0)); then
+    restore_managed_path_snapshot "${OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX}"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 \
+    || record_rollback_error "systemd daemon-reload after enablement restore failed"
+  for unit in "${TRANSACTION_UNITS[@]}"; do
+    expected="${TRANSACTION_UNIT_ENABLED["${unit}"]}"
+    actual="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+    [[ "${actual}" == "${expected}" ]] \
+      || record_rollback_error \
+        "restored unit enablement for ${unit} is ${actual:-<empty>}, expected ${expected:-<empty>}"
   done
 }
 
@@ -638,13 +731,11 @@ rollback_install_transaction() {
   fi
   restore_account_state
   restore_unit_state
-  # systemctl enable may recreate dependencies from the restored historical
-  # unit's [Install] section. Reapply this one root-owned directory snapshot
-  # after unit-state restoration so pre-existing third-party entries survive
-  # exactly and a link absent before the transaction remains absent.
-  if ((OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX >= 0)); then
-    restore_managed_path_snapshot "${OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX}"
-  fi
+  # Reapply every exact persistent enablement snapshot after unit-state
+  # restoration. This removes links created by the failed transaction without
+  # invoking broad `systemctl disable`, preserves pre-existing third-party
+  # topology byte-for-byte, and reloads PID 1 after the final disk state.
+  restore_managed_enablement_topology
   if [[ "${INSTALL_TRANSACTION_ROLLBACK_FAILED}" == false ]]; then
     find "${INSTALL_TRANSACTION_DIR}" -mindepth 1 -depth -delete 2>/dev/null || true
     rmdir "${INSTALL_TRANSACTION_DIR}" 2>/dev/null || true
@@ -2091,8 +2182,81 @@ EOF
   visudo -cf /etc/sudoers >/dev/null
 }
 
+verify_botmux_no_sudo_result() {
+  local policy_path="$1"
+  local sudo_status="$2"
+  # `sudo -U ... -l` reports a successfully completed policy listing with
+  # status 0 even when that authoritative listing says the account has no
+  # rules. Bookworm sudo 1.9 does so for its wrapped negative sentence. Any
+  # non-zero status is an execution/configuration failure, even if its output
+  # happens to contain the expected sentence.
+  case "${sudo_status}" in
+    0) ;;
+    *)
+      printf 'Cannot prove the BotMux no-sudo policy: sudo returned status %s.\n' \
+        "${sudo_status}" >&2
+      return 1
+      ;;
+  esac
+
+  # Read at most 1025 bytes from the root-private probe output. Debian sudo may
+  # wrap the canonical sentence after "on"; fold only ASCII space, tab, and LF
+  # before requiring that complete sentence and nothing else. Binary/control
+  # data, warnings, Defaults, command listings, malformed hostnames, and extra
+  # prose all remain fail-closed.
+  "${release_dir}/runtime/node" - "${policy_path}" "${BOTMUX_USER}" <<'NODE'
+const fs = require("node:fs");
+const [policyPath, botmuxUser] = process.argv.slice(2);
+const maximumBytes = 1024;
+if (!/^[a-z_][a-z0-9_-]{0,31}$/u.test(botmuxUser)) {
+  throw new Error("invalid BotMux account identity");
+}
+const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+const descriptor = fs.openSync(policyPath, flags);
+let data;
+try {
+  const stat = fs.fstatSync(descriptor);
+  if (!stat.isFile()) {
+    throw new Error("sudo policy output is not a regular file");
+  }
+  const bounded = Buffer.alloc(maximumBytes + 1);
+  let length = 0;
+  while (length < bounded.length) {
+    const count = fs.readSync(descriptor, bounded, length, bounded.length - length, null);
+    if (count === 0) break;
+    length += count;
+  }
+  if (length === 0 || length > maximumBytes) {
+    throw new Error("sudo policy output is empty or exceeds its bound");
+  }
+  data = bounded.subarray(0, length);
+} finally {
+  fs.closeSync(descriptor);
+}
+for (const byte of data) {
+  const printableAscii = byte >= 0x20 && byte <= 0x7e;
+  if (!printableAscii && byte !== 0x09 && byte !== 0x0a) {
+    throw new Error("sudo policy output contains non-canonical control or binary data");
+  }
+}
+const normalized = data.toString("ascii")
+  .replace(/[ \t\n]+/gu, " ")
+  .replace(/^ | $/gu, "");
+const escapedUser = botmuxUser.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+const label = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?";
+const sentence = new RegExp(
+  `^User ${escapedUser} is not allowed to run sudo on (${label}(?:\\.${label})*)\\.$`,
+  "u",
+);
+const match = sentence.exec(normalized);
+if (match === null || match[1] === undefined || Buffer.byteLength(match[1], "ascii") > 253) {
+  throw new Error("sudo policy output is not the unique canonical no-rule sentence");
+}
+NODE
+}
+
 verify_effective_sudo_policy() {
-  local output admin_policy botmux_policy
+  local output admin_policy botmux_policy botmux_status
   [[ -x /usr/bin/sudo ]] || {
     printf 'Effective sudo policy probe requires /usr/bin/sudo.\n' >&2
     return 1
@@ -2153,17 +2317,13 @@ verify_effective_sudo_policy() {
   probe_requires_password setup-botmux /usr/libexec/pi-ops-agent/setup-botmux
 
   botmux_policy="${INSTALL_TRANSACTION_DIR}/sudo-probe-${BOTMUX_USER}.log"
-  # sudo 1.9 may return status 0 even when its authoritative result is the
-  # single canonical "is not allowed" line. Do not infer policy from status;
-  # require that exact C-locale negative result and reject warnings, defaults,
-  # command listings, or any other extra output.
-  LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1 || true
-  if [[ "$(wc -l <"${botmux_policy}" | tr -d '[:space:]')" != 1 ]] \
-      || ! grep -Eq \
-        "^User ${BOTMUX_USER} is not allowed to run sudo on [A-Za-z0-9][A-Za-z0-9.-]{0,252}\\.$" \
-        "${botmux_policy}"; then
-    printf 'Unsafe sudo policy: dedicated BotMux account has at least one sudo rule:\n' >&2
-    sed -n '1,10p' "${botmux_policy}" >&2
+  if LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1; then
+    botmux_status=0
+  else
+    botmux_status=$?
+  fi
+  if ! verify_botmux_no_sudo_result "${botmux_policy}" "${botmux_status}"; then
+    printf 'Unsafe sudo policy: dedicated BotMux account lacks an exact no-rule proof.\n' >&2
     return 1
   fi
 }
@@ -2245,13 +2405,64 @@ else
 fi
 maybe_inject_install_failure config
 
-disable_managed_unit_for_cleanup() {
+cleanup_managed_unit_enablement_link() {
+  local path="$1"
+  local unit="$2"
+  local resolved
+  case "${unit}|${path}" in
+    "ops-pve-root-helper.service|${UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "ops-pve-root-helper.service|${UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "ops-pve-root-helper.service|${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service"|\
+    "ops-pve-root-helper.service|${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-pve-root-helper.service"|\
+    "ops-systemd-helper.service|${UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"|\
+    "ops-systemd-helper.service|${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service") ;;
+    *)
+      printf 'Refusing to remove an unmanaged unit enablement link: %s for %s.\n' \
+        "${path}" "${unit}" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! -e "${path}" ]] && [[ ! -L "${path}" ]]; then
+    return 0
+  fi
+  if [[ ! -L "${path}" ]]; then
+    printf 'Refusing to remove a non-symlink unit enablement path: %s.\n' \
+      "${path}" >&2
+    return 1
+  fi
+  resolved="$(readlink -f -- "${path}" 2>/dev/null || true)"
+  if [[ "${resolved}" != "${UNIT_ROOT}/${unit}" ]]; then
+    printf 'Refusing to remove a unit enablement link with an unexpected target: %s.\n' \
+      "${path}" >&2
+    return 1
+  fi
+  rm -f -- "${path}"
+}
+
+cleanup_managed_unit_enablement_links() {
   local unit="$1"
-  local enablement
-  enablement="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
-  case "${enablement}" in
-    enabled|linked|alias) systemctl disable "${unit}" ;;
-    enabled-runtime|linked-runtime) systemctl disable --runtime "${unit}" ;;
+  case "${unit}" in
+    ops-pve-root-helper.service)
+      cleanup_managed_unit_enablement_link \
+        "${UNIT_ROOT}/multi-user.target.wants/${unit}" "${unit}"
+      cleanup_managed_unit_enablement_link \
+        "${UNIT_ROOT}/ops-agent.target.wants/${unit}" "${unit}"
+      cleanup_managed_unit_enablement_link \
+        "${RUNTIME_UNIT_ROOT}/multi-user.target.wants/${unit}" "${unit}"
+      cleanup_managed_unit_enablement_link \
+        "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/${unit}" "${unit}"
+      ;;
+    ops-systemd-helper.service)
+      cleanup_managed_unit_enablement_link \
+        "${UNIT_ROOT}/ops-agent.target.wants/${unit}" "${unit}"
+      cleanup_managed_unit_enablement_link \
+        "${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/${unit}" "${unit}"
+      ;;
+    *)
+      printf 'Refusing to clean enablement for an unmanaged legacy unit: %s.\n' \
+        "${unit}" >&2
+      return 1
+      ;;
   esac
 }
 
@@ -2342,6 +2553,141 @@ installed_unit_bus_property() {
     "${object_path}" "${interface}" "${property}"
 }
 
+installed_systemd_major_version() {
+  local payload
+  payload="$(busctl --json=short get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager Version)" || return 1
+  "${release_dir}/runtime/node" -e '
+    const value = JSON.parse(process.argv[1]);
+    if (value?.type !== "s" || typeof value.data !== "string") {
+      throw new Error("PID 1 returned invalid Manager.Version data");
+    }
+    const match = /^([1-9][0-9]*)(?:[.+~-][0-9A-Za-z]+)*$/u.exec(value.data);
+    if (match === null || match[1] === undefined) {
+      throw new Error("PID 1 returned a non-canonical Manager.Version");
+    }
+    const major = Number(match[1]);
+    if (!Number.isSafeInteger(major)) {
+      throw new Error("PID 1 returned an unsafe Manager.Version major");
+    }
+    process.stdout.write(String(major));
+  ' "${payload}"
+}
+
+installed_unit_bus_property_is_absent() {
+  local object_path="$1"
+  local interface="$2"
+  local property="$3"
+  local payload
+  payload="$(busctl --json=short call org.freedesktop.systemd1 \
+    "${object_path}" org.freedesktop.DBus.Introspectable Introspect)" || return 1
+  "${release_dir}/runtime/node" -e '
+    const [text, expectedInterface, expectedProperty] = process.argv.slice(1);
+    const value = JSON.parse(text);
+    if (value?.type !== "s" || !Array.isArray(value.data)
+        || value.data.length !== 1 || typeof value.data[0] !== "string") {
+      throw new Error("PID 1 returned invalid Introspect data");
+    }
+    if (expectedInterface !== "org.freedesktop.systemd1.Service"
+        || expectedProperty !== "ImportCredential") {
+      throw new Error("unsupported property-absence query");
+    }
+    const interfaces = [...value.data[0].matchAll(
+      /<interface[\t\n\r ]+name="org\.freedesktop\.systemd1\.Service"[\t\n\r ]*>([\s\S]*?)<\/interface[\t\n\r ]*>/gu,
+    )];
+    if (interfaces.length !== 1 || typeof interfaces[0]?.[1] !== "string") {
+      throw new Error("PID 1 introspection omitted the exact Service interface");
+    }
+    const service = interfaces[0][1];
+    const withoutComments = service.replace(/<!--[\s\S]*?-->/gu, "");
+    if (withoutComments.includes("<!--") || withoutComments.includes("-->")) {
+      throw new Error("PID 1 Service introspection contains malformed comments");
+    }
+    const properties = [...withoutComments.matchAll(
+      /<property[\t\n\r ]+name="([A-Za-z_][A-Za-z0-9_]*)"[\t\n\r ]+type="([A-Za-z0-9(){}]+)"[\t\n\r ]+access="read"[\t\n\r ]*(?:\/>|>)/gu,
+    )];
+    for (const [name, type] of [
+      ["LoadCredential", "a(ss)"],
+      ["LoadCredentialEncrypted", "a(ss)"],
+      ["SetCredential", "a(say)"],
+      ["SetCredentialEncrypted", "a(say)"],
+    ]) {
+      const matches = properties.filter((entry) => entry[1] === name);
+      if (matches.length !== 1 || matches[0]?.[2] !== type) {
+        throw new Error(`PID 1 Service introspection omitted or duplicated ${name}`);
+      }
+    }
+    if (withoutComments.includes(expectedProperty)) {
+      throw new Error(`PID 1 Service introspection still exposes ${expectedProperty}`);
+    }
+  ' "${payload}" "${interface}" "${property}"
+}
+
+verify_no_import_credential_file_authority() {
+  local path="$1"
+  local line trimmed
+  [[ -f "${path}" && ! -L "${path}" ]] || {
+    printf 'Cannot prove ImportCredential authority is absent from %s.\n' "${path}" >&2
+    return 1
+  }
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" != *$'\r'* ]] || {
+      printf 'Cannot prove ImportCredential authority in a CRLF unit file: %s.\n' \
+        "${path}" >&2
+      return 1
+    }
+    trimmed="${line%"${line##*[!$' \t']}"}"
+    [[ "${trimmed}" != *\\ ]] || {
+      printf 'Cannot prove ImportCredential authority across a continuation: %s.\n' \
+        "${path}" >&2
+      return 1
+    }
+    if [[ "${line}" == *ImportCredential* ]] && [[ "${line}" != ImportCredential= ]]; then
+      printf 'Refusing non-empty or ambiguous ImportCredential authority in %s.\n' \
+        "${path}" >&2
+      return 1
+    fi
+  done <"${path}"
+}
+
+installed_unit_import_credential_property() {
+  local unit="$1"
+  local object_path="$2"
+  local unit_path="$3"
+  local security_dropin="$4"
+  local credential_dropin="${5:-}"
+  local payload failure major
+  if payload="$(installed_unit_bus_property "${object_path}" \
+      org.freedesktop.systemd1.Service ImportCredential 2>&1)"; then
+    printf '%s' "${payload}"
+    return 0
+  fi
+  failure="${payload}"
+  major="$(installed_systemd_major_version)" || {
+    printf 'ImportCredential failed for %s and PID 1 version was not authoritative; busctl=%q.\n' \
+      "${unit}" "${failure}" >&2
+    return 1
+  }
+  if ((10#${major} >= 254)); then
+    printf 'ImportCredential failed for %s on systemd %s; refusing compatibility; busctl=%q.\n' \
+      "${unit}" "${major}" "${failure}" >&2
+    return 1
+  fi
+  installed_unit_bus_property_is_absent "${object_path}" \
+    org.freedesktop.systemd1.Service ImportCredential || {
+    printf 'ImportCredential failed for %s without authoritative absence; busctl=%q.\n' \
+      "${unit}" "${failure}" >&2
+    return 1
+  }
+  verify_no_import_credential_file_authority "${unit_path}" || return 1
+  # Re-read and validate the complete manager-loaded closure at the exact
+  # fallback point. The closure verifier scans every accepted file below and
+  # rejects non-empty or ambiguous ImportCredential= authority.
+  verify_installed_unit_dropin_closure \
+    "${unit}" "${security_dropin}" "${credential_dropin}" || return 1
+  printf '{"type":"as","data":[]}'
+}
+
 require_installed_unit_apparmor_profile() {
   local unit="$1"
   local expected_ignore="$2"
@@ -2368,6 +2714,8 @@ require_installed_unit_apparmor_profile() {
 verify_installed_unit_typed_vectors() {
   local unit="$1"
   local unit_path="$2"
+  local security_dropin="$3"
+  local credential_dropin="${4:-}"
   local object_path conditions asserts load load_encrypted set set_encrypted import
   object_path="$(installed_unit_bus_path "${unit}")"
   conditions="$(installed_unit_bus_property "${object_path}" \
@@ -2382,8 +2730,8 @@ verify_installed_unit_typed_vectors() {
     org.freedesktop.systemd1.Service SetCredential)"
   set_encrypted="$(installed_unit_bus_property "${object_path}" \
     org.freedesktop.systemd1.Service SetCredentialEncrypted)"
-  import="$(installed_unit_bus_property "${object_path}" \
-    org.freedesktop.systemd1.Service ImportCredential)"
+  import="$(installed_unit_import_credential_property "${unit}" "${object_path}" \
+    "${unit_path}" "${security_dropin}" "${credential_dropin}")"
 
   "${release_dir}/runtime/node" -e '
     const fs = require("node:fs");
@@ -2528,7 +2876,11 @@ verify_installed_unit_dropin_closure() {
   local credential_dropin="${3:-}"
   local raw path
   local -a paths=()
-  raw="$(installed_unit_property "${unit}" DropInPaths)"
+  verify_no_import_credential_file_authority "${security_dropin}" || return 1
+  if [[ -n "${credential_dropin}" ]]; then
+    verify_no_import_credential_file_authority "${credential_dropin}" || return 1
+  fi
+  raw="$(installed_unit_property "${unit}" DropInPaths)" || return 1
   # Drop-in filenames are root-controlled but are still policy input. Parse the
   # manager's whitespace-delimited escaped paths without shell glob expansion;
   # otherwise a loaded name containing [*?] could expand to a different file
@@ -2541,7 +2893,8 @@ verify_installed_unit_dropin_closure() {
     fi
     case "${path}" in
       /run/systemd/system/service.d/*.conf|/usr/lib/systemd/system/service.d/*.conf|/lib/systemd/system/service.d/*.conf)
-        verify_allowed_host_service_dropin "${path}"
+        verify_allowed_host_service_dropin "${path}" || return 1
+        verify_no_import_credential_file_authority "${path}" || return 1
         ;;
       *)
         printf 'Installed unit %s has an unverified extra drop-in: %s.\n' \
@@ -2638,10 +2991,6 @@ verify_effective_unit_lifecycle() {
     }
   require_installed_unit_property "${unit}" LoadState loaded
   require_installed_unit_property "${unit}" FragmentPath "${unit_path}"
-  # systemctl renders typed arrays such as Conditions, Asserts, and credential
-  # vectors as "[unprintable]" on supported systemd releases. Query PID 1 over
-  # D-Bus and compare the complete typed values with the exact release unit.
-  verify_installed_unit_typed_vectors "${unit}" "${unit_path}"
   for property in User Group Type UMask; do
     expected="$(unit_file_single_value "${unit_path}" "${property}" '')"
     [[ -n "${expected}" ]] || {
@@ -2875,6 +3224,13 @@ verify_effective_security_dropin() {
   # writable-directory authority that individual property comparisons cannot
   # safely infer from an unknown drop-in.
   verify_installed_unit_dropin_closure "${unit}" "${dropin}" "${credential_dropin}"
+  # systemctl renders typed arrays such as Conditions, Asserts, and credential
+  # vectors as "[unprintable]" on supported systemd releases. Query PID 1 over
+  # D-Bus only after the exact managed drop-ins and complete loaded closure are
+  # proven. This ordering is also part of the narrow pre-v254 compatibility
+  # proof for PID 1 implementations that do not expose ImportCredential.
+  verify_installed_unit_typed_vectors \
+    "${unit}" "${UNIT_ROOT}/${unit}" "${dropin}" "${credential_dropin}"
 }
 
 for unit in "${release_dir}"/systemd/*.service "${release_dir}"/systemd/*.timer "${release_dir}"/systemd/*.target; do
@@ -2883,11 +3239,13 @@ for unit in "${release_dir}"/systemd/*.service "${release_dir}"/systemd/*.timer 
   if [[ "${unit_name}" == ops-pve-root-helper.service ]] \
       && [[ "${selected_pve_broker}" != true ]]; then
     # Older endpoint releases could leave the managed PVE unit on a non-PVE
-    # enrollment. The complete unit path was snapshotted before enrollment, so
-    # disable/removal remains rollback-safe. State and audit are not removed.
+    # enrollment. Remove only the exact managed persistent/runtime dependency
+    # links; systemctl disable would also delete administrator-created aliases
+    # and custom wants. Every affected managed link and the complete unit path
+    # were snapshotted before enrollment. State and audit are not removed.
     validate_stale_pve_unit_for_cleanup
     validate_stale_pve_dropin_for_cleanup
-    disable_managed_unit_for_cleanup "${unit_name}"
+    cleanup_managed_unit_enablement_links "${unit_name}"
     rm -f -- "${UNIT_ROOT}/${unit_name}"
     continue
   fi
@@ -2903,8 +3261,10 @@ done
 cleanup_pve_controller_target_want
 if [[ "${MODE}" == init ]] && [[ ! -f "${release_dir}/systemd/ops-systemd-helper.service" ]]; then
   # v0.2 compatibility cleanup. State and audit are deliberately preserved;
-  # rollback still has the old unit/drop-in snapshot and its prior unit state.
-  disable_managed_unit_for_cleanup ops-systemd-helper.service
+  # rollback still has the old unit/drop-in and exact persistent/runtime
+  # enablement snapshots. Do not use broad systemctl disable here: unrelated
+  # administrator-created aliases or custom wants must survive the migration.
+  cleanup_managed_unit_enablement_links ops-systemd-helper.service
   rm -f -- "${UNIT_ROOT}/ops-systemd-helper.service"
 fi
 if [[ "${MODE}" == init ]]; then
@@ -3232,12 +3592,20 @@ run_bwrap_service_preflight() (
     local status="$1"
     local cleanup_failed=false
     local load_state=""
+    local load_state_status=0
     trap - EXIT HUP INT TERM
+    # The EXIT trap inherits errexit state from the preflight body. Disable it
+    # explicitly and capture authoritative checks below; relying on an `if !`
+    # caller would change Bash's errexit semantics inside this function.
     set +e
     if [[ "${bwrap_probe_loaded}" == true ]]; then
-      systemctl stop "${bwrap_probe_unit}" >/dev/null 2>&1 || cleanup_failed=true
-      systemctl reset-failed "${bwrap_probe_unit}" >/dev/null 2>&1 \
-        || cleanup_failed=true
+      # These are still required cleanup attempts, but systemd may unload this
+      # short-lived static unit during stop and then return non-zero from stop
+      # or reset-failed. Do not classify stderr or treat either return code as
+      # final authority: exact artifact absence plus the post-reload LoadState
+      # proof below determines whether PID 1 retained any managed unit state.
+      systemctl stop "${bwrap_probe_unit}" >/dev/null 2>&1 || :
+      systemctl reset-failed "${bwrap_probe_unit}" >/dev/null 2>&1 || :
     fi
     if [[ -n "${bwrap_probe_lifecycle_dropin}" ]]; then
       rm -f -- "${bwrap_probe_lifecycle_dropin}" || cleanup_failed=true
@@ -3280,8 +3648,11 @@ run_bwrap_service_preflight() (
     systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
     if [[ -n "${bwrap_probe_unit}" ]]; then
       load_state="$(systemctl show --no-pager --property=LoadState --value \
-        "${bwrap_probe_unit}" 2>/dev/null || true)"
-      [[ "${load_state}" == not-found ]] || cleanup_failed=true
+        "${bwrap_probe_unit}" 2>/dev/null)"
+      load_state_status=$?
+      if ((load_state_status != 0)) || [[ "${load_state}" != not-found ]]; then
+        cleanup_failed=true
+      fi
     fi
     if [[ "${cleanup_failed}" == true ]]; then
       printf 'Could not completely remove the static bubblewrap preflight unit.\n' >&2

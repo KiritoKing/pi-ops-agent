@@ -81,6 +81,31 @@ func TestStoreTTLQuotaAndSafeChangeEviction(t *testing.T) {
 	}
 }
 
+func TestStoreChangeSnapshotDoesNotShareApprovedUIDPointer(t *testing.T) {
+	now := time.Date(2026, 8, 10, 3, 30, 0, 0, time.UTC)
+	store, err := OpenStoreWithLimits(t.TempDir(), testStoreLimits(&now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvedByUID := uint32(1001)
+	change := testStoredChange("change-independent-snapshot", StateCommitted, now)
+	change.ApprovedByUID = &approvedByUID
+	if err := store.PutChange(change); err != nil {
+		t.Fatal(err)
+	}
+
+	approvedByUID = 2002
+	snapshot, ok := store.Change(change.ID)
+	if !ok || snapshot.ApprovedByUID == nil || *snapshot.ApprovedByUID != 1001 {
+		t.Fatalf("stored change shared the caller's approval UID pointer: %#v", snapshot)
+	}
+	*snapshot.ApprovedByUID = 3003
+	fresh, ok := store.Change(change.ID)
+	if !ok || fresh.ApprovedByUID == nil || *fresh.ApprovedByUID != 1001 {
+		t.Fatalf("Store.Change returned a snapshot sharing durable pointer state: %#v", fresh)
+	}
+}
+
 func TestStoreReplayRecordTTLNonceQuotaAndPersistenceFailure(t *testing.T) {
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	limits := testStoreLimits(&now)

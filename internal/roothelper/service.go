@@ -252,11 +252,12 @@ func (s *Service) Handle(ctx context.Context, peer peercred.Credential, request 
 	}()
 
 	var result protocol.Response
+	var statusSnapshot *Change
 	switch request.Method {
 	case protocol.MethodChangePrepare:
 		result = s.prepare(ctx, peer, request, fingerprintText, now())
 	case protocol.MethodChangeStatus:
-		result = s.status(peer, request)
+		result, statusSnapshot = s.status(peer, request)
 	case protocol.MethodChangeApprove:
 		unlock := s.lockChange(request.ChangeID)
 		result = s.approve(ctx, peer, request, now())
@@ -311,7 +312,17 @@ func (s *Service) Handle(ctx context.Context, peer peercred.Credential, request 
 		}
 	}
 	if s.ReceiptSigner != nil && protocol.IsBrokerReceiptMethod(request.Method) {
-		signed, err := s.signBrokerResponse(request, result, now())
+		var signed protocol.Response
+		var err error
+		if request.Method == protocol.MethodChangeStatus {
+			// statusSnapshot is the exact validated Store clone used to build and
+			// audit result. Signing that immutable observation avoids a second Store
+			// read racing a fast worker transition without blocking observation on
+			// the worker's long-running per-change mutation lock.
+			signed, err = s.signBrokerResponseFromChangeSnapshot(request, result, statusSnapshot, now())
+		} else {
+			signed, err = s.signBrokerResponse(request, result, now())
+		}
 		if err != nil {
 			_, _ = s.appendAudit(peer, request, map[string]interface{}{
 				"type": "broker_receipt_signing_failed", "changeId": request.ChangeID, "error": err.Error(),
@@ -348,6 +359,13 @@ func (s *Service) signBrokerResponse(request protocol.Request, result protocol.R
 	}
 	change, ok := s.Store.Change(request.ChangeID)
 	if !ok {
+		return protocol.Response{}, errors.New("authoritative change is unavailable for receipt signing")
+	}
+	return s.signBrokerResponseFromChangeSnapshot(request, result, change, issuedAt)
+}
+
+func (s *Service) signBrokerResponseFromChangeSnapshot(request protocol.Request, result protocol.Response, change *Change, issuedAt time.Time) (protocol.Response, error) {
+	if change == nil {
 		return protocol.Response{}, errors.New("authoritative change is unavailable for receipt signing")
 	}
 	if err := matchChangeIdentity(change, request); err != nil {
@@ -571,27 +589,27 @@ func (s *Service) prepare(ctx context.Context, peer peercred.Credential, request
 	return s.executeAuthorizedChange(ctx, peer, request, change, request.Operation, basis, standingScope, nil, now, PVERecoveryReadiness{})
 }
 
-func (s *Service) status(peer peercred.Credential, request protocol.Request) protocol.Response {
+func (s *Service) status(peer peercred.Credential, request protocol.Request) (protocol.Response, *Change) {
 	if !s.isAgentOrApprover(peer.UID) {
-		return denied(request, "peer may not inspect changes")
+		return denied(request, "peer may not inspect changes"), nil
 	}
 	change, ok := s.Store.Change(request.ChangeID)
 	if !ok {
-		return denied(request, "change not found")
+		return denied(request, "change not found"), nil
 	}
 	if err := matchChangeIdentity(change, request); err != nil {
-		return denied(request, err.Error())
+		return denied(request, err.Error()), nil
 	}
 	if err := s.validateChangeDomain(change); err != nil {
-		return denied(request, err.Error())
+		return denied(request, err.Error()), nil
 	}
 	auditID, err := s.appendAudit(peer, request, map[string]interface{}{"type": "change_status", "changeId": change.ID, "state": change.State})
 	if err != nil {
-		return failed(request, err)
+		return failed(request, err), change
 	}
 	classification, classificationErr := classifyPersistedPlan(change)
 	if classificationErr != nil {
-		return denied(request, classificationErr.Error())
+		return denied(request, classificationErr.Error()), change
 	}
 	rollbackAvailable := change.RollbackAvailable
 	rollbackUnavailableReason := ""
@@ -599,7 +617,7 @@ func (s *Service) status(peer peercred.Credential, request protocol.Request) pro
 	if classification.RecoveryOnly {
 		descriptor := buildLegacyRecoveryDescriptor(change, classification.Operation, s.Executor)
 		if err := descriptor.Validate(); err != nil {
-			return failed(request, fmt.Errorf("construct recovery descriptor: %w", err))
+			return failed(request, fmt.Errorf("construct recovery descriptor: %w", err)), change
 		}
 		recoveryDescriptor = &descriptor
 		rollbackAvailable = change.RollbackAvailable && descriptor.RollbackCompatible
@@ -621,7 +639,7 @@ func (s *Service) status(peer peercred.Credential, request protocol.Request) pro
 		RecoveryOnly: classification.RecoveryOnly, RecoveryDescriptor: recoveryDescriptor,
 		Plan: classification.Plan,
 	}
-	return protocol.Response{Version: protocol.Version, RequestID: request.RequestID, OK: true, AuditID: auditID, ChangeID: change.ID, State: change.State, Summary: change.Summary, Data: data}
+	return protocol.Response{Version: protocol.Version, RequestID: request.RequestID, OK: true, AuditID: auditID, ChangeID: change.ID, State: change.State, Summary: change.Summary, Data: data}, change
 }
 
 type changeStatusData struct {

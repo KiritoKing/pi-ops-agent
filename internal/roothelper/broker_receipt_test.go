@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +88,125 @@ func TestRootBrokerSignsStatusAndActionAfterDurableAudit(t *testing.T) {
 	replayed := service.Handle(context.Background(), serverPeer, actionRequest)
 	if replayed.Receipt == nil || replayed.Receipt.Signature != action.Receipt.Signature {
 		t.Fatalf("idempotent action did not replay its signed result: %#v", replayed)
+	}
+}
+
+func TestSignedStatusUsesImmutableSnapshotAcrossConcurrentCommit(t *testing.T) {
+	now := time.Date(2026, 8, 10, 3, 0, 0, 0, time.UTC)
+	receiptPublic, receiptPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := testService(t, now, &fakePVEExecutor{})
+	service.Domain = DomainPVE
+	service.ReceiptSigner, err = NewBrokerReceiptSigner("pve-receipt-v1", DomainPVE, receiptPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := testPVEStoredChange(
+		t, "pve-change-status-sign-race-0001", StateExecuting, now, "qemu", 100, "",
+	)
+	change.PVEMutationVersion = 1
+	if err := service.Store.PutChange(change); err != nil {
+		t.Fatalf("persist EXECUTING race fixture: %v", err)
+	}
+	request := protocol.Request{
+		Version: protocol.Version, RequestID: "status-sign-race-executing", Deadline: now.Add(time.Minute),
+		Method: protocol.MethodChangeStatus, ServerID: change.ServerID, MachineID: change.MachineID,
+		TargetID: change.TargetID, PolicyRevision: change.PolicyRevision,
+		CapabilityRevision: change.CapabilityRevision, ChangeID: change.ID,
+		Raw: []byte("status-sign-race-executing"),
+	}
+
+	// Pause exactly after status() has built and audited the EXECUTING Store
+	// snapshot, when Handle evaluates the signing timestamp. A simulated fast
+	// worker commits before receipt signing resumes.
+	signingReached := make(chan struct{})
+	releaseSigning := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSigning) }) }
+	defer release()
+	var nowCalls atomic.Int32
+	service.Now = func() time.Time {
+		if nowCalls.Add(1) == 2 {
+			close(signingReached)
+			<-releaseSigning
+		}
+		return now
+	}
+	responses := make(chan protocol.Response, 1)
+	go func() {
+		responses <- service.Handle(
+			context.Background(), peercred.Credential{UID: service.AgentUID}, request,
+		)
+	}()
+	select {
+	case <-signingReached:
+	case <-time.After(time.Second):
+		t.Fatal("status did not reach the deterministic receipt-signing barrier")
+	}
+
+	commitResult := make(chan error, 1)
+	go func() {
+		unlock := service.lockChange(change.ID)
+		defer unlock()
+		current, ok := service.Store.Change(change.ID)
+		if !ok {
+			commitResult <- fmt.Errorf("race fixture change disappeared")
+			return
+		}
+		current.State = StateCommitted
+		current.Verification = "fast fake-PVE task committed"
+		current.UpdatedAt = timestamp(now.Add(time.Second))
+		commitResult <- service.Store.PutChange(current)
+	}()
+	select {
+	case err := <-commitResult:
+		if err != nil {
+			release()
+			t.Fatalf("simulated fast worker could not commit: %v", err)
+		}
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("status snapshot blocked the simulated fast worker")
+	}
+	durable, ok := service.Store.Change(change.ID)
+	if !ok || durable.State != StateCommitted {
+		release()
+		t.Fatalf("simulated worker did not durably commit before receipt signing: %#v", durable)
+	}
+
+	release()
+	var response protocol.Response
+	select {
+	case response = <-responses:
+	case <-time.After(time.Second):
+		t.Fatal("status did not finish after releasing the receipt-signing barrier")
+	}
+	claims := protocol.BrokerReceiptClaims{
+		KeyID: "pve-receipt-v1", Domain: DomainPVE, RequestID: request.RequestID,
+		Method: protocol.MethodChangeStatus, ServerID: change.ServerID, MachineID: change.MachineID,
+		TargetID: change.TargetID, ChangeID: change.ID, PlanHash: change.PlanHash,
+	}
+	if !response.OK || response.State != StateExecuting || response.Receipt == nil {
+		t.Fatalf("status lost its signed EXECUTING snapshot during fast commit: %#v", response)
+	}
+	if err := protocol.VerifyBrokerResponse(response, claims, now, receiptPublic); err != nil {
+		t.Fatalf("EXECUTING status receipt did not verify: %v", err)
+	}
+
+	fresh := request
+	fresh.RequestID = "status-sign-race-committed"
+	fresh.Raw = []byte(fresh.RequestID)
+	committed := service.Handle(
+		context.Background(), peercred.Credential{UID: service.AgentUID}, fresh,
+	)
+	claims.RequestID = fresh.RequestID
+	if !committed.OK || committed.State != StateCommitted || committed.Receipt == nil {
+		t.Fatalf("fresh status did not observe signed COMMITTED state: %#v", committed)
+	}
+	if err := protocol.VerifyBrokerResponse(committed, claims, now, receiptPublic); err != nil {
+		t.Fatalf("COMMITTED status receipt did not verify: %v", err)
 	}
 }
 

@@ -1049,6 +1049,10 @@ func (s *Store) pruneVolatileLocked(now time.Time) {
 
 func cloneChange(change *Change) *Change {
 	clone := *change
+	if change.ApprovedByUID != nil {
+		approvedByUID := *change.ApprovedByUID
+		clone.ApprovedByUID = &approvedByUID
+	}
 	clone.Operation = append(json.RawMessage(nil), change.Operation...)
 	clone.RollbackData = append(json.RawMessage(nil), change.RollbackData...)
 	clone.BackupRefs = append([]string(nil), change.BackupRefs...)

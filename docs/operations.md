@@ -49,6 +49,13 @@ PID 1 D-Bus typed properties 精确核对 `Conditions`、`Asserts`、Load/Set/Im
 额外 loaded drop-in 必须是固定位置中 metadata 安全、完整语法落入窄 compatibility-reset allowlist 的
 host-wide file；未知 unit-specific 或 authority-bearing directive 会 fail closed。日常定位可先查看：
 
+在 systemd 252 上看到 `ImportCredential` unknown 并不意味着可忽略任意 `busctl` 失败。安装器只在
+typed `Manager.Version` canonical major `<254`、同一 unit object introspection 含唯一结构化 Service
+interface、4 个既有 credential anchor 的 type/access 精确且唯一并明确不含该 property，
+以及 exact unit/完整 loaded drop-in 闭包均无非空或含混 ImportCredential authority 这三项证据同时
+成立时接受 canonical empty；systemd `>=254`、错误/数组形式的 Version、缺损 introspection、非空 reset
+或其他 D-Bus 失败都应触发安装事务回滚。
+
 ```bash
 systemctl show ops-agentd.service \
   -p FragmentPath -p DropInPaths -p User -p Group -p ExecStart -p ExecStartEx \
@@ -503,6 +510,14 @@ server/core/PVE 三个候选 unit 以及各自 drop-in directory，其中 PVE di
 适用的集合；non-PVE `init`/`join` 会移除 stale managed PVE unit/drop-in，但不得删除该目录中的
 第三方文件或 PVE state/audit。`daemon-reload` 后、服务启动前，任一 applicable service 的 exact
 unit/final drop-in 或 PID 1 effective lifecycle/security vector 不匹配，都在同一事务内回滚。
+
+Enablement topology 也逐路径处理：事务在替换 unit 前分别 snapshot Release 会创建的 exact persistent
+link，以及 stale PVE/legacy helper 清理会触碰的 exact persistent/runtime link。清理只删除固定
+`.wants/UNIT` 路径中解析到同一个固定 `/etc/systemd/system/UNIT` 的 symlink；unexpected target、普通
+文件或未列入 allowlist 的路径一律回滚。这里禁止用 `systemctl disable` 代替精确删除，因为它还会
+删除管理员手工创建的 custom wants、alias 与 `Also=` link。Rollback 在恢复/删除 unit 文件前先恢复
+这些 link，恢复旧 unit state 后再次应用 exact topology、`daemon-reload` 并核对原 enablement state；
+因此失败事务不会留下 dangling link，也不会把第三方 topology 当作受管文件清掉。
 
 多 endpoint 管理域先升级能解析新 schema 的 controller，再升级 endpoint。没有 capability
 negotiation 时，旧 controller 遇到未知 capability 应 fail closed。

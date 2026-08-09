@@ -71,6 +71,14 @@ property、缺失 final drop-in 或任何 host-wide reset 造成的漂移都会�
 核验先调用 `org.freedesktop.systemd1.Manager.LoadUnit` 并使用其返回的 object path，再读取 unit
 property，不能依赖只对当前 cache 命中的 `GetUnit`。
 
+Debian 12 的 systemd 252 尚未暴露 v254 才增加的 Service `ImportCredential` property。Installer 不按
+发行版或 `busctl` 错误文本放行：只有 typed `Manager.Version` 严格解析为 major `<254`、同一 LoadUnit
+object 的 introspection 含唯一结构化 Service interface、4 个既有 credential anchor 的 type/access
+精确且唯一并权威证明 property 不存在、且 exact unit 与全部 manager-loaded
+drop-in 闭包证明没有非空或含混的 `ImportCredential=` authority 时，才将该单一缺失 vector 归一为
+typed empty。systemd `>=254` 仍必须返回真实 `as` property 并通过 exact-empty 校验；其他 query、类型、
+版本、introspection 结构/anchor 或闭包错误均中止事务。
+
 这项检查是安装/升级时的 PID 1 快照，不是对安装后宿主 root 或随后写入的新 drop-in 的持续防护。
 OS image、LXC runtime 或站点管理员改变 type-wide/unit-specific drop-in 后，必须在维护窗口重新运行
 同一 mode 的版本匹配 installer 验证，并重新检查 effective properties；只看
@@ -260,11 +268,14 @@ E2E 应创建专用、带密码且无 broad sudo rule 的 `opsadmin`；生产机
   以及无参数的 `/usr/libexec/pi-ops-agent/setup-botmux`，均使用 `PASSWD` 与 command-specific
   `timestamp_timeout=0`，不授予通用 root command；完整 sudo policy 必须通过 `sudo -k` 后的
   non-interactive 负向探针，且 root 视角的 `sudo -U ops-agent-botmux -l` 必须证明专用账号没有
-  任何 sudo rule，否则安装失败。sudo 1.9 在“无规则”时也可能返回 status 0，所以安装器不信退出码，
-  只接受 C locale 下唯一一行 canonical `is not allowed to run sudo` 结果；warning、Defaults、command
-  listing 或其他附加输出一律 fail closed；
+  任何 sudo rule，否则安装失败。sudo 1.9 的“无规则”listing 成功时返回 status 0，Debian 12 还会在
+  `on` 后换行；安装器要求 exact status 0，并对最多 1024 bytes 的 C-locale 输出仅折叠 ASCII
+  space/tab/LF 后要求唯一完整的 canonical `is not allowed to run sudo` sentence。控制/NUL、warning、
+  Defaults、command listing、非法 hostname、超限或其他附加输出一律 fail closed；
 - 安装 unit、tmpfiles、immutable release 目录和 `/opt/pi-ops-agent/current`；PVE broker unit、
-  state/audit 目录与 socket 只在检测到 `/usr/bin/pvesh` 的 PVE host 启用；
+  state/audit 目录与 socket 只在检测到 `/usr/bin/pvesh` 的 PVE host 启用。迁移 stale PVE 或旧
+  `ops-systemd-helper` 时，只删除已纳入事务 snapshot、路径与 target 都精确匹配的 persistent/runtime
+  `.wants` link；不调用会连带删除管理员 custom wants/alias 的 broad `systemctl disable`；
 - 初始化 root-owned Target policy 与本机 Machine registration；
 - 复制、检查并请求批准 `adapter.tui`、`workload.base`；
 - 在唯一、root-owned、位于 `/run/systemd/system` 且执行后精确清理的短生命周期 static unit 中，
@@ -407,8 +418,9 @@ Endpoint 在采用 bundle 内 CA 验证签名之前，必须先让该 CA 证书�
 `join` 只创建 `ops-agent-server` identity、server/core broker unit 与最小 tmpfiles；PVE 精确匹配时
 再增加 PVE broker。它不创建 agentd/reviewer/BotMux/client group、模型/guardian 配置、插件目录、
 审批 sudoers、`ops-agent` CLI symlink、controller health timer 或 `ops-agent.target.wants`。旧版
-PVE endpoint 遗留的唯一精确 PVE target symlink 会在升级事务中清理；其他 target-wants 内容一律
-视为 controller surface 并拒绝覆盖。检查使用
+PVE endpoint 遗留的精确 persistent/runtime PVE enablement symlink 会在升级事务中按固定路径和
+fixed unit target 清理；其他 custom wants/alias 保留，persistent controller target-wants 出现其他
+内容则仍视为 controller surface 并拒绝覆盖。检查使用
 `scripts/healthcheck.sh --endpoint`。若发现这些 controller-only surface，join 拒绝覆盖。
 
 远端 server 模式的 root broker（带 `--target-policy`）还必须同时配置
@@ -537,6 +549,10 @@ PID 1 独占的 `--sync-fd` EOF 和 bounded `--info-fd` 绑定的 exact init ide
 进程树 completion barrier。preflight 能捕获
 `RestrictNamespaces`、`ProtectHostname`、`ProtectKernelTunables`、nested userns 或 bwrap 参数漂移；它仍不替代
 对真实 Source Workload/provider/lease 的部署验证。
+清理仍必须逐次调用 `stop` 与 `reset-failed`，但短生命周期 static unit 可能在两次调用之间已被 PID 1
+卸载，所以不能把这两个单步返回码或 stderr 当作残留证据。只有 exact unit/drop-in/driver/nonce 全部
+不存在、`daemon-reload` 成功且随后 PID 1 权威返回 `LoadState=not-found` 才能判定闭包完成；reload、
+query 或任一最终证据失败仍须使安装回滚。
 若真实 probe 进入失败终态，安装器会在删除临时 unit 前输出有界 journal 和
 `kernel.apparmor_restrict_unprivileged_userns` 状态；应以其中的实际 bwrap errno/AppArmor 拒绝为准，
 不能把通用的“user namespace 不可用”摘要当作根因，也不能通过关闭 host-wide 限制制造通过。

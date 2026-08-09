@@ -1,5 +1,19 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 function repositoryFile(path: string): string {
@@ -76,8 +90,9 @@ describe("installed client-plane isolation", () => {
     expect(installer).toContain("required_commands=(systemctl systemd-tmpfiles busctl");
     expect(busPathVerifier).toContain("org.freedesktop.systemd1.Manager LoadUnit");
     expect(busPathVerifier).not.toContain("org.freedesktop.systemd1.Manager GetUnit");
+    expect(installer).toContain("verify_installed_unit_typed_vectors \\");
     expect(installer).toContain(
-      'verify_installed_unit_typed_vectors "${unit}" "${unit_path}"',
+      '"${unit}" "${UNIT_ROOT}/${unit}" "${dropin}" "${credential_dropin}"',
     );
     for (const property of [
       "Conditions",
@@ -124,6 +139,228 @@ describe("installed client-plane isolation", () => {
     expect(hostVerifier).not.toContain("Environment=");
     expect(hostVerifier).not.toContain("CapabilityBoundingSet=");
     expect(hostVerifier).not.toContain("LoadCredentialEncrypted=");
+  });
+
+  it("canonicalizes missing pre-v254 ImportCredential only with three exact proofs", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const compatibilityStart = installer.indexOf("installed_systemd_major_version() {");
+    const compatibilityEnd = installer.indexOf(
+      "require_installed_unit_apparmor_profile() {",
+      compatibilityStart,
+    );
+    const closureStart = installer.indexOf("verify_installed_unit_dropin_closure() {");
+    const closureEnd = installer.indexOf("require_installed_unit_property() {", closureStart);
+    const typedStart = installer.indexOf("verify_installed_unit_typed_vectors() {");
+    const typedEnd = installer.indexOf("verify_allowed_host_service_dropin() {", typedStart);
+    const effectiveStart = installer.indexOf("verify_effective_security_dropin() {");
+    const effectiveEnd = installer.indexOf("\nfor unit in ", effectiveStart);
+    expect(compatibilityStart).toBeGreaterThanOrEqual(0);
+    expect(compatibilityEnd).toBeGreaterThan(compatibilityStart);
+    expect(closureStart).toBeGreaterThan(compatibilityEnd);
+    expect(closureEnd).toBeGreaterThan(closureStart);
+    expect(typedStart).toBeGreaterThan(compatibilityEnd);
+    expect(typedEnd).toBeGreaterThan(typedStart);
+    expect(effectiveStart).toBeGreaterThan(closureEnd);
+    expect(effectiveEnd).toBeGreaterThan(effectiveStart);
+    const compatibility = installer.slice(compatibilityStart, compatibilityEnd);
+    const closure = installer.slice(closureStart, closureEnd);
+    const typedFunction = installer.slice(typedStart, typedEnd);
+    const effective = installer.slice(effectiveStart, effectiveEnd);
+
+    expect(compatibility).toContain("org.freedesktop.systemd1.Manager Version");
+    expect(compatibility).toContain('value?.type !== "s" || typeof value.data !== "string"');
+    expect(compatibility).toContain("org.freedesktop.DBus.Introspectable Introspect");
+    expect(compatibility).toContain("if ((10#${major} >= 254)); then");
+    expect(compatibility).toContain("verify_no_import_credential_file_authority");
+    expect(compatibility).toContain("verify_installed_unit_dropin_closure");
+    expect(compatibility).toContain("printf '{\"type\":\"as\",\"data\":[]}'");
+    expect(closure).toContain(
+      'verify_no_import_credential_file_authority "${security_dropin}" || return 1',
+    );
+    expect(closure).toContain(
+      'verify_no_import_credential_file_authority "${credential_dropin}" || return 1',
+    );
+    expect(closure).toContain(
+      'raw="$(installed_unit_property "${unit}" DropInPaths)" || return 1',
+    );
+    expect(closure).toContain('verify_allowed_host_service_dropin "${path}" || return 1');
+    expect(closure).toContain(
+      'verify_no_import_credential_file_authority "${path}" || return 1',
+    );
+    expect(effective.indexOf("verify_installed_unit_dropin_closure")).toBeLessThan(
+      effective.indexOf("verify_installed_unit_typed_vectors"),
+    );
+
+    const root = mkdtempSync(join(tmpdir(), "ops-agent-systemd-compat-"));
+    try {
+      mkdirSync(join(root, "runtime"));
+      symlinkSync(process.execPath, join(root, "runtime", "node"));
+      const safeUnit = join(root, "safe.service");
+      const emptyReset = join(root, "empty-reset.conf");
+      const nonempty = join(root, "nonempty.conf");
+      const continuation = join(root, "continuation.conf");
+      writeFileSync(safeUnit, "[Service]\nExecStart=/bin/true\n", "utf8");
+      writeFileSync(emptyReset, "[Service]\nImportCredential=\n", "utf8");
+      writeFileSync(nonempty, "[Service]\nImportCredential=host.*\n", "utf8");
+      writeFileSync(continuation, "[Service]\nImportCrede\\\nntial=host.*\n", "utf8");
+      const absentXml = [
+        "<node>",
+        '<interface name="org.freedesktop.systemd1.Service">',
+        '<property name="LoadCredential" type="a(ss)" access="read"/>',
+        '<property name="LoadCredentialEncrypted" type="a(ss)" access="read"/>',
+        '<property name="SetCredential" type="a(say)" access="read"/>',
+        '<property name="SetCredentialEncrypted" type="a(say)" access="read"/>',
+        "</interface>",
+        "</node>",
+      ].join("");
+      const presentXml = absentXml.replace(
+        "</interface>",
+        '<property name="ImportCredential" type="as" access="read"/></interface>',
+      );
+      const serviceInterface = absentXml.slice("<node>".length, -"</node>".length);
+      const duplicateInterfaceXml = `<node>${serviceInterface}${serviceInterface}</node>`;
+      const wrongTypeDuplicateXml = absentXml.replace(
+        "</interface>",
+        '<property name="LoadCredential" type="as" access="read"/></interface>',
+      );
+      const commentAnchorXml = [
+        "<node>",
+        '<interface name="org.freedesktop.systemd1.Service">',
+        "<!-- LoadCredential LoadCredentialEncrypted SetCredential SetCredentialEncrypted -->",
+        "</interface>",
+        "</node>",
+      ].join("");
+      const script = [
+        "set -euo pipefail",
+        `release_dir=${JSON.stringify(root)}`,
+        compatibility,
+        closure,
+        typedFunction,
+        "installed_unit_bus_property() {",
+        "  if [[ ${VECTOR_MODE:-0} == 1 ]]; then",
+        "    case \"$3\" in",
+        "      Conditions|Asserts) printf '%s' '{\"type\":\"a(sbbsi)\",\"data\":[]}' ; return 0 ;;",
+        "      LoadCredential|LoadCredentialEncrypted) printf '%s' '{\"type\":\"a(ss)\",\"data\":[]}' ; return 0 ;;",
+        "      SetCredential|SetCredentialEncrypted) printf '%s' '{\"type\":\"a(say)\",\"data\":[]}' ; return 0 ;;",
+        "    esac",
+        "  fi",
+        "  if [[ ${IMPORT_MODE} == success ]]; then printf '%s' \"${IMPORT_PAYLOAD}\"; return 0; fi",
+        "  printf '%s' 'simulated bus failure' >&2",
+        "  return 23",
+        "}",
+        "busctl() {",
+        "  case \"$*\" in",
+        "    *'Manager Version') printf '%s' \"${VERSION_PAYLOAD}\" ; return ${VERSION_STATUS:-0} ;;",
+        "    *'Introspect') printf '%s' \"${INTROSPECT_PAYLOAD}\" ; return ${INTROSPECT_STATUS:-0} ;;",
+        "  esac",
+        "  return 97",
+        "}",
+        "installed_unit_property() { printf '%s' \"${DROPIN_PATHS}\"; return ${DROPIN_STATUS:-0}; }",
+        "installed_unit_bus_path() { printf '%s' /unit; }",
+        "verify_allowed_host_service_dropin() { [[ ${HOST_OK} == 1 ]]; }",
+        "call_import() {",
+        "  installed_unit_import_credential_property test.service /unit \"$1\" \"$2\" \"${3:-}\"",
+        "}",
+        "expect_failure() {",
+        "  local status",
+        "  set +e",
+        "  \"$@\" >/dev/null 2>&1",
+        "  status=$?",
+        "  set -e",
+        "  ((status != 0))",
+        "}",
+        "IMPORT_MODE=success",
+        "IMPORT_PAYLOAD='{" + "\"type\":\"as\",\"data\":[]}" + "'",
+        "VERSION_PAYLOAD=invalid",
+        "INTROSPECT_PAYLOAD=invalid",
+        "DROPIN_PATHS=\"$2\"",
+        "DROPIN_STATUS=0",
+        "HOST_OK=1",
+        "[[ $(call_import \"$1\" \"$2\") == \"${IMPORT_PAYLOAD}\" ]]",
+        "IMPORT_MODE=fail",
+        "VERSION_PAYLOAD=\"$5\"",
+        "INTROSPECT_PAYLOAD=\"$6\"",
+        "[[ $(call_import \"$1\" \"$2\") == '{\"type\":\"as\",\"data\":[]}' ]]",
+        "VERSION_PAYLOAD=\"$7\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "VERSION_PAYLOAD=\"$8\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "VERSION_PAYLOAD=\"${12}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "VERSION_PAYLOAD=\"${13}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "VERSION_PAYLOAD=\"$5\"",
+        "INTROSPECT_PAYLOAD=\"$9\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_PAYLOAD=\"${10}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_PAYLOAD=\"${11}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_PAYLOAD=\"${14}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_PAYLOAD=\"${15}\"",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_PAYLOAD=\"$6\"",
+        "expect_failure call_import \"$3\" \"$2\"",
+        "expect_failure call_import \"$1\" \"$3\"",
+        "expect_failure call_import \"$1\" \"$2\" \"$3\"",
+        "expect_failure call_import \"$1\" \"$4\"",
+        "DROPIN_STATUS=7",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "DROPIN_STATUS=0",
+        "DROPIN_PATHS=\"$2 /run/systemd/system/service.d/test.conf\"",
+        "HOST_OK=0",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "HOST_OK=1",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "DROPIN_PATHS=\"$2\"",
+        "VERSION_STATUS=7",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "VERSION_STATUS=0",
+        "INTROSPECT_STATUS=7",
+        "expect_failure call_import \"$1\" \"$2\"",
+        "INTROSPECT_STATUS=0",
+        "VECTOR_MODE=1",
+        "IMPORT_MODE=success",
+        "IMPORT_PAYLOAD='{\"type\":\"as\",\"data\":[]}'",
+        "verify_installed_unit_typed_vectors test.service \"$1\" \"$2\" ''",
+        "IMPORT_PAYLOAD='{\"type\":\"as\",\"data\":[\"unexpected\"]}'",
+        "expect_failure verify_installed_unit_typed_vectors test.service \"$1\" \"$2\" ''",
+        "IMPORT_PAYLOAD='{\"type\":\"a(ss)\",\"data\":[]}'",
+        "expect_failure verify_installed_unit_typed_vectors test.service \"$1\" \"$2\" ''",
+        "VECTOR_MODE=0",
+        "verify_no_import_credential_file_authority \"$2\"",
+        "expect_failure verify_no_import_credential_file_authority \"$3\"",
+        "expect_failure verify_no_import_credential_file_authority \"$4\"",
+      ].join("\n");
+      const verification = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          script,
+          "--",
+          safeUnit,
+          emptyReset,
+          nonempty,
+          continuation,
+          JSON.stringify({ type: "s", data: "252.39-1~deb12u2" }),
+          JSON.stringify({ type: "s", data: [absentXml] }),
+          JSON.stringify({ type: "s", data: "254.1-1" }),
+          JSON.stringify({ type: "s", data: ["252.39-1"] }),
+          JSON.stringify({ type: "s", data: [presentXml] }),
+          JSON.stringify({ type: "s", data: absentXml }),
+          JSON.stringify({ type: "s", data: [commentAnchorXml] }),
+          JSON.stringify({ type: "s", data: "0252.39-1" }),
+          JSON.stringify({ type: "s", data: "252evil" }),
+          JSON.stringify({ type: "s", data: [duplicateInterfaceXml] }),
+          JSON.stringify({ type: "s", data: [wrongTypeDuplicateXml] }),
+        ],
+        { encoding: "utf8" },
+      );
+      expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps service, BotMux, and administrator identities out of the service group", () => {
@@ -197,6 +434,102 @@ describe("installed client-plane isolation", () => {
     );
   });
 
+  it("accepts only bounded canonical BotMux no-sudo results across sudo 1.9 wrapping", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const verifierStart = installer.indexOf("verify_botmux_no_sudo_result() {");
+    const verifierEnd = installer.indexOf("verify_effective_sudo_policy() {", verifierStart);
+    const policyEnd = installer.indexOf("secure_registered_approver_material() {", verifierEnd);
+    expect(verifierStart).toBeGreaterThanOrEqual(0);
+    expect(verifierEnd).toBeGreaterThan(verifierStart);
+    expect(policyEnd).toBeGreaterThan(verifierEnd);
+    const verifier = installer.slice(verifierStart, verifierEnd);
+    const policyProbe = installer.slice(verifierEnd, policyEnd);
+    expect(policyProbe).toContain(
+      'if LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1; then',
+    );
+    expect(policyProbe).toContain("botmux_status=$?");
+    expect(policyProbe).toContain(
+      'verify_botmux_no_sudo_result "${botmux_policy}" "${botmux_status}"',
+    );
+    expect(policyProbe).not.toContain(
+      'LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1 || true',
+    );
+
+    const root = mkdtempSync(join(tmpdir(), "ops-agent-sudo-policy-"));
+    try {
+      mkdirSync(join(root, "runtime"));
+      symlinkSync(process.execPath, join(root, "runtime", "node"));
+      const canonical = join(root, "canonical.log");
+      const wrapped = join(root, "wrapped.log");
+      const listing = join(root, "listing.log");
+      const warning = join(root, "warning.log");
+      const badHost = join(root, "bad-host.log");
+      const carriageReturn = join(root, "carriage-return.log");
+      const nul = join(root, "nul.log");
+      const oversized = join(root, "oversized.log");
+      const sentence = "User ops-agent-botmux is not allowed to run sudo on node-1.\n";
+      writeFileSync(canonical, sentence, "utf8");
+      writeFileSync(
+        wrapped,
+        "User ops-agent-botmux is not allowed to run sudo on\n" +
+          "        opsagent-e2e-bookworm-controller.\n",
+        "utf8",
+      );
+      writeFileSync(listing, sentence + "    (ALL : ALL) ALL\n", "utf8");
+      writeFileSync(warning, "sudo: policy plugin warning\n" + sentence, "utf8");
+      writeFileSync(
+        badHost,
+        "User ops-agent-botmux is not allowed to run sudo on bad_host.\n",
+        "utf8",
+      );
+      writeFileSync(carriageReturn, sentence.replace("\n", "\r\n"), "utf8");
+      writeFileSync(nul, Buffer.concat([Buffer.from(sentence), Buffer.from([0])]));
+      writeFileSync(oversized, sentence.trimEnd() + " ".repeat(1100) + "\n", "utf8");
+
+      const script = [
+        "set -euo pipefail",
+        `release_dir=${JSON.stringify(root)}`,
+        "readonly BOTMUX_USER=ops-agent-botmux",
+        verifier,
+        "expect_failure() {",
+        "  if verify_botmux_no_sudo_result \"$1\" \"$2\" >/dev/null 2>&1; then",
+        "    return 1",
+        "  fi",
+        "}",
+        "verify_botmux_no_sudo_result \"$1\" 0",
+        "verify_botmux_no_sudo_result \"$2\" 0",
+        "expect_failure \"$1\" 1",
+        "expect_failure \"$1\" 2",
+        "expect_failure \"$3\" 0",
+        "expect_failure \"$4\" 0",
+        "expect_failure \"$5\" 0",
+        "expect_failure \"$6\" 0",
+        "expect_failure \"$7\" 0",
+        "expect_failure \"$8\" 0",
+      ].join("\n");
+      const verification = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          script,
+          "--",
+          canonical,
+          wrapped,
+          listing,
+          warning,
+          badHost,
+          carriageReturn,
+          nul,
+          oversized,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("lets the isolated reviewer create only its runtime socket", () => {
     const reviewerUnit = repositoryFile("systemd/agentd-approval-reviewer.service");
     const writablePaths = reviewerUnit
@@ -232,11 +565,11 @@ describe("installed client-plane isolation", () => {
     expect(installer).toContain(
       'LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l',
     );
-    expect(installer).toContain(
-      "is not allowed to run sudo on [A-Za-z0-9][A-Za-z0-9.-]",
-    );
+    expect(installer).toContain("verify_botmux_no_sudo_result()");
+    expect(installer).toContain("const maximumBytes = 1024");
+    expect(installer).toContain('.replace(/[ \\t\\n]+/gu, " ")');
     expect(installer).not.toContain(
-      'if /usr/bin/sudo -U "${BOTMUX_USER}" -l',
+      'LC_ALL=C /usr/bin/sudo -U "${BOTMUX_USER}" -l >"${botmux_policy}" 2>&1 || true',
     );
     expect(installer).toContain('stat -c \'%h\' "${lease_path}"');
     expect(installer).toContain('chown root:"${LEASE_GROUP}" "${lease_path}"');
@@ -728,10 +1061,20 @@ describe("installed client-plane isolation", () => {
     const snapshot = installer.indexOf(
       'snapshot_managed_path "${OPS_AGENT_TARGET_WANTS_DIR}"',
     );
-    const restoreUnits = installer.indexOf("\n  restore_unit_state\n");
-    const lateWantsRestore = installer.indexOf(
-      'restore_managed_path_snapshot "${OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX}"',
+    const rollbackStart = installer.indexOf("rollback_install_transaction() {");
+    const restoreUnits = installer.indexOf("\n  restore_unit_state\n", rollbackStart);
+    const restoreTopology = installer.indexOf(
+      "\n  restore_managed_enablement_topology\n",
+      restoreUnits,
     );
+    const topologyFunctionStart = installer.indexOf(
+      "restore_managed_enablement_topology() {",
+    );
+    const topologyFunctionEnd = installer.indexOf(
+      "\nrollback_install_transaction() {",
+      topologyFunctionStart,
+    );
+    const topologyFunction = installer.slice(topologyFunctionStart, topologyFunctionEnd);
     const cleanup = installer.lastIndexOf("\ncleanup_pve_controller_target_want\n");
     const unitFailure = installer.indexOf("maybe_inject_install_failure units");
     const joinActivation = installer.indexOf(
@@ -747,7 +1090,18 @@ describe("installed client-plane isolation", () => {
     const serviceFailure = installer.lastIndexOf("maybe_inject_install_failure services");
 
     expect(snapshot).toBeGreaterThan(0);
-    expect(lateWantsRestore).toBeGreaterThan(restoreUnits);
+    expect(restoreTopology).toBeGreaterThan(restoreUnits);
+    expect(topologyFunction).toContain(
+      'for index in "${TRANSACTION_ENABLEMENT_LINK_SNAPSHOT_INDICES[@]}"; do',
+    );
+    expect(topologyFunction).toContain(
+      'restore_managed_path_snapshot "${OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX}"',
+    );
+    expect(topologyFunction.indexOf("systemctl daemon-reload")).toBeGreaterThan(
+      topologyFunction.indexOf(
+        'restore_managed_path_snapshot "${OPS_AGENT_TARGET_WANTS_SNAPSHOT_INDEX}"',
+      ),
+    );
     expect(cleanup).toBeGreaterThan(snapshot);
     expect(unitFailure).toBeGreaterThan(cleanup);
     expect(joinActivation).toBeGreaterThan(0);
@@ -755,6 +1109,167 @@ describe("installed client-plane isolation", () => {
     expect(installer.slice(joinActivation, initActivation)).not.toContain("add-wants");
     expect(addWants).toBeGreaterThan(initActivation);
     expect(serviceFailure).toBeGreaterThan(addWants);
+  });
+
+  it("snapshots only exact managed persistent and cleanup-time runtime links", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const snapshotStart = installer.indexOf("snapshot_managed_enablement_link() {");
+    const snapshotEnd = installer.indexOf("pve_controller_target_want_is_exact() {", snapshotStart);
+    const snapshotFunction = installer.slice(snapshotStart, snapshotEnd);
+    const beginStart = installer.indexOf("begin_install_transaction() {");
+    const beginEnd = installer.indexOf("record_rollback_error() {", beginStart);
+    const begin = installer.slice(beginStart, beginEnd);
+    const restoreStart = installer.indexOf("restore_unit_state() {");
+    const restoreEnd = installer.indexOf(
+      "restore_managed_enablement_topology() {",
+      restoreStart,
+    );
+    const restore = installer.slice(restoreStart, restoreEnd);
+
+    for (const path of [
+      "multi-user.target.wants/ops-agent.target",
+      "multi-user.target.wants/ops-agent-server.service",
+      "multi-user.target.wants/ops-root-helper.service",
+      "multi-user.target.wants/ops-pve-root-helper.service",
+      "timers.target.wants/ops-agent-healthcheck.timer",
+      "ops-agent.target.wants/ops-pve-root-helper.service",
+      "ops-agent.target.wants/ops-systemd-helper.service",
+    ]) {
+      expect(snapshotFunction).toContain(path);
+    }
+    expect(snapshotFunction).toContain("Unit enablement path is not a symlink");
+    expect(snapshotFunction).toContain("Unit enablement parent is group/world writable");
+    expect(begin.indexOf("snapshot_managed_units")).toBeLessThan(
+      begin.indexOf("snapshot_managed_enablement_links"),
+    );
+    expect(begin.indexOf("snapshot_managed_enablement_links")).toBeLessThan(
+      begin.indexOf('snapshot_managed_path "${OPS_AGENT_TARGET_WANTS_DIR}"'),
+    );
+    expect(snapshotFunction).toContain(
+      '${RUNTIME_UNIT_ROOT}/multi-user.target.wants/ops-pve-root-helper.service',
+    );
+    expect(snapshotFunction).toContain(
+      '${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service',
+    );
+    expect(restore).not.toMatch(/^\s*systemctl disable(?:\s|$)/mu);
+    expect(restore).toContain('if [[ "${current_enabled}" != "${enabled}" ]]');
+    expect(restore).toContain("any remaining state mismatch is therefore an incomplete rollback");
+
+    const installLinks = new Map([
+      ["ops-agent.target", "multi-user.target"],
+      ["ops-agent-healthcheck.timer", "timers.target"],
+      ["ops-agent-server.service", "multi-user.target"],
+      ["ops-root-helper.service", "multi-user.target"],
+      ["ops-pve-root-helper.service", "multi-user.target"],
+    ]);
+    for (const [unit, wantedBy] of installLinks) {
+      const source = repositoryFile(`systemd/${unit}`);
+      expect(source).toContain("[Install]");
+      expect(source).toContain(`WantedBy=${wantedBy}`);
+      expect(snapshotFunction).toContain(`${wantedBy}.wants/${unit}`);
+    }
+  });
+
+  it("removes only fixed stale-unit enablement links and preserves custom aliases", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const cleanupStart = installer.indexOf("cleanup_managed_unit_enablement_link() {");
+    const cleanupEnd = installer.indexOf(
+      "# Controller init follows the local PVE host fact",
+      cleanupStart,
+    );
+    expect(cleanupStart).toBeGreaterThanOrEqual(0);
+    expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+    const cleanupFunctions = installer.slice(cleanupStart, cleanupEnd);
+    expect(cleanupFunctions).not.toContain("systemctl disable");
+
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "ops-agent-enable-cleanup-"));
+    const unitRoot = join(root, "etc-systemd-system");
+    const runtimeUnitRoot = join(root, "run-systemd-system");
+    const pveUnit = join(unitRoot, "ops-pve-root-helper.service");
+    const legacyUnit = join(unitRoot, "ops-systemd-helper.service");
+    const exactLinks = [
+      join(unitRoot, "multi-user.target.wants", "ops-pve-root-helper.service"),
+      join(unitRoot, "ops-agent.target.wants", "ops-pve-root-helper.service"),
+      join(runtimeUnitRoot, "multi-user.target.wants", "ops-pve-root-helper.service"),
+      join(runtimeUnitRoot, "ops-agent.target.wants", "ops-pve-root-helper.service"),
+      join(unitRoot, "ops-agent.target.wants", "ops-systemd-helper.service"),
+      join(runtimeUnitRoot, "ops-agent.target.wants", "ops-systemd-helper.service"),
+    ];
+    const customPve = join(unitRoot, "custom.target.wants", "ops-pve-root-helper.service");
+    const customLegacy = join(unitRoot, "custom.target.wants", "ops-systemd-helper.service");
+    const pveAlias = join(unitRoot, "administrator-pve-alias.service");
+    const legacyAlias = join(unitRoot, "administrator-systemd-alias.service");
+    try {
+      for (const directory of [
+        join(unitRoot, "multi-user.target.wants"),
+        join(unitRoot, "ops-agent.target.wants"),
+        join(unitRoot, "custom.target.wants"),
+        join(runtimeUnitRoot, "multi-user.target.wants"),
+        join(runtimeUnitRoot, "ops-agent.target.wants"),
+      ]) {
+        mkdirSync(directory, { recursive: true });
+      }
+      writeFileSync(pveUnit, "pve fixture\n", "utf8");
+      writeFileSync(legacyUnit, "legacy fixture\n", "utf8");
+      for (const path of exactLinks.slice(0, 4)) symlinkSync(pveUnit, path);
+      for (const path of exactLinks.slice(4)) symlinkSync(legacyUnit, path);
+      for (const path of [customPve, pveAlias]) symlinkSync(pveUnit, path);
+      for (const path of [customLegacy, legacyAlias]) symlinkSync(legacyUnit, path);
+
+      const verification = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          [
+            "set -euo pipefail",
+            'UNIT_ROOT="$1"',
+            'RUNTIME_UNIT_ROOT="$2"',
+            'TEST_NODE="$3"',
+            "readlink() {",
+            '  if [[ "$#" -eq 3 && "$1" == -f && "$2" == -- ]]; then',
+            '    "${TEST_NODE}" -e \'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))\' "$3"',
+            "  else",
+            '    command readlink "$@"',
+            "  fi",
+            "}",
+            cleanupFunctions,
+            "cleanup_managed_unit_enablement_links ops-pve-root-helper.service",
+            "cleanup_managed_unit_enablement_links ops-systemd-helper.service",
+            'unsafe="${RUNTIME_UNIT_ROOT}/ops-agent.target.wants/ops-systemd-helper.service"',
+            'ln -s "${UNIT_ROOT}/ops-pve-root-helper.service" "${unsafe}"',
+            "if cleanup_managed_unit_enablement_links ops-systemd-helper.service >/dev/null 2>&1; then exit 91; fi",
+            '[[ -L "${unsafe}" ]]',
+            'rm -f -- "${unsafe}"',
+            'printf "%s\\n" unsafe >"${unsafe}"',
+            "if cleanup_managed_unit_enablement_links ops-systemd-helper.service >/dev/null 2>&1; then exit 92; fi",
+            '[[ -f "${unsafe}" ]]',
+            'rm -f -- "${unsafe}"',
+            "if cleanup_managed_unit_enablement_links unrelated.service >/dev/null 2>&1; then exit 93; fi",
+          ].join("\n"),
+          "--",
+          unitRoot,
+          runtimeUnitRoot,
+          process.execPath,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+      for (const path of exactLinks) {
+        expect(existsSync(path)).toBe(false);
+        expect(() => lstatSync(path)).toThrow();
+      }
+      for (const [path, target] of [
+        [customPve, pveUnit],
+        [customLegacy, legacyUnit],
+        [pveAlias, pveUnit],
+        [legacyAlias, legacyUnit],
+      ] as const) {
+        expect(lstatSync(path).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(path)).toBe(target);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("transactionally removes only managed PVE systemd surfaces from non-PVE endpoints", () => {
@@ -784,8 +1299,10 @@ describe("installed client-plane isolation", () => {
     expect(dropInCleanup).toBeGreaterThan(unitCleanup);
     expect(unitFailure).toBeGreaterThan(dropInCleanup);
     expect(installer.slice(unitCleanup, unitFailure)).toContain(
-      'disable_managed_unit_for_cleanup "${unit_name}"',
+      'cleanup_managed_unit_enablement_links "${unit_name}"',
     );
+    expect(installer).not.toContain("disable_managed_unit_for_cleanup");
+    expect(installer).not.toMatch(/^\s*systemctl disable(?:\s|$)/mu);
     expect(installer.slice(selection, unitFailure)).toContain(
       "validate_stale_pve_unit_for_cleanup",
     );
@@ -1188,7 +1705,13 @@ describe("installed client-plane isolation", () => {
     expect(preflight).toContain('rm -f -- "${bwrap_probe_unit_path}"');
     expect(preflight).toContain('rm -f -- "${bwrap_probe_driver}"');
     expect(preflight).toContain('rm -f -- "${bwrap_probe_nonce}"');
-    expect(preflight).toContain('[[ "${load_state}" == not-found ]]');
+    expect(preflight).toContain('load_state_status=$?');
+    expect(preflight).toContain(
+      'if ((load_state_status != 0)) || [[ "${load_state}" != not-found ]]; then',
+    );
+    expect(preflight).not.toContain(
+      '"${bwrap_probe_unit}" 2>/dev/null || true)',
+    );
     expect(preflight).toContain(
       "Static bubblewrap preflight did not produce its exact root-owned nonce.",
     );
@@ -1282,6 +1805,126 @@ describe("installed client-plane isolation", () => {
     expect(sandbox).toContain('"--cap-drop"');
     expect(sandbox).toContain('"--nproc=64:64"');
     expect(sandbox).toContain("must be a root-owned, non-writable executable file");
+  });
+
+  it("uses final PID 1 absence, not stop/reset status, as preflight cleanup authority", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const preflightStart = installer.indexOf("run_bwrap_service_preflight() (");
+    const preflightEnd = installer.indexOf(
+      '\nif [[ "${MODE}" == init ]]; then',
+      preflightStart,
+    );
+    const preflight = installer.slice(preflightStart, preflightEnd);
+    const cleanupMatch = preflight.match(
+      / {2}cleanup_bwrap_service_preflight\(\) \{\n(?<body>[\s\S]*?)\n {2}\}\n\n {2}pid1_unit_property\(\)/u,
+    );
+    const cleanupBody = cleanupMatch?.groups?.body;
+    expect(cleanupBody).toBeDefined();
+    if (cleanupBody === undefined) throw new Error("preflight cleanup helper is missing");
+
+    const runCleanup = (
+      finalLoadState: string,
+      stopStatus: number,
+      daemonReloadStatus = 0,
+      showStatus = 0,
+    ) => {
+      const root = mkdtempSync(join(tmpdir(), "ops-agent-probe-cleanup-"));
+      const unit = "ops-agent-bwrap-probe-test.service";
+      const unitPath = join(root, unit);
+      const dropinDirectory = join(root, `${unit}.d`);
+      const lifecycleDropin = join(
+        dropinDirectory,
+        "zzzz-ops-agent-zz-preflight.conf",
+      );
+      const securityDropin = join(dropinDirectory, "zzzz-ops-agent-security.conf");
+      const driver = join(root, "ops-agent-bwrap-probe-test-driver");
+      const nonce = join(root, "ops-agent-bwrap-probe-test.nonce");
+      const callLog = join(root, "calls.log");
+      mkdirSync(dropinDirectory);
+      for (const path of [unitPath, lifecycleDropin, securityDropin, driver, nonce]) {
+        writeFileSync(path, "fixture\n", "utf8");
+      }
+      const script = [
+        "set -euo pipefail",
+        "cleanup_bwrap_service_preflight() {",
+        cleanupBody,
+        "}",
+        `bwrap_probe_unit=${JSON.stringify(unit)}`,
+        `bwrap_probe_unit_path=${JSON.stringify(unitPath)}`,
+        `bwrap_probe_dropin_dir=${JSON.stringify(dropinDirectory)}`,
+        `bwrap_probe_lifecycle_dropin=${JSON.stringify(lifecycleDropin)}`,
+        `bwrap_probe_security_dropin=${JSON.stringify(securityDropin)}`,
+        `bwrap_probe_driver=${JSON.stringify(driver)}`,
+        `bwrap_probe_nonce=${JSON.stringify(nonce)}`,
+        "bwrap_probe_loaded=true",
+        'FINAL_LOAD_STATE="$1"',
+        'STOP_STATUS="$2"',
+        'DAEMON_RELOAD_STATUS="$3"',
+        'SHOW_STATUS="$4"',
+        'CALL_LOG="$5"',
+        "systemctl() {",
+        "  printf '%s\\n' \"$*\" >>\"${CALL_LOG}\"",
+        '  case "$1" in',
+        '    stop) return "${STOP_STATUS}" ;;',
+        "    reset-failed) return 1 ;;",
+        '    daemon-reload) return "${DAEMON_RELOAD_STATUS}" ;;',
+        "    show)",
+        "      printf '%s\\n' \"${FINAL_LOAD_STATE}\"",
+        '      return "${SHOW_STATUS}"',
+        "      ;;",
+        "    *) return 97 ;;",
+        "  esac",
+        "}",
+        "cleanup_bwrap_service_preflight 0",
+      ].join("\n");
+      const verification = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          script,
+          "--",
+          finalLoadState,
+          String(stopStatus),
+          String(daemonReloadStatus),
+          String(showStatus),
+          callLog,
+        ],
+        { encoding: "utf8" },
+      );
+      const calls = readFileSync(callLog, "utf8").trim().split("\n");
+      const remaining = readdirSync(root).sort();
+      rmSync(root, { recursive: true, force: true });
+      return { verification, calls, remaining };
+    };
+
+    const expectedCalls = [
+      "stop ops-agent-bwrap-probe-test.service",
+      "reset-failed ops-agent-bwrap-probe-test.service",
+      "daemon-reload",
+      "show --no-pager --property=LoadState --value ops-agent-bwrap-probe-test.service",
+    ];
+    for (const stopStatus of [0, 1]) {
+      const unloaded = runCleanup("not-found", stopStatus);
+      expect(
+        unloaded.verification.status,
+        `${unloaded.verification.stdout}${unloaded.verification.stderr}`,
+      ).toBe(0);
+      expect(unloaded.calls).toEqual(expectedCalls);
+      expect(unloaded.remaining).toEqual(["calls.log"]);
+    }
+
+    const stillLoaded = runCleanup("loaded", 0);
+    expect(stillLoaded.verification.status).toBe(1);
+    expect(stillLoaded.verification.stderr).toContain(
+      "Could not completely remove the static bubblewrap preflight unit.",
+    );
+    expect(stillLoaded.calls).toEqual(expectedCalls);
+    expect(stillLoaded.remaining).toEqual(["calls.log"]);
+
+    const reloadFailed = runCleanup("not-found", 0, 1);
+    expect(reloadFailed.verification.status).toBe(1);
+    const showFailed = runCleanup("not-found", 0, 0, 1);
+    expect(showFailed.verification.status).toBe(1);
   });
 
   it("compares PID 1 list properties as exact unique sets", () => {

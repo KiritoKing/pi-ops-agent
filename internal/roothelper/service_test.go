@@ -606,13 +606,13 @@ func TestPVERecoveryStatusCrossBoundaryFixtures(t *testing.T) {
 			service := testService(t, now, &fakeExecutor{})
 			service.Store = store
 			service.Domain = DomainPVE
-			response := service.status(peercred.Credential{UID: service.AgentUID}, protocol.Request{
+			response, snapshot := service.status(peercred.Credential{UID: service.AgentUID}, protocol.Request{
 				Version: protocol.Version, RequestID: "status-cross-boundary-" + basis,
 				Method: protocol.MethodChangeStatus, ServerID: parent.ServerID, MachineID: parent.MachineID,
 				TargetID: parent.TargetID, PolicyRevision: parent.PolicyRevision,
 				CapabilityRevision: parent.CapabilityRevision, ChangeID: parent.ID,
 			})
-			if !response.OK || response.State != StateSuperseded {
+			if !response.OK || response.State != StateSuperseded || snapshot == nil || snapshot.State != response.State {
 				t.Fatalf("real Store transfer did not produce a status response: %#v", response)
 			}
 			payload, err := json.Marshal(response.Data)
@@ -713,7 +713,7 @@ func TestPrepareRejectsCallerSelectedCapabilityRevision(t *testing.T) {
 }
 
 func TestLongChangesDoNotBlockStatusOrUnrelatedChanges(t *testing.T) {
-	now := time.Date(2026, 8, 8, 2, 30, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	release := make(chan struct{})
 	executor := &concurrentExecutor{started: make(chan string, 2), release: release}
 	service := testService(t, now, executor)
@@ -736,17 +736,29 @@ func TestLongChangesDoNotBlockStatusOrUnrelatedChanges(t *testing.T) {
 			t.Fatal("an unrelated change was blocked behind a long-running change")
 		}
 	}
+	statusDeadline := time.Now().Add(250 * time.Millisecond)
+	statusContext, cancelStatus := context.WithDeadline(context.Background(), statusDeadline)
+	defer cancelStatus()
+	statusPayload := fmt.Sprintf(
+		`{"version":1,"requestId":"status-concurrent-first","deadline":%q,"method":"change.status","changeId":%q}`,
+		statusDeadline.Format(time.RFC3339Nano), first.ChangeID,
+	)
+	statusRequest, err := protocol.ParseRequest([]byte(statusPayload), now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	statusResult := make(chan protocol.Response, 1)
 	go func() {
-		statusResult <- service.Handle(context.Background(), peercred.Credential{UID: 1001}, parseRequest(t, now, "status-concurrent-first", fmt.Sprintf(`"method":"change.status","changeId":%q`, first.ChangeID)))
+		statusResult <- service.Handle(statusContext, peercred.Credential{UID: 1001}, statusRequest)
 	}()
 	select {
 	case status := <-statusResult:
 		if !status.OK || status.State != StateExecuting {
 			t.Fatalf("status did not observe an executing change: %#v", status)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("status was blocked behind a long-running change")
+	case <-statusContext.Done():
+		close(release)
+		t.Fatalf("status was blocked behind a long-running change past its request/context deadline: %v", statusContext.Err())
 	}
 	close(release)
 	for index := 0; index < 2; index++ {
