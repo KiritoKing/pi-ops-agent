@@ -7,6 +7,21 @@ interface ProcessIdentity {
   startTimeTicks: number;
 }
 
+const JAVASCRIPT_UTC_TIMESTAMP =
+  /^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})\.([0-9]{3})Z$/u;
+
+export function formatGuardianObservedAt(date: Date): string {
+  const timestamp = date.toISOString();
+  const match = JAVASCRIPT_UTC_TIMESTAMP.exec(timestamp);
+  if (match === null) throw new Error("guardian heartbeat timestamp is outside canonical UTC range");
+  const seconds = match[1];
+  const fraction = match[2]?.replace(/0+$/u, "");
+  if (seconds === undefined || fraction === undefined) {
+    throw new Error("guardian heartbeat timestamp has an invalid ISO representation");
+  }
+  return fraction.length === 0 ? `${seconds}Z` : `${seconds}.${fraction}Z`;
+}
+
 function parseStartTime(stat: string): number {
   const commandEnd = stat.lastIndexOf(")");
   if (commandEnd < 2 || stat[commandEnd + 1] !== " ") {
@@ -99,7 +114,7 @@ export class GuardianHeartbeat {
       cgroup: identity.cgroup,
       startTimeTicks: identity.startTimeTicks,
       sequence: this.#sequence,
-      observedAt: new Date().toISOString(),
+      observedAt: formatGuardianObservedAt(new Date()),
     };
     if (record.uid === 0) throw new Error("guardian heartbeat refuses a root agentd identity");
     const temporary = `${this.#path}.tmp-${process.pid}`;

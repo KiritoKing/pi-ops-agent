@@ -37,6 +37,38 @@ func TestParseHeartbeatAcceptsCanonicalRecord(t *testing.T) {
 	}
 }
 
+func TestParseHeartbeatAcceptsCanonicalTypeScriptProducerTimestamps(t *testing.T) {
+	tests := map[string]string{
+		"full milliseconds":      "2026-08-08T04:05:06.123Z",
+		"one trailing zero":      "2026-08-08T04:05:06.12Z",
+		"two trailing zeroes":    "2026-08-08T04:05:06.1Z",
+		"live leading zero case": "2026-08-08T04:05:06.07Z",
+		"zero fractional second": "2026-08-08T04:05:06Z",
+	}
+	for name, observedAt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseHeartbeat([]byte(validHeartbeatJSON(observedAt))); err != nil {
+				t.Fatalf("rejected canonical TypeScript producer timestamp %q: %v", observedAt, err)
+			}
+		})
+	}
+}
+
+func TestParseHeartbeatRejectsNoncanonicalFractionalAliases(t *testing.T) {
+	for _, observedAt := range []string{
+		"2026-08-08T04:05:06.120Z",
+		"2026-08-08T04:05:06.100Z",
+		"2026-08-08T04:05:06.070Z",
+		"2026-08-08T04:05:06.000Z",
+	} {
+		t.Run(observedAt, func(t *testing.T) {
+			if _, err := ParseHeartbeat([]byte(validHeartbeatJSON(observedAt))); err == nil {
+				t.Fatalf("accepted noncanonical timestamp alias %q", observedAt)
+			}
+		})
+	}
+}
+
 func TestParseHeartbeatRejectsMalformedRecords(t *testing.T) {
 	now := time.Date(2026, time.August, 8, 4, 5, 6, 0, time.UTC).Format(time.RFC3339Nano)
 	base := validHeartbeatJSON(now)
