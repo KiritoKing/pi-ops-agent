@@ -112,6 +112,9 @@ ID/digest，并把外部 Session ID 放入 UID+Adapter+digest namespace。descri
 `session.writerLease` 固定为 `gateway-global`：同一 gateway 进程内每个 canonical namespace 只有一个
 live writer，BotMux/其他 Adapter 即使猜中 TUI Session ID 也只能进入自己的 namespace。digest 更新
 故意产生新 namespace；gateway restart 会断开全部 live writer，而不是保留模糊 ownership。
+agentd backend restart 不重启 gateway，但 backend EOF 仍会关闭旧 compiled Client 并释放该
+namespace 的 writer 与 admission；Adapter 应在 agentd 恢复后以相同稳定 external Session ID 启动
+fresh Client，而不是继续向旧 FD 写入或绕过 gateway。backend 暂时缺失只返回有界 unavailable。
 
 本地 TUI 是当前唯一能 approve/reject/rollback 的入口。`localConsole=true` 还要求：
 

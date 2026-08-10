@@ -35,6 +35,12 @@ Release 中每个会由 installer 安装的 managed **service** 都同时带一�
 host 存在 `/run/systemd/system/service.d/*.conf`、distribution type-wide drop-in 或站点自定义
 unit override 时，把每个已安装 daemon 的最小 hardening 重新固定到 unit 自己的最终 drop-in。
 `ops-agent.target` 与 healthcheck timer 不是进程执行边界，不属于这组 service security drop-in。
+target/gateway 的生命周期拓扑仍是安装边界：installer 另以 PID 1 typed D-Bus 对
+`ops-agent.target.Wants` 做 closed-world exact 校验，并确认 gateway effective `Wants` 含有 exact
+agentd member、`PartOf` target、`After` agentd，且没有指向 agentd 的 `BindsTo`/`Requires`。
+gateway 的 `PrivateTmp` 等 hardening 可让 systemd 加入 `tmp.mount` 等隐式依赖，所以 gateway
+`Wants` 不能误作 singleton；其显式 unit 与 loaded drop-in 闭包仍逐字封闭。这样 target maintenance
+仍统一停机，而 guardian 触发的 agentd 自动重启不会把 gateway 留在 inactive/dead。
 
 安装模式决定唯一允许出现并必须验证的 service 集合：
 

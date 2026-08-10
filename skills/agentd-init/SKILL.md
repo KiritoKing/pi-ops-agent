@@ -141,6 +141,19 @@ healthcheck `SuccessExitStatus` and exact agentd credential drop-in, and reject 
 drop-in except a root-owned host-wide compatibility reset whose complete syntax is in the fixed
 narrow allowlist. Host-wide `service.d` drift or later unit overrides must fail the transaction;
 `cmp`, `systemctl cat`, and `systemd-analyze verify` alone are not sufficient.
+Also verify the controller lifecycle topology from typed PID 1 data: `ops-agent.target.Wants` is the
+exact release set containing both agentd and the client gateway; the gateway effective `Wants`
+contains the exact `ops-agentd.service` member, has exact `PartOf=ops-agent.target`, is ordered after
+agentd, and has neither a `BindsTo` nor `Requires` edge to agentd. Do not require gateway `Wants` to
+be a singleton because `PrivateTmp` may add `tmp.mount`; exact release files plus the closed loaded
+drop-in set prove the explicit edge. During a guardian fault test, backend EOF must make the old
+Client exit and release both canonical writer and total/per-UID admission while the gateway stays
+active and a fresh Client with the same external Session ID can connect after agentd returns. A
+missing backend at gateway startup may only produce bounded per-connection unavailable responses;
+each production dial must revalidate owner-only mode and unchanged device/inode identity.
+On a fresh Bookworm start, wait for backend readiness and require gateway `NRestarts=0`; an early
+ENOENT followed by a two-second gateway retry means the obsolete startup pathname gate is still in
+the deployed bytes and does not count as a clean start.
 For the v254-added `ImportCredential` property only, a pre-v254 PID 1 may map a missing property to
 the canonical empty vector after three independent proofs: a strict scalar typed `Manager.Version`
 with major below 254, one structured Service interface whose four existing credential-property

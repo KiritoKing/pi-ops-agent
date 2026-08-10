@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -230,6 +232,324 @@ func TestGatewayRejectsConcurrentWriterForSameGlobalSession(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first writer did not release")
 	}
+}
+
+func TestGatewayBackendEOFReleasesWriterAndAdmissionForFreshSameSession(t *testing.T) {
+	backendQueue := make(chan net.Conn, 2)
+	var backendDials atomic.Int32
+	server := &Server{
+		Authorizer: testAuthorizer(),
+		DialBackend: func(ctx context.Context) (net.Conn, error) {
+			select {
+			case connection := <-backendQueue:
+				backendDials.Add(1)
+				return connection, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		HandshakeTimeout: time.Second,
+		WriteTimeout:     time.Second,
+	}
+	request := helloPayload("restart-session-1234", "adapter.tui", tuiDigest)
+	canonical, err := CanonicalSessionID(
+		1000,
+		PeerIdentity{APIVersion: PeerAPIVersion, AdapterID: "adapter.tui", Digest: tuiDigest},
+		"restart-session-1234",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertReleased := func() {
+		t.Helper()
+		server.writers.mu.Lock()
+		activeWriters := len(server.writers.active)
+		server.writers.mu.Unlock()
+		server.clients.mu.Lock()
+		activeConnections := server.clients.total
+		activeUIDs := len(server.clients.byUID)
+		server.clients.mu.Unlock()
+		if activeWriters != 0 || activeConnections != 0 || activeUIDs != 0 {
+			t.Fatalf(
+				"gateway retained restart state: writers=%d connections=%d uids=%d",
+				activeWriters,
+				activeConnections,
+				activeUIDs,
+			)
+		}
+	}
+
+	runConnection := func(label string) {
+		t.Helper()
+		client, gatewaySide := net.Pipe()
+		gatewayBackend, agentdBackend := net.Pipe()
+		backendQueue <- gatewayBackend
+		releaseAdmission, admitted := server.clients.acquire(1000)
+		if !admitted {
+			t.Fatalf("%s connection was not admitted", label)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer gatewaySide.Close()
+			defer releaseAdmission()
+			server.ServeConnection(context.Background(), gatewaySide, peercred.Credential{UID: 1000})
+		}()
+		if err := protocol.WriteFrame(client, request); err != nil {
+			t.Fatal(err)
+		}
+		backendHello := readObject(t, agentdBackend)
+		if backendHello["sessionId"] != canonical {
+			t.Fatalf("%s backend sessionId=%v want=%s", label, backendHello["sessionId"], canonical)
+		}
+
+		// Model an agentd process exit: its accepted backend fd disappears while
+		// the public client is still live. The persistent gateway must close the
+		// old client and release both in-memory accounting layers.
+		if err := agentdBackend.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s gateway connection did not exit after backend EOF", label)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		buffer := make([]byte, 1)
+		if count, readErr := client.Read(buffer); count != 0 || readErr == nil {
+			t.Fatalf("%s old client remained live after backend EOF: n=%d err=%v", label, count, readErr)
+		}
+		_ = client.Close()
+		assertReleased()
+	}
+
+	runConnection("original")
+	runConnection("fresh")
+	if backendDials.Load() != 2 {
+		t.Fatalf("fresh same-session connection did not reach the restarted backend: dials=%d", backendDials.Load())
+	}
+}
+
+func TestDefaultBackendDialRequiresStableOwnerOnlySocket(t *testing.T) {
+	shortTempDir := func(t *testing.T) string {
+		t.Helper()
+		directory, err := os.MkdirTemp("/tmp", "agentd-gateway-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(directory) })
+		return directory
+	}
+	listen := func(t *testing.T, path string, mode os.FileMode) *net.UnixListener {
+		t.Helper()
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			_ = listener.Close()
+			t.Fatal(err)
+		}
+		return listener
+	}
+
+	t.Run("missing", func(t *testing.T) {
+		server := &Server{BackendPath: filepath.Join(shortTempDir(t), "missing.sock")}
+		if connection, err := server.dialBackend(context.Background()); err == nil {
+			_ = connection.Close()
+			t.Fatal("missing backend socket was dialed")
+		}
+	})
+
+	t.Run("unsafe mode", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "backend.sock")
+		listener := listen(t, path, 0o660)
+		defer listener.Close()
+		server := &Server{BackendPath: path}
+		if connection, err := server.dialBackend(context.Background()); err == nil {
+			_ = connection.Close()
+			t.Fatal("group-writable backend socket was dialed")
+		}
+	})
+
+	t.Run("stable owner-only socket", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "backend.sock")
+		listener := listen(t, path, 0o600)
+		defer listener.Close()
+		accepted := make(chan net.Conn, 1)
+		acceptErrors := make(chan error, 1)
+		go func() {
+			connection, err := listener.AcceptUnix()
+			if err != nil {
+				acceptErrors <- err
+				return
+			}
+			accepted <- connection
+		}()
+		server := &Server{BackendPath: path}
+		connection, err := server.dialBackend(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = connection.Close()
+		select {
+		case peer := <-accepted:
+			_ = peer.Close()
+		case err := <-acceptErrors:
+			t.Fatal(err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("validated backend dial was not accepted")
+		}
+	})
+
+	t.Run("pathname replacement during dial", func(t *testing.T) {
+		path := filepath.Join(shortTempDir(t), "backend.sock")
+		original := listen(t, path, 0o600)
+		defer original.Close()
+		var replacement *net.UnixListener
+		dialer := net.Dialer{Timeout: time.Second}
+		connection, err := dialValidatedBackend(
+			context.Background(),
+			path,
+			func(ctx context.Context, socketPath string) (net.Conn, error) {
+				if err := os.Remove(socketPath); err != nil {
+					return nil, err
+				}
+				replacement = listen(t, socketPath, 0o600)
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		)
+		if connection != nil {
+			_ = connection.Close()
+			t.Fatal("dial returned a connection after backend pathname replacement")
+		}
+		if err == nil || !strings.Contains(err.Error(), "changed during dial") {
+			t.Fatalf("backend pathname replacement was not rejected: %v", err)
+		}
+		if replacement == nil {
+			t.Fatal("replacement listener was not created")
+		}
+		_ = replacement.SetDeadline(time.Now().Add(time.Second))
+		peer, acceptErr := replacement.AcceptUnix()
+		if acceptErr != nil {
+			t.Fatal(acceptErr)
+		}
+		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+		buffer := make([]byte, 1)
+		if count, readErr := peer.Read(buffer); count != 0 || readErr == nil {
+			t.Fatalf("rejected replacement connection remained open: n=%d err=%v", count, readErr)
+		}
+		_ = peer.Close()
+		_ = replacement.Close()
+	})
+}
+
+func TestGatewayMissingBackendReleasesStateAndAllowsFreshSameSession(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "agentd-gateway-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	path := filepath.Join(directory, "backend.sock")
+	server := &Server{
+		BackendPath:      path,
+		Authorizer:       testAuthorizer(),
+		HandshakeTimeout: time.Second,
+		WriteTimeout:     time.Second,
+	}
+	request := helloPayload("missing-backend-session-1234", "adapter.tui", tuiDigest)
+
+	run := func(label string, backendExpected bool) (net.Conn, <-chan struct{}) {
+		t.Helper()
+		client, gatewaySide := net.Pipe()
+		releaseAdmission, admitted := server.clients.acquire(1000)
+		if !admitted {
+			t.Fatalf("%s connection was not admitted", label)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer gatewaySide.Close()
+			defer releaseAdmission()
+			server.ServeConnection(context.Background(), gatewaySide, peercred.Credential{UID: 1000})
+		}()
+		if err := protocol.WriteFrame(client, request); err != nil {
+			t.Fatal(err)
+		}
+		if !backendExpected {
+			response := readObject(t, client)
+			if response["type"] != "error" || response["message"] != "agentd backend is unavailable" {
+				t.Fatalf("unexpected missing-backend response: %#v", response)
+			}
+		}
+		return client, done
+	}
+
+	missingClient, missingDone := run("missing", false)
+	select {
+	case <-missingDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("missing backend kept the gateway handler alive")
+	}
+	_ = missingClient.Close()
+	server.writers.mu.Lock()
+	missingWriters := len(server.writers.active)
+	server.writers.mu.Unlock()
+	server.clients.mu.Lock()
+	missingConnections := server.clients.total
+	missingUIDs := len(server.clients.byUID)
+	server.clients.mu.Unlock()
+	if missingWriters != 0 || missingConnections != 0 || missingUIDs != 0 {
+		t.Fatalf(
+			"missing backend leaked state: writers=%d connections=%d uids=%d",
+			missingWriters,
+			missingConnections,
+			missingUIDs,
+		)
+	}
+
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	}()
+	freshClient, freshDone := run("fresh", true)
+	var backend net.Conn
+	select {
+	case backend = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fresh same-session connection did not reach the restored backend")
+	}
+	backendHello := readObject(t, backend)
+	canonical, err := CanonicalSessionID(
+		1000,
+		PeerIdentity{APIVersion: PeerAPIVersion, AdapterID: "adapter.tui", Digest: tuiDigest},
+		"missing-backend-session-1234",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backendHello["sessionId"] != canonical {
+		t.Fatalf("fresh backend sessionId=%v want=%s", backendHello["sessionId"], canonical)
+	}
+	_ = backend.Close()
+	select {
+	case <-freshDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fresh restored-backend handler did not exit")
+	}
+	_ = freshClient.Close()
 }
 
 func TestConnectionAdmissionBoundsConcurrentTotalAndPerUIDState(t *testing.T) {

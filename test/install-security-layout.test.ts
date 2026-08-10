@@ -658,6 +658,67 @@ describe("installed client-plane isolation", () => {
     expect(operationsDocs).toMatch(/不能\s+作为新版 Client 的 runtime fallback/u);
   });
 
+  it("keeps the client gateway available across an automatic agentd restart", () => {
+    const gatewayUnit = repositoryFile("systemd/agentd-client-gateway.service");
+    const targetUnit = repositoryFile("systemd/ops-agent.target");
+    const installer = repositoryFile("scripts/install-release.sh");
+    const gatewaySource = repositoryFile("internal/clientgateway/gateway.go");
+
+    expect(gatewayUnit).toContain("PartOf=ops-agent.target");
+    expect(gatewayUnit).toContain("Wants=ops-agentd.service");
+    expect(gatewayUnit).toContain("After=ops-agentd.service");
+    expect(gatewayUnit).not.toContain("BindsTo=ops-agentd.service");
+    expect(gatewayUnit).not.toContain("Requires=ops-agentd.service");
+    expect(targetUnit).toMatch(
+      /^Wants=.*\bops-agentd\.service\b.*\bagentd-client-gateway\.service\b/mu,
+    );
+
+    expect(installer).toContain("verify_effective_controller_restart_topology() {");
+    expect(installer).toContain('value?.type !== "as"');
+    expect(installer).toContain("value.data.includes(expectedMember)");
+    expect(installer).toContain("PrivateTmp may add portable mount dependencies");
+    expect(installer).toContain(
+      '"${target_unit}" "${target_object}" Wants "${target_wants}"',
+    );
+    expect(installer).toContain(
+      '"${gateway_unit}" "${gateway_object}" Wants ops-agentd.service true',
+    );
+    expect(installer).toContain(
+      '"${gateway_unit}" "${gateway_object}" PartOf ops-agent.target',
+    );
+    expect(installer).toContain(
+      '"${gateway_unit}" "${gateway_object}" BindsTo \'\'',
+    );
+    expect(installer).toContain(
+      '"${gateway_unit}" "${gateway_object}" Requires ops-agentd.service false',
+    );
+    expect(installer).toContain(
+      '"${gateway_unit}" "${gateway_object}" After ops-agentd.service true',
+    );
+    const effectiveLoop = installer.indexOf(
+      'for effective_unit in "${effective_units[@]}"; do',
+    );
+    const topologyGate = installer.indexOf(
+      "  verify_effective_controller_restart_topology",
+      effectiveLoop,
+    );
+    expect(effectiveLoop).toBeGreaterThan(0);
+    expect(topologyGate).toBeGreaterThan(effectiveLoop);
+
+    const listenStart = gatewaySource.indexOf("func (s *Server) ListenAndServe");
+    const dialStart = gatewaySource.indexOf("func (s *Server) dialBackend", listenStart);
+    const proxyStart = gatewaySource.indexOf("func proxyBackendFrames", dialStart);
+    expect(listenStart).toBeGreaterThan(0);
+    expect(dialStart).toBeGreaterThan(listenStart);
+    expect(gatewaySource.slice(listenStart, dialStart)).not.toContain(
+      "inspectBackendSocket",
+    );
+    expect(gatewaySource.slice(dialStart, proxyStart)).toContain(
+      "dialValidatedBackend",
+    );
+    expect(gatewaySource).toContain("after != before");
+  });
+
   it("assigns the client socket and immutable plugin registry to the client group", () => {
     const tmpfiles = repositoryFile("systemd/ops-agent.tmpfiles.conf");
     const agentUnit = repositoryFile("systemd/ops-agentd.service");

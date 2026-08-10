@@ -2,7 +2,7 @@
 Description=Pi Ops Agent peer-authenticated local client gateway
 Documentation=file:/opt/pi-ops-agent/current/docs/security-model.md
 PartOf=ops-agent.target
-BindsTo=ops-agentd.service
+Wants=ops-agentd.service
 After=ops-agentd.service
 StartLimitIntervalSec=60s
 StartLimitBurst=10

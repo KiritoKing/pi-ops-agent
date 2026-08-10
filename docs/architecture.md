@@ -334,6 +334,15 @@ External conversation -> Adapter mapping -> AgentSession
 当前 gateway 已在同一进程内为每个 canonical namespace 维护 process-global live-writer lease，
 因此多个 Client connection 不能同时写入同一 namespace。该 lease 不跨 gateway restart、多个 gateway
 实例或 Adapter handoff 持久化；这些场景会断开现有 writer，跨平台 handoff 仍是待实现能力。
+systemd 让 gateway `PartOf=ops-agent.target`，但对 agentd 只使用 `Wants=` + `After=`：启动 gateway
+会同时拉起并等待 agentd，停止整个 target 仍会停止两者；guardian 终止卡死 agentd 并由 systemd
+自动重启时，gateway 本身不会被 stop-propagating dependency 一并停掉。旧 backend fd 的 EOF 会让
+对应 Client 断开并释放 writer/admission 状态，backend socket 恢复后同一外部 Session 可由 fresh
+Client 重新连接。gateway 启动不以 backend pathname 已出现为前提，避免与 `Type=simple` agentd
+建 socket 的短暂竞态；每个真实 backend dial 都重新验证 pathname 为本 UID owner-only `0600`
+socket，并比较 dial 前后的 device/inode identity，变化则关闭新 fd 并拒绝。这里不能使用
+`BindsTo=ops-agentd.service`：依赖触发的 clean gateway stop 不会被 gateway 的 `Restart=always` 在
+agentd 自动恢复后反向拉起。
 
 ## 一次模型 turn
 

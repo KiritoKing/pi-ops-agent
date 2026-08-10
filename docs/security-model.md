@@ -604,6 +604,15 @@ unit 另设 `TasksMax=128`、`LimitNOFILE=512`、`MemoryMax=256M`，作为已授
 直接连接 owner-only backend；同一专用 Adapter UID 内的进程也属于同一 OS principal。digest 更新
 会产生新 Session namespace，不自动延续旧上下文。gateway 重启会关闭连接并清空内存 writer map，
 不会在存活连接之外保留 writer claim。
+agentd backend 重启与 gateway 重启是两个不同事件：gateway 跨前者保持 active，但 backend EOF
+必须关闭对应的旧 Client connection，并在 fresh connection 到达前释放 canonical writer lease 和
+process-total/per-UID admission。backend pathname 尚不存在只会让当前连接得到有界 unavailable，
+不会让持有公开 socket 的 gateway 退出；每次 production dial 都重新验证 backend owner/mode，并以
+dial 前后 device/inode 相等拒绝 pathname replacement。installer 通过 PID 1 typed D-Bus 确认
+gateway 对 agentd 有 `Wants`/`After` 启动关系、没有 `BindsTo` 或 `Requires` stop propagation，
+同时精确验证 `ops-agent.target.Wants` 仍包含受管 controller 集合。gateway 的 effective `Wants`
+还可能因 `PrivateTmp` 出现 `tmp.mount` 等 systemd 隐式项，因此 agentd 关系使用 typed exact-member
+验证；显式 unit 与完整 drop-in 闭包仍必须逐字匹配 Release。
 
 `adapter.tui` 的固定 launcher 只读取获批 CAS 中的声明式 profile 并运行 compiled Client；
 `adapter.botmux` 则执行获批 CAS snapshot 中的真实源码。对于可执行 Adapter，runner 将 Source

@@ -2553,6 +2553,60 @@ installed_unit_bus_property() {
     "${object_path}" "${interface}" "${property}"
 }
 
+require_installed_unit_bus_string_set() {
+  local unit="$1"
+  local object_path="$2"
+  local property="$3"
+  local expected="$4"
+  local payload
+  payload="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Unit "${property}")" || return 1
+  "${release_dir}/runtime/node" -e '
+    const [text, expectedText, unit, property] = process.argv.slice(1);
+    const value = JSON.parse(text);
+    if (value?.type !== "as" || !Array.isArray(value.data)
+        || value.data.some((entry) => typeof entry !== "string" || entry.length === 0)
+        || new Set(value.data).size !== value.data.length) {
+      throw new Error(`PID 1 returned invalid ${property} data for ${unit}`);
+    }
+    const expected = expectedText === "" ? [] : expectedText.trim().split(/[\t\n\r ]+/u);
+    if (new Set(expected).size !== expected.length) {
+      throw new Error(`release policy contains duplicate ${property} data for ${unit}`);
+    }
+    const canonical = (entries) => [...entries].sort();
+    if (JSON.stringify(canonical(value.data)) !== JSON.stringify(canonical(expected))) {
+      throw new Error(`unsafe effective ${property} set for ${unit}`);
+    }
+  ' "${payload}" "${expected}" "${unit}" "${property}"
+}
+
+require_installed_unit_bus_string_member() {
+  local unit="$1"
+  local object_path="$2"
+  local property="$3"
+  local expected_member="$4"
+  local expected_present="$5"
+  local payload
+  payload="$(installed_unit_bus_property "${object_path}" \
+    org.freedesktop.systemd1.Unit "${property}")" || return 1
+  "${release_dir}/runtime/node" -e '
+    const [text, expectedMember, expectedPresentText, unit, property] = process.argv.slice(1);
+    const value = JSON.parse(text);
+    if (value?.type !== "as" || !Array.isArray(value.data)
+        || value.data.some((entry) => typeof entry !== "string" || entry.length === 0)
+        || new Set(value.data).size !== value.data.length) {
+      throw new Error(`PID 1 returned invalid ${property} data for ${unit}`);
+    }
+    if (expectedPresentText !== "true" && expectedPresentText !== "false") {
+      throw new Error("invalid expected membership mode");
+    }
+    const present = value.data.includes(expectedMember);
+    if (present !== (expectedPresentText === "true")) {
+      throw new Error(`unsafe effective ${property} membership for ${unit}`);
+    }
+  ' "${payload}" "${expected_member}" "${expected_present}" "${unit}" "${property}"
+}
+
 installed_systemd_major_version() {
   local payload
   payload="$(busctl --json=short get-property org.freedesktop.systemd1 \
@@ -3233,6 +3287,49 @@ verify_effective_security_dropin() {
     "${unit}" "${UNIT_ROOT}/${unit}" "${dropin}" "${credential_dropin}"
 }
 
+verify_effective_controller_restart_topology() {
+  local gateway_unit=agentd-client-gateway.service
+  local target_unit=ops-agent.target
+  local target_path="${UNIT_ROOT}/${target_unit}"
+  local target_source="${release_dir}/systemd/${target_unit}"
+  local gateway_object target_object target_wants
+
+  [[ -f "${target_path}" && ! -L "${target_path}" ]] \
+    && [[ "$(stat -c '%U:%G:%a:%h' "${target_path}")" == root:root:644:1 ]] \
+    && cmp -s "${target_source}" "${target_path}" || {
+      printf 'Installed target is not the exact root-owned release file: %s.\n' \
+        "${target_unit}" >&2
+      return 1
+    }
+  require_installed_unit_property "${target_unit}" LoadState loaded
+  require_installed_unit_property "${target_unit}" FragmentPath "${target_path}"
+
+  gateway_object="$(installed_unit_bus_path "${gateway_unit}")" || return 1
+  target_object="$(installed_unit_bus_path "${target_unit}")" || return 1
+  target_wants="$(unit_file_single_value "${target_path}" Wants '')" || return 1
+
+  # The target still owns both daemons, while the gateway only pulls agentd
+  # into a start transaction. A stop-propagating BindsTo/Requires edge would
+  # turn guardian recovery into a clean gateway stop that Restart=always does
+  # not reverse after agentd's automatic restart.
+  require_installed_unit_bus_string_set \
+    "${target_unit}" "${target_object}" Wants "${target_wants}"
+  # Service sandboxing such as PrivateTmp may add portable mount dependencies
+  # (for example tmp.mount) to effective Wants. The exact release unit and
+  # closed drop-in set above prove the explicit source edge; typed PID 1 data
+  # must still contain that exact agentd member.
+  require_installed_unit_bus_string_member \
+    "${gateway_unit}" "${gateway_object}" Wants ops-agentd.service true
+  require_installed_unit_bus_string_set \
+    "${gateway_unit}" "${gateway_object}" PartOf ops-agent.target
+  require_installed_unit_bus_string_set \
+    "${gateway_unit}" "${gateway_object}" BindsTo ''
+  require_installed_unit_bus_string_member \
+    "${gateway_unit}" "${gateway_object}" Requires ops-agentd.service false
+  require_installed_unit_bus_string_member \
+    "${gateway_unit}" "${gateway_object}" After ops-agentd.service true
+}
+
 for unit in "${release_dir}"/systemd/*.service "${release_dir}"/systemd/*.timer "${release_dir}"/systemd/*.target; do
   [[ -f "${unit}" ]] || continue
   unit_name="$(basename "${unit}")"
@@ -3404,6 +3501,9 @@ fi
 for effective_unit in "${effective_units[@]}"; do
   verify_effective_security_dropin "${effective_unit}"
 done
+if [[ "${MODE}" == init ]]; then
+  verify_effective_controller_restart_topology
+fi
 
 stage_bundled_source_plugin() {
   local source_name="$1"

@@ -221,6 +221,9 @@ func (leases *writerLeases) acquire(sessionID string) (func(), bool) {
 	}, true
 }
 
+// BackendDialer is a test seam for in-memory transports. Production leaves it
+// nil so every connection validates the managed backend socket pathname and
+// its stable filesystem identity around the Unix dial.
 type BackendDialer func(context.Context) (net.Conn, error)
 
 type Server struct {
@@ -250,9 +253,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	if err := validateSocketDirectory(filepath.Dir(s.PublicPath), s.SocketGID); err != nil {
-		return err
-	}
-	if err := validateBackendSocket(s.BackendPath); err != nil {
 		return err
 	}
 	if err := removeStaleSocket(s.PublicPath); err != nil {
@@ -386,7 +386,36 @@ func (s *Server) dialBackend(ctx context.Context) (net.Conn, error) {
 		return s.DialBackend(ctx)
 	}
 	dialer := net.Dialer{Timeout: s.handshakeTimeout()}
-	return dialer.DialContext(ctx, "unix", s.BackendPath)
+	return dialValidatedBackend(ctx, s.BackendPath, func(ctx context.Context, path string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "unix", path)
+	})
+}
+
+type backendSocketIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+type unixPathDialer func(context.Context, string) (net.Conn, error)
+
+func dialValidatedBackend(ctx context.Context, path string, dial unixPathDialer) (net.Conn, error) {
+	before, err := inspectBackendSocket(path)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := dial(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	after, err := inspectBackendSocket(path)
+	if err != nil || after != before {
+		_ = connection.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("agentd backend socket changed during dial")
+	}
+	return connection, nil
 }
 
 func proxyBackendFrames(backend, client net.Conn, canonicalSessionID, externalSessionID string) error {
@@ -508,17 +537,17 @@ func validateSocketDirectory(path string, socketGID int) error {
 	return nil
 }
 
-func validateBackendSocket(path string) error {
+func inspectBackendSocket(path string) (backendSocketIdentity, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return err
+		return backendSocketIdentity{}, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int(stat.Uid) != os.Geteuid() || info.Mode()&os.ModeSocket == 0 ||
 		info.Mode().Perm() != 0o600 {
-		return errors.New("agentd backend socket must be owner-only and owned by the gateway UID")
+		return backendSocketIdentity{}, errors.New("agentd backend socket must be owner-only and owned by the gateway UID")
 	}
-	return nil
+	return backendSocketIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino)}, nil
 }
 
 func validatePublicSocket(path string, socketGID int) error {

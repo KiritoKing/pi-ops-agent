@@ -97,6 +97,17 @@ sudo systemctl start ops-agent.target
 
 不要仅 kill agentd：guardian 与 systemd restart policy 可能将其拉起。
 
+Guardian 正常恢复卡死 agentd 时，应看到 guardian PID 保持不变、`ops-agentd.service` 的
+`NRestarts` 增加一次，而 `agentd-client-gateway.service` 始终 active（通常 PID 也不变）。旧 TUI
+因 backend EOF 自动退出，writer 与 total/per-UID admission 随连接释放；backend socket 恢复后用
+fresh TUI 重新连接。同一次事件后 gateway 若为 `inactive/dead`，是 systemd dependency topology
+漂移或旧 Release 的 `BindsTo` 行为，不能只凭 agentd 已恢复就判定健康；应用匹配 Release 的 installer
+重新验证 effective topology，再运行 healthcheck。gateway 自身可先于 backend pathname ready 并持有
+公开 socket，当前连接只会得到有界 unavailable；这不替代 healthcheck 对 owner-only backend socket
+的检查。每个 production dial 还会重验 backend owner/mode 与 dial 前后 device/inode identity。
+fresh controller 启动并达到 backend ready 后，gateway `NRestarts` 应为 `0`；若 journal 先出现
+backend pathname `ENOENT`、两秒后 gateway 自重启，说明仍在运行旧的 startup pathname gate。
+
 ## 审批操作
 
 Agent prepare 后会输出 opaque `changeRef`。本地 TUI 使用：

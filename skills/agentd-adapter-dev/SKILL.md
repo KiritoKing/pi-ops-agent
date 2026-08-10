@@ -152,6 +152,11 @@ Core transport invariant: every descriptor must declare `session.writerLease: "g
 The fixed `agentd-client-gateway` derives its backend Session namespace from kernel-observed UID,
 exact active Adapter ID/digest, and external Session ID, and rejects a second live writer. Adapter
 source cannot choose or bypass that namespace merely by guessing another Adapter's Session ID.
+The gateway stays active across an agentd backend restart, but EOF closes the old compiled Client
+and releases its writer/admission state. Treat that Client process exit as the reconnect boundary:
+the outer Adapter may start a fresh compiled Client with the same stable external Session ID after
+agentd returns; Source must not keep feeding or revive the disconnected Client. A temporarily
+missing backend yields a bounded unavailable response, not permission to bypass the gateway.
 
 ## Preserve the behavioral boundaries
 
