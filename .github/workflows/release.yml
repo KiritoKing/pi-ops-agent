@@ -64,7 +64,9 @@ jobs:
               exit 1
               ;;
           esac
+          lock_document_version="$(node -p 'require("./package-lock.json").version')"
           lock_version="$(node -p 'require("./package-lock.json").packages[""].version')"
+          test "${release_version}" = "${lock_document_version}"
           test "${release_version}" = "${lock_version}"
           NODE_VERSION="${NODE_VERSION}" node <<'NODE'
           const packageDocument = require("./package.json");
@@ -86,7 +88,8 @@ jobs:
           test "${release_version}" = "${client_version}"
           for manifest in plugins/*/manifest.json; do
             plugin_version="$(node -p 'require("./'"${manifest}"'").version')"
-            test "${release_version}" = "${plugin_version}"
+            (( ${#plugin_version} <= 96 ))
+            [[ "${plugin_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
           done
           {
             printf 'release_version=%s\n' "${release_version}"
@@ -417,8 +420,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packaging/build-botmux-plugin.sh "${RELEASE_VERSION}" candidate
-          packaging/build-hermes-workload-plugin.sh "${RELEASE_VERSION}" candidate
+          botmux_plugin_version="$(node -p \
+            'require("./plugins/adapter-botmux/manifest.json").version')"
+          hermes_plugin_version="$(node -p \
+            'require("./plugins/workload-hermes/manifest.json").version')"
+          packaging/build-botmux-plugin.sh "${botmux_plugin_version}" candidate
+          packaging/build-hermes-workload-plugin.sh "${hermes_plugin_version}" candidate
       - name: Generate release candidate manifest and checksums
         shell: bash
         run: |

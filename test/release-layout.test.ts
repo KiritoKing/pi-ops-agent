@@ -63,6 +63,60 @@ function expectAuditableActionPins(workflow: string): void {
 }
 
 describe("native release layout", () => {
+  it("separates the 0.3.1 product release from unchanged digest-bound plugin versions", () => {
+    const packageDocument = JSON.parse(repositoryFile("package.json")) as { version?: unknown };
+    const lockDocument = JSON.parse(repositoryFile("package-lock.json")) as {
+      version?: unknown;
+      packages?: { ""?: { version?: unknown } };
+    };
+    expect(packageDocument.version).toBe("0.3.1");
+    expect(lockDocument.version).toBe("0.3.1");
+    expect(lockDocument.packages?.[""]?.version).toBe("0.3.1");
+    expect(repositoryFile("src/client/index.ts")).toContain('const VERSION = "0.3.1";');
+    expect(repositoryFile(".github/workflows/ci.yml")).toContain("RELEASE_VERSION: 0.3.1");
+
+    for (const manifestPath of [
+      "plugins/adapter-botmux-source/manifest.json",
+      "plugins/adapter-botmux/manifest.json",
+      "plugins/adapter-tui/manifest.json",
+      "plugins/workload-base/manifest.json",
+      "plugins/workload-botmux-ops/manifest.json",
+      "plugins/workload-example/manifest.json",
+      "plugins/workload-hermes-ops/manifest.json",
+      "plugins/workload-hermes/manifest.json",
+      "plugins/workload-pve/manifest.json",
+    ]) {
+      const manifest = JSON.parse(repositoryFile(manifestPath)) as { version?: unknown };
+      expect(manifest.version, manifestPath).toBe("0.3.0");
+    }
+
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    for (const releaseGuard of [packager, verifier]) {
+      expect(releaseGuard).toContain("pluginVersionPattern");
+      expect(releaseGuard).toContain("manifest.version.length > 96");
+      expect(releaseGuard).not.toContain("manifest.version !== expectedVersion");
+    }
+    expect(workflow).toContain("(( ${#plugin_version} <= 96 ))");
+    expect(workflow).not.toContain('test "${release_version}" = "${plugin_version}"');
+
+    const botmuxBuilder = repositoryFile("packaging/build-botmux-plugin.sh");
+    const hermesBuilder = repositoryFile("packaging/build-hermes-workload-plugin.sh");
+    expect(botmuxBuilder).toContain('[[ "${manifest_version}" != "${VERSION}" ]]');
+    expect(hermesBuilder).toContain('[[ "${manifest_version}" != "${VERSION}" ]]');
+    for (const caller of [packager, workflow]) {
+      expect(caller).toContain("botmux_plugin_version");
+      expect(caller).toContain("hermes_plugin_version");
+    }
+
+    const manifestBuilder = repositoryFile("packaging/create-release-manifest.sh");
+    expect(manifestBuilder).toContain('adapter-botmux_${botmux_plugin_version}.opspkg');
+    expect(manifestBuilder).toContain('workload-hermes_${hermes_plugin_version}.opspkg');
+    expect(manifestBuilder).not.toContain('adapter-botmux_${version}.opspkg');
+    expect(manifestBuilder).not.toContain('workload-hermes_${version}.opspkg');
+  });
+
   it("builds only the current static Go command set", () => {
     const workflow = repositoryFile(".github/workflows/release.yml");
     const packager = repositoryFile("packaging/build-release.sh");
@@ -927,8 +981,8 @@ describe("native release layout", () => {
       'ops-agent-all_${version}_arm64.deb',
       "ops-agent-linux-amd64.spdx.json",
       "ops-agent-linux-arm64.spdx.json",
-      'adapter-botmux_${version}.opspkg',
-      'workload-hermes_${version}.opspkg',
+      'adapter-botmux_${botmux_plugin_version}.opspkg',
+      'workload-hermes_${hermes_plugin_version}.opspkg',
     ]) {
       expect(manifestBuilder).toContain(required);
     }

@@ -527,7 +527,8 @@ snapshot 校验失败都直接中止；legacy `.opspkg` 只保留 artifact/chang
 配置、credential、Session、plugin source/snapshot、change、backup 和 audit 位于 `/etc`、
 `/var/lib`、`/var/log`，不随 `current` 切换。升级前：
 
-1. 验证 tag/checksum/attestation 与 package/client/plugin manifest 版本一致；
+1. 验证 tag/checksum/attestation 与 package/lockfile/client 的产品版本一致；分别核对每个 Plugin
+   manifest 的独立版本、源码 digest 与现有 grant，不要求 Plugin 版本等于产品 Release；
 2. 备份 current link、`targets.json`、server registry、endpoint 的 `endpoint-enrollment.json` 和
    plugin registrations；
 3. 检查 TS/Go protocol、capability revision、persisted change 和 config schema 兼容；

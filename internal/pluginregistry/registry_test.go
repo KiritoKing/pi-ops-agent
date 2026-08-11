@@ -548,12 +548,19 @@ func TestRepositorySourcePluginManifests(t *testing.T) {
 	repositoryRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..")
 	registry := testRegistry(t)
 	for _, test := range []struct {
-		path string
-		id   string
-		kind Kind
+		path           string
+		id             string
+		kind           Kind
+		expectedDigest string
 	}{
-		{path: "adapter-tui", id: "adapter.tui", kind: KindAdapter},
-		{path: "workload-base", id: "workload.base", kind: KindWorkload},
+		{
+			path: "adapter-tui", id: "adapter.tui", kind: KindAdapter,
+			expectedDigest: "sha256:230fbaad8b45fda68ea715ecd16db9be419258a5fde4408d21a8bd46767da32a",
+		},
+		{
+			path: "workload-base", id: "workload.base", kind: KindWorkload,
+			expectedDigest: "sha256:534be6a85ffd44457e3c6c941b25c40ae241492626d28f5fd1c04d7dad5211e2",
+		},
 		{path: "workload-example", id: "workload.example", kind: KindWorkload},
 		{path: "workload-hermes-ops", id: "workload.hermes-ops", kind: KindWorkload},
 		{path: "workload-botmux-ops", id: "workload.botmux-ops", kind: KindWorkload},
@@ -565,6 +572,9 @@ func TestRepositorySourcePluginManifests(t *testing.T) {
 		}
 		if inspection.Manifest.ID != test.id || inspection.Manifest.Kind != test.kind {
 			t.Fatalf("unexpected repository plugin manifest: %#v", inspection.Manifest)
+		}
+		if test.expectedDigest != "" && inspection.Digest != test.expectedDigest {
+			t.Fatalf("repository plugin %s digest changed: got %s, want %s", test.id, inspection.Digest, test.expectedDigest)
 		}
 	}
 }

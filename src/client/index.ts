@@ -5,7 +5,7 @@ import { parseClientArguments } from "./args.js";
 import { readAdapterClientContext } from "./adapter-channel.js";
 import { escapeUntrustedTerminalText } from "../shared/terminal-safety.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 
 async function main(): Promise<void> {
   const arguments_ = process.argv.slice(2);

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repository_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 directory="${1:-}"
 version="${2:-}"
 repository="${3:-}"
@@ -14,7 +15,26 @@ if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   printf 'Release manifest version is invalid: %s\n' "${version}" >&2
   exit 2
 fi
-command -v jq >/dev/null 2>&1 || { printf 'jq is required.\n' >&2; exit 1; }
+for command_name in jq node; do
+  command -v "${command_name}" >/dev/null 2>&1 || {
+    printf '%s is required.\n' "${command_name}" >&2
+    exit 1
+  }
+done
+
+botmux_plugin_version="$(node -p \
+  'require(process.argv[1]).version' \
+  "${repository_root}/plugins/adapter-botmux/manifest.json")"
+hermes_plugin_version="$(node -p \
+  'require(process.argv[1]).version' \
+  "${repository_root}/plugins/workload-hermes/manifest.json")"
+for plugin_version in "${botmux_plugin_version}" "${hermes_plugin_version}"; do
+  if [[ ! "${plugin_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] \
+      || (( ${#plugin_version} > 96 )); then
+    printf 'Release plugin manifest version is invalid: %s\n' "${plugin_version}" >&2
+    exit 1
+  fi
+done
 
 directory="$(CDPATH= cd -- "${directory}" && pwd -P)"
 [[ ! -e "${directory}/manifest.json" ]] || {
@@ -29,8 +49,8 @@ required_assets=(
   "ops-agent-all_${version}_arm64.deb"
   "ops-agent-linux-amd64.spdx.json"
   "ops-agent-linux-arm64.spdx.json"
-  "adapter-botmux_${version}.opspkg"
-  "workload-hermes_${version}.opspkg"
+  "adapter-botmux_${botmux_plugin_version}.opspkg"
+  "workload-hermes_${hermes_plugin_version}.opspkg"
 )
 for required_asset in "${required_assets[@]}"; do
   [[ -f "${directory}/${required_asset}" && ! -L "${directory}/${required_asset}" ]] || {

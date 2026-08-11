@@ -467,15 +467,18 @@ const appRoot = process.argv[2];
 const expectedVersion = process.argv[3];
 const packageDocument = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8"));
 const lockDocument = JSON.parse(fs.readFileSync(path.join(appRoot, "package-lock.json"), "utf8"));
-if (packageDocument.version !== expectedVersion || lockDocument.packages?.[""]?.version !== expectedVersion) {
+if (packageDocument.version !== expectedVersion || lockDocument.version !== expectedVersion ||
+    lockDocument.packages?.[""]?.version !== expectedVersion) {
   throw new Error("package and lockfile versions do not match the release");
 }
+const pluginVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
 for (const directory of fs.readdirSync(path.join(appRoot, "plugins"), { withFileTypes: true })) {
   if (!directory.isDirectory()) continue;
   const manifestPath = path.join(appRoot, "plugins", directory.name, "manifest.json");
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-  if (manifest.version !== expectedVersion) {
-    throw new Error(`plugin manifest version mismatch: ${directory.name}`);
+  if (typeof manifest.version !== "string" || manifest.version.length > 96 ||
+      !pluginVersionPattern.test(manifest.version)) {
+    throw new Error(`plugin manifest has an invalid independent version: ${directory.name}`);
   }
 }
 NODE

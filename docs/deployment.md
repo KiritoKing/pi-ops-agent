@@ -141,6 +141,15 @@ Bootstrap：
 验证。高价值环境应在管理机验证 attestation 后，将 archive 放入受控镜像，并通过
 `OPS_AGENT_RELEASE_BASE` 使用该镜像。
 
+产品 Release 版本与 digest-bound Plugin 版本是两套独立身份。`package.json`、lockfile 根包、
+compiled Client、tag、`payload/VERSION` 与 Debian package 必须全部等于产品 Release 版本；
+`plugins/*/manifest.json` 则各自保持 strict bounded semver，并不因一次只修 Core/installer 的产品
+patch 自动改写。否则无源码变化的 `adapter.tui`/`workload.base` 也会产生新 digest，错误废弃已经
+逐次批准的 exact grant。Release 内 legacy `.opspkg` 的文件名从对应 manifest 版本派生，builder 仍
+要求参数与包内 manifest exact 相等；不得用产品版本给旧 Plugin 重命名并把文件名冒充 Plugin 身份。
+Plugin tree 任何真实字节变化无论是否同时提升 manifest version，都必须重新计算 digest 并重新审批；
+版本字段本身也继续作为审批计划与 runtime registration 的 exact-bound identity。
+
 Release installer 自身不调用 apt/dnf/yum 等包管理器。所有模式都要求 systemd、OpenSSL、diffutils
 等基础命令及 util-linux 的固定 `/bin/findmnt` 已由管理员或 image 提供；`init` 还要求固定
 `/usr/bin/bwrap`、`sudo`/`visudo` 与 util-linux `prlimit`。
@@ -160,7 +169,8 @@ tar/deb 上传为独立、不可覆盖的 artifact，再运行第三方 SBOM Act
 不能改写已验证 payload。
 
 Release workflow 把候选验证与发布权限分开。面向 `main` 的 `pull_request` 和 `workflow_dispatch`
-止于 non-publishing candidate 路径：`validate` 固定 source SHA 与 package/client/plugin version，随后等待
+止于 non-publishing candidate 路径：`validate` 固定 source SHA 与一致的产品 package/client version，
+并分别验证每个 Plugin manifest 的独立版本格式，随后等待
 完整 CI gates、真实 Linux Adapter runtime probe 以及 amd64/arm64 native build；
 `release-candidate-verification` 下载两组 native artifact，以 `--no-payload-execution` 重新执行 verifier，
 构建两个 legacy 恢复/兼容 `.opspkg`，生成绑定同一 source SHA/version 的 manifest 与最终 checksums，

@@ -128,15 +128,18 @@ const repositoryRoot = process.argv[2];
 const expectedVersion = process.argv[3];
 const packageDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8"));
 const lockDocument = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package-lock.json"), "utf8"));
-if (packageDocument.version !== expectedVersion || lockDocument.packages?.[""]?.version !== expectedVersion) {
+if (packageDocument.version !== expectedVersion || lockDocument.version !== expectedVersion ||
+    lockDocument.packages?.[""]?.version !== expectedVersion) {
   throw new Error("package and lockfile versions do not match --version");
 }
+const pluginVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
 for (const directory of fs.readdirSync(path.join(repositoryRoot, "plugins"), { withFileTypes: true })) {
   if (!directory.isDirectory()) continue;
   const manifestPath = path.join(repositoryRoot, "plugins", directory.name, "manifest.json");
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-  if (manifest.version !== expectedVersion) {
-    throw new Error(`plugin manifest version mismatch: ${directory.name}`);
+  if (typeof manifest.version !== "string" || manifest.version.length > 96 ||
+      !pluginVersionPattern.test(manifest.version)) {
+    throw new Error(`plugin manifest has an invalid independent version: ${directory.name}`);
   }
 }
 NODE
@@ -194,8 +197,16 @@ cp -a "${REPOSITORY_ROOT}/docs/." "${app_root}/docs/"
 cp -a "${REPOSITORY_ROOT}/systemd/." "${app_root}/systemd/"
 cp -a "${REPOSITORY_ROOT}/plugins/." "${app_root}/plugins/"
 cp -a "${REPOSITORY_ROOT}/skills/." "${app_root}/skills/"
-"${REPOSITORY_ROOT}/packaging/build-botmux-plugin.sh" "${VERSION}" "${app_root}/catalog"
-"${REPOSITORY_ROOT}/packaging/build-hermes-workload-plugin.sh" "${VERSION}" "${app_root}/catalog"
+botmux_plugin_version="$("${NODE_RUNTIME_DIR}/bin/node" -p \
+  'require(process.argv[1]).version' \
+  "${REPOSITORY_ROOT}/plugins/adapter-botmux/manifest.json")"
+hermes_plugin_version="$("${NODE_RUNTIME_DIR}/bin/node" -p \
+  'require(process.argv[1]).version' \
+  "${REPOSITORY_ROOT}/plugins/workload-hermes/manifest.json")"
+"${REPOSITORY_ROOT}/packaging/build-botmux-plugin.sh" \
+  "${botmux_plugin_version}" "${app_root}/catalog"
+"${REPOSITORY_ROOT}/packaging/build-hermes-workload-plugin.sh" \
+  "${hermes_plugin_version}" "${app_root}/catalog"
 "${REPOSITORY_ROOT}/packaging/create-catalog-index.sh" "${app_root}/catalog" "${app_root}/catalog/index.json"
 for script_name in configure-noble-bwrap-apparmor.sh configure-plugin-credentials.sh encrypt-credential.sh healthcheck.sh install-release.sh ops-agent.sh probe-adapter-linux-runtime.sh setup-botmux.sh uninstall.sh; do
   install -m 0755 "${REPOSITORY_ROOT}/scripts/${script_name}" "${app_root}/scripts/${script_name}"
