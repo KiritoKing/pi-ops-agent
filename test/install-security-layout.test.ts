@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -1561,6 +1562,196 @@ describe("installed client-plane isolation", () => {
       { encoding: "utf8" },
     );
     expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+  });
+
+  it("waits for the private agent backend and a new heartbeat generation", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const verifierMatch = installer.match(
+      /verify_committed_agentd_generation\(\) \{\n(?<body>[\s\S]*?)\n\}\n\nwait_for_committed_controller_generation/u,
+    );
+    const verifierBody = verifierMatch?.groups?.body;
+    expect(verifierBody).toBeDefined();
+    if (verifierBody === undefined) throw new Error("agentd generation verifier is missing");
+    const helperMatch = installer.match(
+      /wait_for_committed_controller_generation\(\) \{\n(?<body>[\s\S]*?)\n\}\n\nwait_for_committed_endpoint_socket/u,
+    );
+    const helperBody = helperMatch?.groups?.body;
+    expect(helperBody).toBeDefined();
+    if (helperBody === undefined) throw new Error("controller readiness helper is missing");
+
+    expect(installer).toContain('readonly READINESS_TIMEOUT_BIN="/usr/bin/timeout"');
+    expect(helperBody).toContain('while ((readiness_attempt < 100)); do');
+    expect(verifierBody).toContain('"${READINESS_TIMEOUT_BIN}" --kill-after=1s 2s');
+    expect(verifierBody).toContain(
+      "systemctl show --property=MainPID --value ops-agentd.service",
+    );
+    expect(helperBody.match(/verify_committed_agentd_generation/gu)).toHaveLength(2);
+    expect(helperBody).toContain("current_heartbeat_identity");
+    expect(helperBody).toContain("baseline_heartbeat_identity");
+    expect(helperBody).toContain("sleep 0.1");
+    expect(helperBody).toContain("heartbeat for the new process generation");
+    expect(helperBody).not.toContain("healthcheck.sh");
+
+    const activationStart = installer.indexOf(
+      '\nif [[ "${START_NOW}" == true ]]; then\n  if ! systemctl restart ops-agent.target',
+    );
+    const actualActivationStart = installer.indexOf(
+      '\nif [[ "${START_NOW}" == true ]]; then\n  controller_heartbeat=',
+    );
+    const activationEnd = installer.indexOf(
+      '\nprintf \'%s\\n\' \\\n  "Pi Ops Agent ${release_version}',
+      actualActivationStart,
+    );
+    expect(activationStart).toBe(-1);
+    expect(actualActivationStart).toBeGreaterThan(0);
+    expect(activationEnd).toBeGreaterThan(actualActivationStart);
+    const activation = installer.slice(actualActivationStart, activationEnd);
+    const restart = activation.indexOf("systemctl restart ops-agent.target");
+    const mainPid = activation.indexOf("agentd_main_pid=", restart);
+    const baseline = activation.indexOf("controller_heartbeat_baseline=absent", mainPid);
+    const publicSocket = activation.indexOf("/run/ops-agent/agentd/agentd.sock");
+    const backendSocket = activation.indexOf("/run/ops-agent/agentd/backend.sock");
+    const readiness = activation.indexOf("wait_for_committed_controller_generation");
+    const finalHealth = activation.indexOf('"${CURRENT_LINK}/scripts/healthcheck.sh"');
+    const finalGeneration = activation.indexOf(
+      'verify_committed_agentd_generation "${agentd_main_pid}"',
+      finalHealth,
+    );
+    expect(restart).toBeGreaterThan(0);
+    expect(mainPid).toBeGreaterThan(restart);
+    expect(baseline).toBeGreaterThan(mainPid);
+    expect(publicSocket).toBeGreaterThan(0);
+    expect(backendSocket).toBeGreaterThan(publicSocket);
+    expect(readiness).toBeGreaterThan(backendSocket);
+    expect(finalHealth).toBeGreaterThan(readiness);
+    expect(finalGeneration).toBeGreaterThan(finalHealth);
+    expect(activation.match(/scripts\/healthcheck\.sh/gu)).toHaveLength(1);
+    expect(activation.slice(readiness, finalHealth)).not.toContain("healthcheck.sh");
+    expect(activation).toContain(
+      '"${READINESS_TIMEOUT_BIN}" --kill-after=5s 60s \\\n      systemctl restart ops-agent.target ops-agent-healthcheck.timer',
+    );
+    expect(activation).toContain(
+      '"${READINESS_TIMEOUT_BIN}" --kill-after=5s 60s \\\n    "${CURRENT_LINK}/scripts/healthcheck.sh"',
+    );
+
+    const root = mkdtempSync(join(tmpdir(), "ops-agent-controller-readiness-"));
+    try {
+      const binaryRoot = join(root, "bin");
+      const timeout = join(binaryRoot, "timeout");
+      const systemctl = join(binaryRoot, "systemctl");
+      const heartbeat = join(root, "heartbeat.json");
+      const pidState = join(root, "pid-state");
+      mkdirSync(binaryRoot, { recursive: true });
+      writeFileSync(
+        timeout,
+        [
+          "#!/bin/sh",
+          'test "$1" = --kill-after=1s',
+          'test "$2" = 2s',
+          "shift 2",
+          'exec "$@"',
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      writeFileSync(
+        systemctl,
+        [
+          "#!/bin/sh",
+          'test "${OPS_AGENT_SYSTEMCTL_FAIL:-0}" = 0 || exit 1',
+          'test "$1" = show',
+          'test "$2" = --property=MainPID',
+          'test "$3" = --value',
+          'test "$4" = ops-agentd.service',
+          'exec /bin/cat "${OPS_AGENT_PID_STATE}"',
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      chmodSync(timeout, 0o755);
+      chmodSync(systemctl, 0o755);
+      writeFileSync(heartbeat, "old heartbeat\n", "utf8");
+      writeFileSync(pidState, "1234\n", "utf8");
+      const verification = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          [
+            "set -euo pipefail",
+            "verify_committed_agentd_generation() {",
+            verifierBody,
+            "}",
+            "wait_for_committed_controller_generation() {",
+            helperBody,
+            "}",
+            'READINESS_TIMEOUT_BIN="$1/bin/timeout"',
+            'PATH="$1/bin:${PATH}"',
+            'heartbeat_path="$2"',
+            'export OPS_AGENT_PID_STATE="$3"',
+            "identity=old",
+            "drift_on_new=0",
+            "sleep_calls=0",
+            'diagnostic_file="$(mktemp)"',
+            'trap \'rm -f -- "${diagnostic_file}"\' EXIT',
+            'stat() { if [[ "${identity}" == new && "${drift_on_new}" -eq 1 ]]; then printf \'5678\\n\' >"${OPS_AGENT_PID_STATE}"; fi; printf \'%s\\n\' "${identity}"; }',
+            'sleep() { sleep_calls=$((sleep_calls + 1)); if [[ "${sleep_calls}" -eq 2 ]]; then identity=new; fi; }',
+            'wait_for_committed_controller_generation 1234 old "${heartbeat_path}"',
+            '[[ "${sleep_calls}" -eq 2 ]]',
+            'printf \'1234\\n\' >"${OPS_AGENT_PID_STATE}"',
+            "identity=old",
+            "drift_on_new=1",
+            "sleep_calls=0",
+            ': >"${diagnostic_file}"',
+            "set +e",
+            'wait_for_committed_controller_generation 1234 old "${heartbeat_path}" 2>"${diagnostic_file}"',
+            "status=$?",
+            "set -e",
+            '[[ "${status}" -eq 1 ]]',
+            '[[ "${sleep_calls}" -eq 2 ]]',
+            "grep -F 'changed generation while becoming ready' \"${diagnostic_file}\"",
+            "drift_on_new=0",
+            'printf \'5678\\n\' >"${OPS_AGENT_PID_STATE}"',
+            "sleep_calls=0",
+            ': >"${diagnostic_file}"',
+            "set +e",
+            'wait_for_committed_controller_generation 1234 old "${heartbeat_path}" 2>"${diagnostic_file}"',
+            "status=$?",
+            "set -e",
+            '[[ "${status}" -eq 1 ]]',
+            '[[ "${sleep_calls}" -eq 0 ]]',
+            "grep -F 'changed generation while becoming ready' \"${diagnostic_file}\"",
+            'printf \'1234\\n\' >"${OPS_AGENT_PID_STATE}"',
+            "identity=old",
+            "sleep_calls=0",
+            'sleep() { sleep_calls=$((sleep_calls + 1)); }',
+            ': >"${diagnostic_file}"',
+            "set +e",
+            'wait_for_committed_controller_generation 1234 old "${heartbeat_path}" 2>"${diagnostic_file}"',
+            "status=$?",
+            "set -e",
+            '[[ "${status}" -eq 1 ]]',
+            '[[ "${sleep_calls}" -eq 100 ]]',
+            "grep -F 'heartbeat for the new process generation' \"${diagnostic_file}\"",
+            "export OPS_AGENT_SYSTEMCTL_FAIL=1",
+            "sleep_calls=0",
+            ': >"${diagnostic_file}"',
+            "set +e",
+            'wait_for_committed_controller_generation 1234 old "${heartbeat_path}" 2>"${diagnostic_file}"',
+            "status=$?",
+            "set -e",
+            '[[ "${status}" -eq 1 ]]',
+            '[[ "${sleep_calls}" -eq 0 ]]',
+            "grep -F 'PID 1 did not answer the bounded agentd readiness query' \"${diagnostic_file}\"",
+          ].join("\n"),
+          "controller-readiness",
+          root,
+          heartbeat,
+          pidState,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(verification.status, `${verification.stdout}${verification.stderr}`).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("installs the JSON config helper as one transactionally managed root-owned executable", () => {

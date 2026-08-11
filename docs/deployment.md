@@ -297,7 +297,12 @@ E2E 应创建专用、带密码且无 broad sudo rule 的 `opsadmin`；生产机
   例外；任一边界不可用时必需的 `workload.base` 无法加载，因此 `init`
   fail closed 并回滚整轮安装事务；
 - 通过 `/dev/tty` 读取模型 key 并生成 systemd encrypted credential；
-- 启动服务并运行当前 healthcheck。
+- 启动服务后先取得本次 `ops-agentd.service` 的非零 `MainPID`，再记录当时的 heartbeat
+  file identity，并等待 core/reviewer/lease/public gateway socket 与 owner-only `backend.sock`。gateway
+  可以早于 agentd backend 就绪并先发布公开 socket，因此安装器还要求同一 `MainPID` 保持稳定且
+  heartbeat 在该基线后至少原子换代一次，最后只在固定 deadline 内运行一次已安装的完整
+  healthcheck。只看公开 `agentd.sock` 或 15 秒内仍新鲜的旧 heartbeat 都不能作为 controller ready
+  证据；PID 漂移、命令超时或最终 health failure 一律在 commit 后 fail closed。
 
 Release 还包含独立 `agentd-json-config-helper`。安装器会在停止 ingress、确认 broker store idle 后，
 事务化快照并以 `root:root 0755` regular file 安装到固定

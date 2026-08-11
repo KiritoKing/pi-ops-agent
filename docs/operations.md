@@ -107,6 +107,12 @@ fresh TUI 重新连接。同一次事件后 gateway 若为 `inactive/dead`，是
 的检查。每个 production dial 还会重验 backend owner/mode 与 dial 前后 device/inode identity。
 fresh controller 启动并达到 backend ready 后，gateway `NRestarts` 应为 `0`；若 journal 先出现
 backend pathname `ENOENT`、两秒后 gateway 自重启，说明仍在运行旧的 startup pathname gate。
+同理，安装或升级后的启动验收不能把公开 `agentd.sock` 首次出现或旧 heartbeat 仍在 15 秒 freshness
+窗口内当作成功：公开 socket 由跨 backend restart 存活的 gateway 持有，可能先于 agentd 的
+owner-only `backend.sock` 和本代 heartbeat。当前 installer 会锁定 restart 后的非零 `MainPID`，记录
+该时点 heartbeat file identity，等待 private backend 与其他 sockets，并要求同一 PID 下 heartbeat
+随后至少原子换代一次。只有这之后才在固定 deadline 内运行一次完整 health contract；PID 漂移、
+timeout 或最终 health failure 都 fail closed，不把旧 generation 或持续故障当作启动竞态。
 
 ## 审批操作
 

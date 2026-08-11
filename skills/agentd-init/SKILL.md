@@ -141,6 +141,12 @@ healthcheck `SuccessExitStatus` and exact agentd credential drop-in, and reject 
 drop-in except a root-owned host-wide compatibility reset whose complete syntax is in the fixed
 narrow allowlist. Host-wide `service.d` drift or later unit overrides must fail the transaction;
 `cmp`, `systemctl cat`, and `systemd-analyze verify` alone are not sufficient.
+After a committed controller start, do not treat the gateway-owned public socket or a still-fresh
+old heartbeat as agentd readiness. Capture the bounded nonzero post-restart MainPID and the
+heartbeat file identity observed after that PID, wait for the owner-only backend socket, and require
+the same PID to publish a later atomic heartbeat replacement. Only then run the installed full
+healthcheck once under a fixed deadline; PID drift, timeout, or persistent failure must remain fatal
+and retain the committed evidence.
 Also verify the controller lifecycle topology from typed PID 1 data: `ops-agent.target.Wants` is the
 exact release set containing both agentd and the client gateway; the gateway effective `Wants`
 contains the exact `ops-agentd.service` member, has exact `PartOf=ops-agent.target`, is ordered after

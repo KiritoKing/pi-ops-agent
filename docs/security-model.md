@@ -97,6 +97,13 @@ server/core broker，signed PVE enrollment 与本机固定入口双向匹配时�
 扩大 endpoint authority，必须 fail closed。PVE broker 的 final drop-in 必须保留唯一精确
 `/etc/pve` 写例外；它不能被复制到 core/server/agentd。
 
+Controller commit 后的 readiness 也必须按实际 gateway topology 验证：gateway 可在 owner-only
+`backend.sock` 和本代 heartbeat 出现前先发布 public `agentd.sock`。installer 必须锁定 restart 后的
+非零 agentd `MainPID`，记录该时点 heartbeat file identity，等待 private backend，并要求同一 PID
+下 heartbeat 随后原子换代；之后才在固定 deadline 内运行一次完整 health contract。PID 漂移、命令
+timeout 或最终 health failure 都保留已提交证据并 fail closed，不能用 public socket 或仍新鲜的旧
+heartbeat 掩盖 agentd 未 ready。
+
 Installer 的 unit migration 不能把 `systemctl disable` 当作受管 topology 清理器：该命令会删除所有
 匹配 unit 的 link，而不仅是 installer 创建的 link。stale PVE 与 legacy `ops-systemd-helper` 只允许
 删除 allowlist 中 exact persistent/runtime `.wants` path，且 symlink 必须解析到固定的受管 unit；这些

@@ -24,6 +24,7 @@ readonly LEASE_GROUP="ops-agent-lease"
 readonly BOTMUX_HOME="/var/lib/ops-agent/adapters/botmux"
 readonly APPROVAL_SUDOERS="/etc/sudoers.d/zzzz-ops-agent-approval"
 readonly JSON_CONFIG_HELPER="/usr/lib/ops-agent/agentd-json-config-helper"
+readonly READINESS_TIMEOUT_BIN="/usr/bin/timeout"
 readonly RECEIPT_ROOT="${CONFIG_ROOT}/broker-receipts"
 readonly RECEIPT_PRIVATE_ROOT="${RECEIPT_ROOT}/private"
 readonly CORE_RECEIPT_KEY_ID="local-core-receipt-v1"
@@ -768,6 +769,47 @@ maybe_inject_install_failure() {
   }
 }
 
+verify_committed_agentd_generation() {
+  local expected_pid="$1"
+  local current_pid=""
+  if ! current_pid="$("${READINESS_TIMEOUT_BIN}" --kill-after=1s 2s \
+      systemctl show --property=MainPID --value ops-agentd.service 2>/dev/null)"; then
+    printf 'Installation committed, but PID 1 did not answer the bounded agentd readiness query.\n' >&2
+    return 1
+  fi
+  if [[ "${current_pid}" != "${expected_pid}" ]]; then
+    printf 'Installation committed, but ops-agentd.service changed generation while becoming ready.\n' >&2
+    return 1
+  fi
+}
+
+wait_for_committed_controller_generation() {
+  local expected_pid="$1"
+  local baseline_heartbeat_identity="$2"
+  local heartbeat_path="$3"
+  local readiness_attempt=0
+  local current_heartbeat_identity=""
+  while ((readiness_attempt < 100)); do
+    if ! verify_committed_agentd_generation "${expected_pid}"; then
+      return 1
+    fi
+    if [[ -f "${heartbeat_path}" ]] && [[ ! -L "${heartbeat_path}" ]]; then
+      current_heartbeat_identity="$(stat -c '%d:%i' -- "${heartbeat_path}" 2>/dev/null || true)"
+      if [[ -n "${current_heartbeat_identity}" ]] \
+          && [[ "${current_heartbeat_identity}" != "${baseline_heartbeat_identity}" ]]; then
+        if ! verify_committed_agentd_generation "${expected_pid}"; then
+          return 1
+        fi
+        return 0
+      fi
+    fi
+    sleep 0.1
+    readiness_attempt=$((readiness_attempt + 1))
+  done
+  printf 'Installation committed, but agentd did not publish a heartbeat for the new process generation before the readiness deadline.\n' >&2
+  return 1
+}
+
 wait_for_committed_endpoint_socket() {
   local label="$1"
   local unit="$2"
@@ -1007,8 +1049,9 @@ for required_command in "${required_commands[@]}"; do
   }
 done
 if [[ "${MODE}" == init ]] \
-    && { [[ ! -x /usr/bin/env ]] || [[ ! -x /usr/bin/sudo ]] || [[ ! -x /usr/bin/bwrap ]]; }; then
-  printf 'Pi Ops Agent requires fixed /usr/bin/env, /usr/bin/sudo, and /usr/bin/bwrap paths.\n' >&2
+    && { [[ ! -x /usr/bin/env ]] || [[ ! -x /usr/bin/sudo ]] || [[ ! -x /usr/bin/bwrap ]] \
+      || [[ ! -x "${READINESS_TIMEOUT_BIN}" ]]; }; then
+  printf 'Pi Ops Agent requires fixed /usr/bin/env, /usr/bin/sudo, /usr/bin/bwrap, and /usr/bin/timeout paths.\n' >&2
   exit 1
 fi
 SANDBOX_PRLIMIT=""
@@ -4265,15 +4308,31 @@ maybe_inject_install_failure services
 commit_install_transaction
 
 if [[ "${START_NOW}" == true ]]; then
-  if ! systemctl restart ops-agent.target ops-agent-healthcheck.timer; then
+  controller_heartbeat=/run/ops-agent/agentd/heartbeat.json
+  if ! "${READINESS_TIMEOUT_BIN}" --kill-after=5s 60s \
+      systemctl restart ops-agent.target ops-agent-healthcheck.timer; then
     printf 'Installation committed, but services did not start; inspect systemd before retrying.\n' >&2
     exit 1
+  fi
+  if ! agentd_main_pid="$("${READINESS_TIMEOUT_BIN}" --kill-after=1s 2s \
+      systemctl show --property=MainPID --value ops-agentd.service 2>/dev/null)" \
+      || [[ ! "${agentd_main_pid}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'Installation committed, but ops-agentd.service did not expose one bounded nonzero MainPID.\n' >&2
+    exit 1
+  fi
+  controller_heartbeat_baseline=absent
+  if [[ -e "${controller_heartbeat}" ]] || [[ -L "${controller_heartbeat}" ]]; then
+    if ! controller_heartbeat_baseline="$(stat -c '%d:%i' -- "${controller_heartbeat}" 2>/dev/null)"; then
+      printf 'Installation committed, but the post-restart agentd heartbeat identity could not be inspected.\n' >&2
+      exit 1
+    fi
   fi
   required_sockets=(
     /run/ops-agent/helper/root-helper.sock
     /run/ops-agent/reviewer/reviewer.sock
     /run/ops-agent/plugin-lease/lease.sock
     /run/ops-agent/agentd/agentd.sock
+    /run/ops-agent/agentd/backend.sock
   )
   if [[ -x /usr/bin/pvesh ]]; then
     required_sockets+=(/run/ops-agent/helper/pve-root-helper.sock)
@@ -4290,7 +4349,22 @@ if [[ "${START_NOW}" == true ]]; then
       exit 1
     fi
   done
-  "${CURRENT_LINK}/scripts/healthcheck.sh"
+  if ! wait_for_committed_controller_generation \
+      "${agentd_main_pid}" "${controller_heartbeat_baseline}" "${controller_heartbeat}"; then
+    exit 1
+  fi
+  health_status=0
+  "${READINESS_TIMEOUT_BIN}" --kill-after=5s 60s \
+    "${CURRENT_LINK}/scripts/healthcheck.sh" || health_status=$?
+  if ((health_status != 0)); then
+    if ((health_status == 124 || health_status == 137)); then
+      printf 'Installation committed, but the final controller healthcheck exceeded its bounded deadline.\n' >&2
+    fi
+    exit 1
+  fi
+  if ! verify_committed_agentd_generation "${agentd_main_pid}"; then
+    exit 1
+  fi
 fi
 
 printf '%s\n' \
