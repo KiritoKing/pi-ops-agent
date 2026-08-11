@@ -114,6 +114,41 @@ owner-only `backend.sock` 和本代 heartbeat。当前 installer 会锁定 resta
 随后至少原子换代一次。只有这之后才在固定 deadline 内运行一次完整 health contract；PID 漂移、
 timeout 或最终 health failure 都 fail closed，不把旧 generation 或持续故障当作启动竞态。
 
+### 模型 turn 超时与恢复
+
+agentd 从每次 Pi `prompt()` 开始计算固定 180 秒总时限。这个时限不因 DeepSeek/OpenAI-compatible
+SSE 已返回 `200` headers、持续发送 keep-alive、输出 token、Pi 串行 retry 或 compaction 而延期。
+到期后 agentd 只发起一次 abort，并等待最多 10 秒：
+
+- abort 已证明 Pi session idle：Client 收到固定的 turn timeout error，旧 turn 不会发送 `done`，随后
+  才可处理新的显式输入；agentd 不自动重放原 prompt；
+- abort 立即失败或 grace 内没有证明 idle：agentd 不发送伪造的 idle/success，也不继续复用该
+  Session，而是直接退出。`ops-agentd.service` 的 `Restart=always` 会建立新进程，gateway backend EOF
+  使旧 Client 退出并释放 writer；backend 恢复后用 fresh Client 重连同一外部 Session。
+
+backend connection 在 active turn 中断开时也使用同一条保守边界。agentd 先把 Session 标成 closing，
+复用该 turn 已有的唯一 abort latch，并从断连时起最多等待 10 秒，要求 Pi idle **且**外围 prompt wrapper
+已经静止后才 dispose。canonical backend `SessionId` 的进程内 reservation 覆盖 opening、active 与这段
+cleanup；只有明确 open failure 或上述安全 close resolve 才释放。因此 cleanup 中相同 Session 的重连会
+暂时拒绝，其他 Session 仍可连接。abort 拒绝、hang 或 wrapper 未静止都产生固定、无 provider 细节的
+fatal error，poison Session 并保留 reservation，直到 systemd 用新进程恢复；不能靠断开 socket、手工
+dispose 或测试中的 non-exiting fatal hook 绕过。
+
+这里的“abort”还区分 Pi prompt commit 前后。若断连、Ctrl-C 或 deadline 发生在 Pi 自己的 auth、
+pre-compaction、`before_agent_start` preflight，`preflightResult(true)` 同步 gate 会在
+`_runAgentPrompt()` 前取消后续 main agent run 及其工具，也不会对 idle Pi 调用 abort；若 gate 已先提交，
+Pi 会在同一同步栈进入 active run，再由同一个 latch 调用 abort。但 pinned Pi 会在这个 callback 之前
+运行 `_checkCompaction()`，auto pre-compaction 可能已经发出模型请求并更新 compaction history。让该
+raw prompt 在 grace 内完成后可以安全阻止 main turn；若 pre-compaction 卡住则 agentd fail-stop、同名
+Session 保持 quarantine。raw Pi prompt 的 finish 只解除 deadline/preflight 等待，connection cleanup
+仍须等待外围 prompt wrapper 后才可释放 Session 名字；恢复后先查 broker/audit，不能自动重放旧 prompt。
+
+后一种情况应核对 `systemctl show ops-agentd.service -p NRestarts -p MainPID` 与本代 heartbeat，确认
+PID 已换代，再检查 agent audit 中最后一个 `turnId` 和 broker 的权威 change status。不要手工重复旧
+prompt：超时前工具或 broker 可能已经产生待审批或已执行的独立状态，必须先按原 `changeRef`/审计证据
+查询。provider 侧 retry 已固定为 `0`；Pi 自身 transient retry 仍在同一 turn 内串行且受上述总时限
+约束。
+
 ## 审批操作
 
 Agent prepare 后会输出 opaque `changeRef`。本地 TUI 使用：
@@ -517,8 +552,22 @@ runtime/server/TLS/approver、unit/drop-in、Source 工作树、plugin registry�
 unit 状态都处于同一个 root-only 回滚事务；激活、plugin registration 或 sudo 有效策略探针
 失败都会恢复，而不是只恢复 link/policy。Adapter state/secret 与 broker state/backup/audit
 不进入整树 snapshot。服务在 commit 后才启动；此后的 start/health 失败保留新版本与证据，
-不会竞态恢复旧 registry/config。已有 config 不覆盖，新默认写相邻 `.dist`。升级不得自动新增
+不会竞态恢复旧 registry/config。已有 config 默认不覆盖，新模板写相邻 `.dist`；唯一例外是
+`root:ops-agent 0640`、单硬链接且 SHA-256 逐字匹配已知旧版默认模板的 `models.json`，它会在同一
+config snapshot 内原子迁移到当前 verified DeepSeek template。任一自定义字节或 metadata 漂移都
+不会被静默合并，后者直接 fail closed。写 config 前，既存 `/etc/ops-agent` 还必须是
+`root:root 0755` real directory；controller 的 `credentials` 必须是 `root:root 0700` real directory。
+符号链接不会交给 `install -d` 修复，安全缺失的目录在创建后重新核验。升级不得自动新增
 artifact、PVE guest/storage、read path 或 requested scope。
+
+安装事务还要求固定 `/bin/findmnt` 的 kernel inventory 可用、非空且包含 `/`。事务开始前先拒绝
+`/etc/ops-agent` exact/descendant mount；每个随后纳入 snapshot 的 config、release link、helper、
+plugin source/registry、unit/drop-in、sudoers、wrapper 与 wants path，也分别在 copy 前和 rollback
+递归清理前拒绝自身 exact/descendant directory 或 file bind/submount。ancestor `/`、`/etc` 与相似
+前缀不阻断。rollback 前若观察到新 mount，只记录 incomplete rollback 并保留对应 managed path，
+绝不调用其删除原语。不要用 `find -xdev`、静态 `/proc/mounts` 快照或“它仍是 real directory”来
+绕过该边界。具备 `CAP_SYS_ADMIN` 的主体在两次检查间并发改变 mount namespace 属于当前威胁模型
+之外的宿主 root 竞态。
 
 unit/drop-in snapshot 也必须按 topology 分开：`init` 覆盖 Release 中全部 controller managed unit、
 全部 managed service drop-in directory 和待清理的旧 managed `zzzz-ops-agent-*` 文件；`join` 只覆盖

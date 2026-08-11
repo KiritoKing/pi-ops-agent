@@ -21,7 +21,16 @@ import { ServerRegistry } from "./server-registry.js";
 import { SessionRegistry, type SessionRecord } from "./session-registry.js";
 import type { OpsToolRuntime } from "./tools.js";
 import { ManagedOpsServerPool } from "./ops-server-client.js";
-import { waitForAgentSettlement } from "./session-turn.js";
+import type { AgentTurnAbortLatch } from "./session-turn.js";
+import {
+  AgentTurnAbortedError,
+  AgentTurnAbortGraceError,
+  AgentTurnPreflightGate,
+  closeActiveAgentTurn,
+  DEFAULT_AGENT_ABORT_GRACE_MS,
+  DEFAULT_AGENT_TURN_TIMEOUT_MS,
+  waitForAgentSettlement,
+} from "./session-turn.js";
 import { prependTrustedWorkspaceContext, trustedWorkspaceContext } from "./workspace-context.js";
 import {
   listActiveRuntimeSourceWorkloads,
@@ -84,7 +93,24 @@ async function sessionManagerFor(
 export interface OpsSession {
   prompt(text: string, turnId: TurnId): Promise<void>;
   abort(): Promise<void>;
-  dispose(): void;
+  close(): Promise<void>;
+}
+
+export interface SessionFactoryOptions {
+  turnTimeoutMs?: number;
+  abortGraceMs?: number;
+  onFatalTurnFailure?: (error: AgentTurnAbortGraceError) => void;
+}
+
+interface AgentTurnPolicy {
+  timeoutMs: number;
+  abortGraceMs: number;
+  onAbortGraceExceeded(error: AgentTurnAbortGraceError): void;
+}
+
+function failStopAfterTurnCleanupFailure(error: AgentTurnAbortGraceError): never {
+  process.stderr.write(`ops-agentd: ${error.message}; exiting for a clean systemd restart\n`);
+  process.exit(1);
 }
 
 export class SessionFactory {
@@ -95,6 +121,7 @@ export class SessionFactory {
   readonly #contexts: MachineContextStore;
   readonly #sessionRegistry: SessionRegistry;
   readonly #serverPool: ManagedOpsServerPool;
+  readonly #turnPolicy: AgentTurnPolicy;
 
   private constructor(
     config: AgentConfig,
@@ -104,6 +131,7 @@ export class SessionFactory {
     contexts: MachineContextStore,
     sessionRegistry: SessionRegistry,
     serverPool: ManagedOpsServerPool,
+    turnPolicy: AgentTurnPolicy,
   ) {
     this.#config = config;
     this.#audit = audit;
@@ -112,9 +140,15 @@ export class SessionFactory {
     this.#contexts = contexts;
     this.#sessionRegistry = sessionRegistry;
     this.#serverPool = serverPool;
+    this.#turnPolicy = turnPolicy;
   }
 
-  static async create(config: AgentConfig, audit: AuditLog, apiKey: string): Promise<SessionFactory> {
+  static async create(
+    config: AgentConfig,
+    audit: AuditLog,
+    apiKey: string,
+    options: SessionFactoryOptions = {},
+  ): Promise<SessionFactory> {
     const credentials = new InMemoryCredentialStore();
     const modelRuntime = await ModelRuntime.create({
       credentials,
@@ -142,6 +176,11 @@ export class SessionFactory {
       contexts,
       sessionRegistry,
       new ManagedOpsServerPool(),
+      {
+        timeoutMs: options.turnTimeoutMs ?? DEFAULT_AGENT_TURN_TIMEOUT_MS,
+        abortGraceMs: options.abortGraceMs ?? DEFAULT_AGENT_ABORT_GRACE_MS,
+        onAbortGraceExceeded: options.onFatalTurnFailure ?? failStopAfterTurnCleanupFailure,
+      },
     );
   }
 
@@ -159,7 +198,12 @@ export class SessionFactory {
     const preparedChanges = new PreparedChangeTracker();
     let sessionRecord = await this.#sessionRegistry.refreshBinding(externalId, this.#contexts);
     const settingsManager = SettingsManager.inMemory({
-      retry: { enabled: true, maxRetries: 2, baseDelayMs: 1000 },
+      retry: {
+        enabled: true,
+        maxRetries: 2,
+        baseDelayMs: 1000,
+        provider: { maxRetries: 0 },
+      },
       compaction: { enabled: true },
       enableAnalytics: false,
       enableInstallTelemetry: false,
@@ -242,7 +286,19 @@ export class SessionFactory {
     preparedChanges: PreparedChangeTracker,
   ): OpsSession {
     let activeTurn: TurnId | undefined;
+    let activeTurnAbort: AgentTurnAbortLatch | undefined;
+    let activeTurnQuiesced: Promise<void> | undefined;
+    let poisonedByTurnCleanup: AgentTurnAbortGraceError | undefined;
+    let closing = false;
+    let closePromise: Promise<void> | undefined;
+    let disposed = false;
     let workspaceContext = trustedWorkspaceContext(initialRecord);
+    const poisonSession = (error: AgentTurnAbortGraceError): void => {
+      if (poisonedByTurnCleanup !== undefined) return;
+      poisonedByTurnCleanup = error;
+      this.#turnPolicy.onAbortGraceExceeded(error);
+    };
+    const currentPoison = (): AgentTurnAbortGraceError | undefined => poisonedByTurnCleanup;
     const correlation = (turnId: TurnId) => {
       const binding = initialRecord.binding;
       return {
@@ -259,50 +315,142 @@ export class SessionFactory {
     });
     return {
       prompt: async (text: string, turnId: TurnId): Promise<void> => {
-        if (session.isStreaming) throw new Error("session is already processing a request");
-        const refreshed = await this.#sessionRegistry.refreshBinding(externalId, this.#contexts);
-        const refreshedContext = trustedWorkspaceContext(refreshed);
-        if (refreshedContext !== workspaceContext) {
-          setRecord(refreshed);
-          initialRecord = refreshed;
-          workspaceContext = refreshedContext;
-          await session.reload();
+        if (closing || disposed) {
+          throw new Error("agent session is closing");
+        }
+        if (poisonedByTurnCleanup !== undefined) {
+          throw new Error("agent session is unavailable after failed turn cleanup");
+        }
+        if (activeTurn !== undefined || session.isStreaming) {
+          throw new Error("session is already processing a request");
         }
         activeTurn = turnId;
-        const route = routePrompt(text, this.#config.provider, this.#config.model);
-        session.setThinkingLevel(route.thinking);
-        emit({
-          type: "status",
-          state: "working",
-          route: `${route.model}/${route.thinking}/${route.risk}`,
-          ...correlation(turnId),
-        });
-        await this.#audit.append({
-          type: "prompt",
-          sessionId: externalId,
-          turnId,
-          workspacePath: refreshed.workspacePath,
-          machineId: refreshed.binding?.machineId,
-          targetId: refreshed.binding?.targetId,
-          text,
-          route,
-        });
+        const quiesced = Promise.withResolvers<undefined>();
+        activeTurnQuiesced = quiesced.promise;
+        const piPromptFinished = Promise.withResolvers<undefined>();
+        const preflightGate = new AgentTurnPreflightGate(
+          async () => await session.abort(),
+          piPromptFinished.promise,
+          () => closing,
+        );
+        const turnAbort = preflightGate.abort;
+        activeTurnAbort = turnAbort;
+        let workingEmitted = false;
+        const requireOpenTurn = (): void => {
+          if (closing || turnAbort.requested) throw new AgentTurnAbortedError();
+        };
         try {
+          const refreshed = await this.#sessionRegistry.refreshBinding(externalId, this.#contexts);
+          requireOpenTurn();
+          const refreshedContext = trustedWorkspaceContext(refreshed);
+          if (refreshedContext !== workspaceContext) {
+            setRecord(refreshed);
+            initialRecord = refreshed;
+            workspaceContext = refreshedContext;
+            await session.reload();
+            requireOpenTurn();
+          }
+          const route = routePrompt(text, this.#config.provider, this.#config.model);
+          session.setThinkingLevel(route.thinking);
+          emit({
+            type: "status",
+            state: "working",
+            route: `${route.model}/${route.thinking}/${route.risk}`,
+            ...correlation(turnId),
+          });
+          workingEmitted = true;
+          await this.#audit.append({
+            type: "prompt",
+            sessionId: externalId,
+            turnId,
+            workspacePath: refreshed.workspacePath,
+            machineId: refreshed.binding?.machineId,
+            targetId: refreshed.binding?.targetId,
+            text,
+            route,
+          });
+          requireOpenTurn();
           await waitForAgentSettlement(
             session,
-            () => session.prompt(text, { source: "rpc" }),
+            () => {
+              if (turnAbort.requested) {
+                piPromptFinished.resolve(undefined);
+                return Promise.reject(new AgentTurnAbortedError());
+              }
+              let prompt: Promise<void>;
+              try {
+                prompt = session.prompt(text, {
+                  source: "rpc",
+                  preflightResult: (accepted) => {
+                    // Pi 0.84.1 invokes this synchronously immediately before
+                    // _runAgentPrompt(). Throwing here is the last pre-commit
+                    // gate for the main agent run and its tools. Pi auto-
+                    // compaction may already have used its model before here.
+                    preflightGate.observePreflight(accepted);
+                  },
+                });
+              } catch (error) {
+                piPromptFinished.resolve(undefined);
+                throw error;
+              }
+              void prompt.then(
+                () => piPromptFinished.resolve(undefined),
+                () => piPromptFinished.resolve(undefined),
+              );
+              return prompt;
+            },
+            {
+              timeoutMs: this.#turnPolicy.timeoutMs,
+              abortGraceMs: this.#turnPolicy.abortGraceMs,
+              abort: () => turnAbort.request(),
+              onAbortGraceExceeded: poisonSession,
+            },
           );
-          emit({ type: "done", ...correlation(turnId) });
+          if (!turnAbort.requested) {
+            emit({ type: "done", ...correlation(turnId) });
+          }
+        } catch (error) {
+          if (error instanceof AgentTurnAbortGraceError) {
+            poisonSession(error);
+          }
+          throw error;
         } finally {
-          emit({ type: "status", state: "idle", ...correlation(turnId) });
-          activeTurn = undefined;
+          if (currentPoison() === undefined) {
+            if (workingEmitted) {
+              emit({ type: "status", state: "idle", ...correlation(turnId) });
+            }
+            activeTurn = undefined;
+          }
+          if (activeTurnAbort === turnAbort) activeTurnAbort = undefined;
+          if (activeTurnQuiesced === quiesced.promise) activeTurnQuiesced = undefined;
+          piPromptFinished.resolve(undefined);
+          quiesced.resolve(undefined);
         }
       },
-      abort: async (): Promise<void> => await session.abort(),
-      dispose: (): void => {
-        unsubscribe();
-        preparedChanges.clear();
-        session.dispose();
+      abort: (): Promise<void> => activeTurnAbort?.request() ?? Promise.resolve(),
+      close: (): Promise<void> => {
+        if (closePromise !== undefined) return closePromise;
+        closing = true;
+        closePromise = (async (): Promise<void> => {
+          const poisonBeforeClose = currentPoison();
+          if (poisonBeforeClose !== undefined) throw poisonBeforeClose;
+          const turnAbort = activeTurnAbort;
+          const turnQuiesced = activeTurnQuiesced;
+          if (turnAbort !== undefined && turnQuiesced !== undefined) {
+            await closeActiveAgentTurn(turnAbort, turnQuiesced, {
+              timeoutMs: this.#turnPolicy.timeoutMs,
+              abortGraceMs: this.#turnPolicy.abortGraceMs,
+              onAbortGraceExceeded: poisonSession,
+            });
+          }
+          const poisonAfterClose = currentPoison();
+          if (poisonAfterClose !== undefined) throw poisonAfterClose;
+          unsubscribe();
+          preparedChanges.clear();
+          session.dispose();
+          disposed = true;
+        })();
+        return closePromise;
       },
     };
   }

@@ -350,6 +350,47 @@ Pi `0.84.1` 的 `agent_settled` 是 authoritative completion：重试、compacti
 continuation 全部结束后才能发送一次 `done`。`prompt()` 正常 resolve 只作为兼容 fallback；
 一次 turn 的 completion 由 Client 按 `turnId` 去重。
 
+从调用 Pi `prompt()` 起，每个 turn 还有固定 180 秒的单调总时限；SSE token、comment/keep-alive、
+Pi agent-level retry、compaction 或 queued continuation 都不能重置它。OpenAI-compatible provider retry
+显式固定为 `0`；Pi 自己的至多两次 transient retry 仍只在同一个 `_runAgentPrompt` 内串行完成，不会
+另起并发 turn。总时限到达后 agentd 只调用一次 `AgentSession.abort()`，并且只有该 Promise resolve、
+即 Pi 已证明 session idle 后，才用固定 timeout error 结束本 turn 并重新接受输入；deadline 后迟到的
+`agent_settled` 不能把结果改写成成功。abort 若立即失败或 10 秒内仍不能证明 idle，当前 Session 会被
+poison，agentd 直接 fail-stop，由 systemd 以全新进程代恢复；不能仅清除 `activeTurn`、断开 Client 或
+调用 `dispose()` 后继续运行，因为那会允许旧 stream/retry 与新 turn 共享 Session 历史。
+
+严格解析 `hello` 后，agentd 还会在进程内用 canonical backend `SessionId` 同步取得一个 opaque-token
+reservation。它覆盖 `SessionFactory.open()`、active turn 和 backend disconnect cleanup；只有 open 明确
+失败，或 connection close 已复用该 turn 的同一个 abort latch、在 10 秒内同时证明 Pi idle 与外围
+prompt wrapper quiescent、随后安全 dispose，才按 token compare-delete 释放。connection close 会先把
+Session 标为 closing，因此发生在 binding refresh、reload 或 audit await 中间时，旧 coroutine 也不能
+继续启动模型；同一 `SessionId` 的新 backend connection 在 cleanup 完成前会被拒绝，其他 Session 不受
+影响。Pi 自己的 auth、auto pre-compaction 与 `before_agent_start` async preflight 最后由 pinned `0.84.1`
+`preflightResult(true)` 的同步 commit hook 收口：cancel/close/deadline 已请求时 callback 直接抛固定
+aborted error，因此后续 main `_runAgentPrompt()` 及其工具不会启动，也不会对仍 idle 的 Pi 假调用
+abort；未取消的 callback 先记录 committed，Pi 随即在同一同步栈进入 `_runAgentPrompt()`，此后同一个
+latch 才调用 Pi abort。这个 hook 位于 `_checkCompaction()` **之后**：auto pre-compaction 可能已经发出
+独立模型请求并改写 session compaction history，不能宣称 pre-commit cancellation 是零模型流量。它
+必须在同一 disconnect/deadline grace 内结束，使 raw Pi prompt finished；否则 Session fail-stop 且
+reservation 保留。raw Pi prompt 的独立 finished signal 解除 deadline/preflight 的互等；close 仍必须
+另外等待外围 wrapper quiescent。disconnect abort 拒绝或 idle/wrapper 任一未在 grace 内完成时使用固定错误 poison Session 并走
+同一个一次性 fail-stop hook；即使测试注入的 hook 不退出，也不能释放 reservation 或打开第二个同名
+Session。生产环境只有 systemd 建立全新 agentd 进程后才能重连，且不会自动重放旧 prompt。
+
+同一 backend connection 上，`hello`、`prompt` 和 `ping` 继续按 frame 顺序串行；`abort` 是唯一的
+旁路控制。它绑定当前或排在最前的未完成 prompt，每个 turn 最多调用一次 `session.abort()`，因此
+同一个 chunk 中紧随 prompt 的 Ctrl-C 也能取消在途请求。abort 本身不会推进 prompt queue；原
+prompt 未 settle 时后续 prompt/ping 仍不得并发执行。
+
+DeepSeek thinking tool replay 还需要 assistant tool-call message 的 `content` 非 `null`。固定的 Pi
+`0.84.1` 尚未提供上游命名的 `requiresAssistantContentForToolCalls` compat 开关；当前模型配置战术性
+使用该版本已有的 `requiresAssistantAfterToolResult=true`，使这类 message 序列化为 `content: ""`，
+同时由 `requiresReasoningContentOnAssistantMessages` 保留 `reasoning_content`。这个映射并非无副作用：
+若持久历史出现 `toolResult` 后直接接 `user` 的异常邻接，Pi 会在两者之间插入固定 synthetic
+assistant bridge（`I have processed the tool results.`）。正常 tool continuation 不产生该邻接；升级
+Pi 或替换 compat 开关前，序列化回归必须同时锁定 non-null tool-call content、reasoning replay 和
+这项 synthetic bridge 行为，不能把该开关解释为审批、工具执行或其他 authority。
+
 Client 与 agentd socket 断开时会：
 
 1. 停止并解绑本地 TTY 或 Source FD 4 typed input；

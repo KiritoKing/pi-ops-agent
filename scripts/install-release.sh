@@ -25,10 +25,12 @@ readonly BOTMUX_HOME="/var/lib/ops-agent/adapters/botmux"
 readonly APPROVAL_SUDOERS="/etc/sudoers.d/zzzz-ops-agent-approval"
 readonly JSON_CONFIG_HELPER="/usr/lib/ops-agent/agentd-json-config-helper"
 readonly READINESS_TIMEOUT_BIN="/usr/bin/timeout"
+readonly FINDMNT_BIN="/bin/findmnt"
 readonly RECEIPT_ROOT="${CONFIG_ROOT}/broker-receipts"
 readonly RECEIPT_PRIVATE_ROOT="${RECEIPT_ROOT}/private"
 readonly CORE_RECEIPT_KEY_ID="local-core-receipt-v1"
 readonly PVE_RECEIPT_KEY_ID="local-pve-receipt-v1"
+readonly LEGACY_DEFAULT_MODELS_SHA256="e7be604cd6cf42eb40ab6734332b63a7aaad191b2b3d2c2f1a74212e654e3891"
 
 PAYLOAD_DIR="${OPS_AGENT_PAYLOAD_DIR:-}"
 MODE=""
@@ -123,6 +125,177 @@ declare -A TRANSACTION_DIRECTORY_UID=()
 declare -A TRANSACTION_DIRECTORY_GID=()
 declare -A TRANSACTION_DIRECTORY_MODE=()
 
+is_unmodified_legacy_default_models_config() {
+  local path="$1"
+  local expected_group="$2"
+  local digest
+  [[ -f "${path}" ]] && [[ ! -L "${path}" ]] \
+      && [[ "$(stat -c '%U:%G:%a:%h' "${path}")" \
+        == "root:${expected_group}:640:1" ]] || return 1
+  digest="$(sha256sum -- "${path}" | cut -d' ' -f1)" || return 1
+  [[ "${digest}" == "${LEGACY_DEFAULT_MODELS_SHA256}" ]]
+}
+
+ensure_managed_directory() {
+  local path="$1"
+  local expected_owner="$2"
+  local expected_group="$3"
+  local expected_mode="$4"
+  local expected_identity="${expected_owner}:${expected_group}:${expected_mode}"
+  if [[ -L "${path}" ]] || { [[ -e "${path}" ]] && [[ ! -d "${path}" ]]; }; then
+    printf 'Managed directory is not a real directory: %s\n' "${path}" >&2
+    return 1
+  fi
+  if [[ -d "${path}" ]]; then
+    [[ "$(stat -c '%U:%G:%a' "${path}")" == "${expected_identity}" ]] || {
+      printf 'Managed directory has unsafe ownership or mode: %s\n' "${path}" >&2
+      return 1
+    }
+  else
+    # The fixed parent is root-owned. Do not call install -d on an existing
+    # path: it follows a final symlink and would mutate the referent before the
+    # installer had established the managed-directory identity.
+    install -d -o "${expected_owner}" -g "${expected_group}" \
+      -m "0${expected_mode}" "${path}"
+  fi
+  [[ -d "${path}" ]] && [[ ! -L "${path}" ]] \
+      && [[ "$(stat -c '%U:%G:%a' "${path}")" == "${expected_identity}" ]] || {
+    printf 'Managed directory failed post-create verification: %s\n' "${path}" >&2
+    return 1
+  }
+}
+
+install_verified_config_copy() {
+  local source_path="$1"
+  local destination_path="$2"
+  local destination_group="$3"
+  local destination_parent temporary_path
+  destination_parent="$(dirname "${destination_path}")"
+  if [[ -d "${destination_path}" ]] && [[ ! -L "${destination_path}" ]]; then
+    printf 'Managed config destination is unexpectedly a directory: %s\n' \
+      "${destination_path}" >&2
+    return 1
+  fi
+  temporary_path="$(mktemp "${destination_parent}/.${destination_path##*/}.XXXXXX")" \
+    || return 1
+  if ! install -o root -g "${destination_group}" -m 0640 \
+      "${source_path}" "${temporary_path}"; then
+    rm -f -- "${temporary_path}"
+    return 1
+  fi
+  [[ -f "${temporary_path}" ]] && [[ ! -L "${temporary_path}" ]] \
+      && [[ "$(stat -c '%U:%G:%a:%h' "${temporary_path}")" \
+        == "root:${destination_group}:640:1" ]] || {
+    printf 'Staged managed config has unsafe identity or metadata: %s\n' \
+      "${destination_path}" >&2
+    rm -f -- "${temporary_path}"
+    return 1
+  }
+  cmp -s "${source_path}" "${temporary_path}" || {
+    printf 'Staged managed config differs from the verified release source: %s\n' \
+      "${destination_path}" >&2
+    rm -f -- "${temporary_path}"
+    return 1
+  }
+  if ! sync -- "${temporary_path}"; then
+    rm -f -- "${temporary_path}"
+    return 1
+  fi
+  if ! mv -Tf -- "${temporary_path}" "${destination_path}"; then
+    rm -f -- "${temporary_path}"
+    return 1
+  fi
+  # Plain `sync -- FILE` requests fsync(2) semantics for that object. `sync -f`
+  # instead requests the broader syncfs(2) operation for its filesystem; it is
+  # not the narrow file/directory durability primitive required here.
+  if ! sync -- "${destination_parent}"; then
+    return 1
+  fi
+  [[ -f "${destination_path}" ]] && [[ ! -L "${destination_path}" ]] \
+      && [[ "$(stat -c '%U:%G:%a:%h' "${destination_path}")" \
+        == "root:${destination_group}:640:1" ]] \
+      && cmp -s "${source_path}" "${destination_path}" || {
+    printf 'Published managed config failed post-install verification: %s\n' \
+      "${destination_path}" >&2
+    return 1
+  }
+}
+
+install_controller_configs() {
+  local release_dir="$1"
+  local config_name source_config config_group destination_config
+  for config_name in agentd.json models.json; do
+    source_config="${release_dir}/config/${config_name}"
+    [[ -f "${source_config}" ]] || continue
+    config_group="${SERVICE_GROUP}"
+    if [[ "${config_name}" == agentd.json ]]; then
+      config_group="${CLIENT_GROUP}"
+    fi
+    destination_config="${CONFIG_ROOT}/${config_name}"
+    if [[ ! -e "${destination_config}" ]] && [[ ! -L "${destination_config}" ]]; then
+      install_verified_config_copy \
+        "${source_config}" "${destination_config}" "${config_group}" || return 1
+      continue
+    fi
+    [[ -f "${destination_config}" ]] && [[ ! -L "${destination_config}" ]] || {
+      printf 'Managed config is not a regular non-symlink file: %s\n' \
+        "${destination_config}" >&2
+      return 1
+    }
+    [[ "$(stat -c '%U:%G:%a:%h' "${destination_config}")" \
+        == "root:${config_group}:640:1" ]] || {
+      printf 'Managed config has unsafe ownership, mode, or link count: %s\n' \
+        "${destination_config}" >&2
+      return 1
+    }
+    if [[ "${config_name}" == models.json ]] \
+        && is_unmodified_legacy_default_models_config \
+          "${destination_config}" "${config_group}"; then
+      install_verified_config_copy \
+        "${source_config}" "${destination_config}" "${config_group}" || return 1
+      printf '%s\n' \
+        'Migrated the unmodified legacy default models.json to the current verified template.'
+    fi
+    install_verified_config_copy \
+      "${source_config}" "${destination_config}.dist" "${config_group}" || return 1
+  done
+}
+
+refuse_mounts_at_or_below_managed_path() {
+  local path="$1"
+  local mount_targets target
+  local observed_namespace_root=false
+  if ! mount_targets="$("${FINDMNT_BIN}" \
+      --kernel --noheadings --raw --output TARGET)"; then
+    printf 'Could not query kernel mount targets before managing path: %s\n' \
+      "${path}" >&2
+    return 1
+  fi
+  [[ -n "${mount_targets}" ]] || {
+    printf 'Kernel mount target inventory is empty before managing path: %s\n' \
+      "${path}" >&2
+    return 1
+  }
+  while IFS= read -r target; do
+    [[ -n "${target}" ]] || continue
+    if [[ "${target}" == / ]]; then
+      observed_namespace_root=true
+    fi
+    case "${target}" in
+      "${path}"|"${path}/"*)
+        printf 'Refusing to manage %s while mount target %s is at or below it.\n' \
+          "${path}" "${target}" >&2
+        return 1
+        ;;
+    esac
+  done <<<"${mount_targets}"
+  [[ "${observed_namespace_root}" == true ]] || {
+    printf 'Kernel mount target inventory is incomplete before managing path: %s\n' \
+      "${path}" >&2
+    return 1
+  }
+}
+
 remove_managed_path() {
   local path="$1"
   case "${path}" in
@@ -168,6 +341,7 @@ snapshot_managed_path() {
   local path="$1"
   local index="${#TRANSACTION_PATHS[@]}"
   local snapshot="${INSTALL_TRANSACTION_DIR}/paths/${index}"
+  refuse_mounts_at_or_below_managed_path "${path}" || return 1
   TRANSACTION_PATHS+=("${path}")
   install -d -o root -g root -m 0700 "${snapshot}"
   if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
@@ -183,6 +357,11 @@ restore_managed_path_snapshot() {
   local path="${TRANSACTION_PATHS[${index}]}"
   local state="${TRANSACTION_PATH_STATES[${index}]}"
   local snapshot="${INSTALL_TRANSACTION_DIR}/paths/${index}/value"
+  if ! refuse_mounts_at_or_below_managed_path "${path}"; then
+    record_rollback_error \
+      "refused to clear ${path} because its mount-free state could not be proven"
+    return
+  fi
   remove_managed_path "${path}" \
     || { record_rollback_error "could not clear ${path}"; return; }
   if [[ "${state}" == present ]]; then
@@ -532,6 +711,7 @@ begin_install_transaction() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   quiesce_install_ingress
+  refuse_mounts_at_or_below_managed_path "${CONFIG_ROOT}"
   snapshot_managed_path "${CONFIG_ROOT}"
   snapshot_managed_path "${CURRENT_LINK}"
   snapshot_managed_path "${JSON_CONFIG_HELPER}"
@@ -1038,7 +1218,7 @@ if [[ "${MODE}" == init ]] && ((${#ENABLED_ARTIFACTS[@]} > 0)); then
   "${preflight_node}" "${preflight_initializer}" "${preflight_args[@]}" >/dev/null
 fi
 
-required_commands=(systemctl systemd-tmpfiles busctl getent groupadd groupdel useradd userdel usermod install cp cmp mv ln readlink mktemp stat wc openssl sed tr cut grep find sleep diff dirname sort paste)
+required_commands=(systemctl systemd-tmpfiles busctl getent groupadd groupdel useradd userdel usermod install cp cmp mv ln readlink mktemp stat wc openssl sed tr cut grep find sleep sync diff dirname sort paste)
 if [[ "${MODE}" == init ]]; then
   required_commands+=(gpasswd bwrap sha256sum hostname runuser sudo visudo)
 fi
@@ -1048,6 +1228,12 @@ for required_command in "${required_commands[@]}"; do
     exit 1
   }
 done
+if [[ ! -f "${FINDMNT_BIN}" ]] || [[ -L "${FINDMNT_BIN}" ]] \
+    || [[ ! -x "${FINDMNT_BIN}" ]] \
+    || [[ "$(stat -c '%U:%G:%a:%h' "${FINDMNT_BIN}")" != "root:root:755:1" ]]; then
+  printf 'Pi Ops Agent requires fixed root-owned /bin/findmnt with mode 0755.\n' >&2
+  exit 1
+fi
 if [[ "${MODE}" == init ]] \
     && { [[ ! -x /usr/bin/env ]] || [[ ! -x /usr/bin/sudo ]] || [[ ! -x /usr/bin/bwrap ]] \
       || [[ ! -x "${READINESS_TIMEOUT_BIN}" ]]; }; then
@@ -1214,6 +1400,12 @@ if [[ "${MODE}" == join ]]; then
   done
 fi
 
+# Reject before quiesce, account reconciliation, or any managed mutation. The
+# transaction repeats this query immediately before the config snapshot, and
+# rollback repeats it before any recursive clear. A concurrent CAP_SYS_ADMIN
+# mount change between those kernel observations remains outside this Release's
+# threat model.
+refuse_mounts_at_or_below_managed_path "${CONFIG_ROOT}"
 begin_install_transaction
 
 validate_existing_group_members() {
@@ -1600,31 +1792,10 @@ if [[ "${MODE}" == join ]] && [[ "${EXISTING_ENDPOINT_ENROLLMENT}" == true ]]; t
     --controller-ca-sha256 "${CONTROLLER_CA_SHA256}"
 fi
 
-install -d -o root -g root -m 0755 "${CONFIG_ROOT}"
+ensure_managed_directory "${CONFIG_ROOT}" root root 755
 if [[ "${MODE}" == init ]]; then
-  install -d -o root -g root -m 0700 "${CONFIG_ROOT}/credentials"
-  for config_name in agentd.json models.json; do
-    source_config="${release_dir}/config/${config_name}"
-    [[ -f "${source_config}" ]] || continue
-    config_group="${SERVICE_GROUP}"
-    if [[ "${config_name}" == agentd.json ]]; then
-      config_group="${CLIENT_GROUP}"
-    fi
-    if [[ ! -e "${CONFIG_ROOT}/${config_name}" ]]; then
-      install -o root -g "${config_group}" -m 0640 \
-        "${source_config}" "${CONFIG_ROOT}/${config_name}"
-    else
-      [[ -f "${CONFIG_ROOT}/${config_name}" ]] && [[ ! -L "${CONFIG_ROOT}/${config_name}" ]] || {
-        printf 'Managed config is not a regular non-symlink file: %s\n' \
-          "${CONFIG_ROOT}/${config_name}" >&2
-        exit 1
-      }
-      chown root:"${config_group}" "${CONFIG_ROOT}/${config_name}"
-      chmod 0640 "${CONFIG_ROOT}/${config_name}"
-      install -o root -g "${config_group}" -m 0640 \
-        "${source_config}" "${CONFIG_ROOT}/${config_name}.dist"
-    fi
-  done
+  ensure_managed_directory "${CONFIG_ROOT}/credentials" root root 700
+  install_controller_configs "${release_dir}"
 
   agent_uid="$(id -u "${SERVICE_USER}")"
   agent_gid="$(getent group "${SERVICE_GROUP}" | cut -d: -f3)"

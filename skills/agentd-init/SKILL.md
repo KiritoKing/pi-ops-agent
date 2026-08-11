@@ -362,6 +362,40 @@ Use the current artifact names from the architecture document. Verify all applic
   Defaults, malformed hostnames, command listings, oversized output, or any extra prose.
 - `agentd-server` requires HTTPS/mTLS and exposes only current policy capabilities.
 - The TUI creates an isolated session; model-visible input cannot approve, reject, or roll back.
+- Exercise the production model-turn deadline with a deterministic OpenAI-compatible fixture that
+  returns `200` SSE headers and then keeps the body alive without a terminal event. The fixed
+  180-second absolute deadline must not reset on bytes, keep-alive, Pi retry, compaction, or queued
+  continuation; provider-level retries remain exactly zero. Require exactly one session abort and
+  do not emit `done`, clear correlation, accept another turn, or replay the prompt until that abort
+  Promise proves Pi idle. Also inject an abort that rejects and one that remains pending beyond the
+  10-second grace: both must use fixed non-provider error text, poison the Session, and invoke the
+  production fatal path so systemd starts a fresh agentd. Tests must inject a non-exiting fatal hook;
+  never weaken the production fail-stop callback or substitute async audit completion for exit.
+- Exercise the real backend Unix socket with a prompt that never settles, then disconnect while its
+  abort rejects and while it hangs. Strict hello parsing must synchronously reserve the canonical
+  backend Session ID before asynchronous open. Cleanup must reuse the exact per-turn abort latch and
+  require both Pi idle and prompt-wrapper quiescence inside the 10-second disconnect grace. With an
+  injected non-exiting fatal hook, the same Session ID must remain reserved and must not open or
+  prompt a new Session; a different Session ID must remain usable. Also disconnect during the outer
+  binding/reload/audit awaits and prove no Pi prompt starts after closing. Only explicit open failure or a
+  safely resolved `OpsSession.close()` may compare-delete the matching opaque reservation token.
+  After a production fatal restart, query authoritative broker status before new input and never
+  automatically replay the interrupted prompt.
+  Pin Pi `0.84.1`'s synchronous `preflightResult(true)` contract in a fake internal-preflight gate:
+  cancellation before commit must throw before the main `_runAgentPrompt`, start none of that run's
+  tools, and call Pi abort zero times; cancellation after commit must call Pi abort exactly once. Preflight rejection
+  must finish safely with zero abort, while hung preflight must exhaust disconnect grace and retain
+  the reservation. Repeat with the absolute deadline firing during preflight: raw prompt rejection
+  must release the latch through its separate finished signal and return the fixed timeout without
+  invoking the fatal hook; disconnect must still await the outer prompt wrapper before safe release.
+  Also pin the installed Pi source ordering: `_checkCompaction(lastAssistant, false)` precedes the
+  final `preflightResult(true)`, which immediately precedes `_runAgentPrompt(messages)`. The source-
+  anchored fixture proves this Release's containment assumption but does not execute a real model
+  compaction. Record that auto pre-compaction may already use the model and update session history;
+  it must finish within the same disconnect/deadline grace or trigger fail-stop while the process-wide
+  Session reservation remains held. Repeat this with a real forced auto-compaction fixture when the
+  pinned SDK exposes a stable injectable compaction harness; until then, do not claim zero model
+  traffic before the commit hook.
 - A legacy status is marked `recoveryOnly=true` with no live plan only when the broker can strictly
   parse the stored operation and reproduce its exact v0.1/v0.2 NUL-prefixed plan hash. Verify an
   arbitrary canonical-plan mismatch fails closed and approve is always refused; pending changes can
@@ -448,3 +482,27 @@ failure-injection stages on an isolated systemd test host for upgrade smoke; if 
 incomplete recovery, preserve its transaction evidence and never call the partial deployment
 successful. Service activation happens after commit, so a post-commit start/health failure is a
 degraded installed release to diagnose, not permission to overwrite live state with the old tree.
+For the versioned default DeepSeek catalog migration, first hash and stat the active `models.json`
+without reading credentials. Require the exact known legacy-template digest plus root ownership,
+the service group, mode `0640`, a regular non-symlink file and link count one before automatic
+migration. Exercise exact-old migration, one-byte-custom preservation with a refreshed `.dist`,
+new-file installation, hard-link and active-config symlink rejection, and config-stage rollback.
+Before any config-root mutation, exercise an existing `/etc/ops-agent` symlink and an existing
+`credentials` symlink and prove their referent bytes and mode did not change; safely absent directories
+must be created and post-verified, while existing directories require exact owner/group/mode without
+repair. The atomic publish must use narrow file and directory fsync, not filesystem-wide `sync -f`.
+Extract and execute the production `/bin/findmnt --kernel --noheadings --raw --output TARGET`
+guard with fixture inventories. Require namespace root `/`; reject query failure, empty or rootless
+output, the exact config root, and every directory or file target below it, including `credentials`
+and `models.json`; accept ancestor mounts and false prefixes such as `/etc/ops-agent-old`. Assert the
+config-root guard runs before the transaction, then prove every `snapshot_managed_path` invocation
+guards its own path before copy and every restore guards before recursive delete. Repeat the executable
+fixture with at least one non-config managed tree such as the plugin registry, including exact,
+descendant, and false-prefix targets. Inject new config and non-config descendant mounts in rollback
+inventories and prove the delete primitive was never called and rollback was marked incomplete. Do not
+claim the fixture proves live mount behavior: later candidate validation must repeat these cases in a disposable
+Linux mount namespace with root, bind mounts, sentinel bytes/modes, and guaranteed unmount cleanup.
+After commit, load the installed active path
+through the pinned Pi `ModelRuntime` and verify its serialized request uses `max_tokens`, mapped
+reasoning effort, non-null tool-call assistant content, and preserved `reasoning_content`; a test
+that reads only the repository template does not prove an upgraded host was migrated.

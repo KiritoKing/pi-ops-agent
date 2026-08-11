@@ -53,6 +53,33 @@ review request 或用户意图。
 | Plugin | 严格 manifest、源码 tree limit、digest、不可变 snapshot、scope grant；独立非 root lease broker 以 `SO_PEERCRED` 绑定 runtime UID/plugin class，client 不可读 lock | 已批准 plugin 代码仍可能恶意；lease broker compromise 可阻塞更新但不能批准或取得 root |
 | Recovery | 写前准备、fsync mutation barrier、验证、自动回滚或 `RECOVERY_REQUIRED` | package/service/PVE 等操作不都是完整事务 |
 
+模型 provider 的 `200` response headers 或持续 SSE keep-alive 都不是进度/完成证据。agentd 对每个
+Pi turn 使用固定 180 秒 absolute monotonic deadline，显式关闭 OpenAI-compatible provider 内层 retry，
+且不允许 token、keep-alive、Pi 串行 retry 或 compaction 延长总时限。deadline 后必须先以一次
+`AgentSession.abort()` 取得 idle completion barrier，随后才可清除 turn correlation 或向 Client 返回
+固定 timeout error；迟到的 `agent_settled` 不可转成 `done`。abort 立即拒绝或 10 秒 grace 到期都表示
+旧执行是否仍在运行不可证明，必须 poison Session 并让 agentd fail-stop/systemd restart，不能在同一
+进程中自动重放 prompt 或接受下一个 turn。
+
+backend `hello` 的 canonical `SessionId` 另受 agentd 进程内 opaque-token reservation 保护；reservation
+从 strict hello 解析后、异步 open 之前开始，贯穿 active turn 与 disconnect cleanup。断连不会直接
+`dispose()` 或释放名字：cleanup 必须复用 active turn 的同一 abort latch，并在 10 秒内同时取得 Pi
+idle barrier 与 prompt wrapper quiescence；只有该证明或明确 open failure 才能 compare-delete 原 token。
+abort 拒绝、hang 或 wrapper 未静止都会一次性 poison/fail-stop 并保留 reservation，所以 external gateway
+释放 writer 后也不能让旧 provider/tool 与新同名 Session 在同一 agentd 进程并发。这个 reservation
+不是跨进程锁；fatal recovery 依靠 systemd 的新进程，并且恢复后仍须先查询 broker 权威状态，不能自动
+重放旧 prompt。
+
+`AgentSession.abort()` 在 Pi internal preflight 尚未提交时会因 idle 立即 resolve，不能单独作为取消
+证明。agentd 因而绑定 pinned Pi `preflightResult(true)` 同步 callback：若 close/manual abort/deadline
+已经请求，callback 在 `_runAgentPrompt()` 前抛错并阻止 main agent run 及其工具、同时保持零 Pi abort；
+否则先不可逆标记 committed，Pi 在同一同步栈进入 active run，随后共享 latch 才能调用 abort。该 callback
+晚于 pinned Pi 的 `_checkCompaction()`，所以 auto pre-compaction 可能已经使用模型并产生 compaction
+history；这里只能把它约束在同一 grace 和 Session reservation 内，不能声称零模型流量。raw Pi prompt
+resolve/reject 使用独立 finished signal，避免 deadline 等 latch、latch 又等外围 wrapper 的循环；如果
+pre-compaction 没在 grace 内结束则 fail-stop 并保留 reservation。disconnect close 仍要求外围 wrapper
+quiescence，不能用 raw finished 直接释放 Session reservation，也不能自动重放旧 prompt。
+
 ### systemd effective 配置也是安全边界
 
 Repository 内的 base unit 不是 PID 1 最终执行配置的充分证据。systemd 会合并 distribution、container

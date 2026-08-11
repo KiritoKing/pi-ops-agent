@@ -1,7 +1,9 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -1434,6 +1436,549 @@ describe("installed client-plane isolation", () => {
     expect(enrollment).toContain('remoteReceiptFolder = "remotes"');
   });
 
+  it("migrates only the exact unmodified legacy default model catalog", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const legacyDefault = `{
+  "providers": {
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "reasoning": true,
+          "input": ["text"]
+        }
+      ]
+    }
+  }
+}
+`;
+    const legacyDigest = createHash("sha256").update(legacyDefault).digest("hex");
+    expect(legacyDigest).toBe(
+      "e7be604cd6cf42eb40ab6734332b63a7aaad191b2b3d2c2f1a74212e654e3891",
+    );
+    expect(installer).toContain(
+      `readonly LEGACY_DEFAULT_MODELS_SHA256="${legacyDigest}"`,
+    );
+
+    const bashFunction = (name: string): string => {
+      const match = installer.match(new RegExp(
+        `^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}\\n`,
+        "mu",
+      ));
+      expect(match?.[0], `${name} must be a top-level executable helper`).toBeDefined();
+      if (match?.[0] === undefined) throw new Error(`missing ${name}`);
+      return match[0];
+    };
+    const productionFunctions = [
+      "is_unmodified_legacy_default_models_config",
+      "ensure_managed_directory",
+      "install_verified_config_copy",
+      "install_controller_configs",
+      "refuse_mounts_at_or_below_managed_path",
+      "remove_managed_path",
+      "snapshot_managed_path",
+      "restore_managed_path_snapshot",
+      "maybe_inject_install_failure",
+    ].map(bashFunction).join("\n");
+    const configStart = installer.indexOf("install_controller_configs() {");
+    const configEnd = installer.indexOf("\n}\n", configStart) + 3;
+    const configInstall = installer.slice(configStart, configEnd);
+    expect(configInstall).toContain(
+      `== "root:\${config_group}:640:1"`,
+    );
+    expect(configInstall).toContain("is_unmodified_legacy_default_models_config");
+    expect(configInstall).toContain('"${destination_config}.dist" "${config_group}"');
+    expect(installer).toContain('sync -- "${temporary_path}"');
+    expect(installer).toContain('sync -- "${destination_parent}"');
+    expect(installer).not.toMatch(/^\s*sync\s+-f(?:\s|$)/mu);
+    expect(installer.indexOf('snapshot_managed_path "${CONFIG_ROOT}"')).toBeLessThan(
+      installer.indexOf('install_controller_configs "${release_dir}"'),
+    );
+    expect(installer.indexOf('install_controller_configs "${release_dir}"')).toBeLessThan(
+      installer.indexOf("maybe_inject_install_failure config"),
+    );
+
+    const harness = [
+      "set -euo pipefail",
+      'CONFIG_ROOT="$1"',
+      'release_dir="$2"',
+      'TEST_UNSAFE_PATH="$3"',
+      'SYNC_LOG="$4"',
+      'ACTION="$5"',
+      'INSTALL_TRANSACTION_DIR="$6"',
+      'FINDMNT_BIN="$7"',
+      'readonly SERVICE_GROUP="ops-agent"',
+      'readonly CLIENT_GROUP="ops-agent-client"',
+      `readonly LEGACY_DEFAULT_MODELS_SHA256="${legacyDigest}"`,
+      'readonly CURRENT_LINK="/test/current"',
+      'readonly JSON_CONFIG_HELPER="/test/json-config-helper"',
+      'readonly TMPFILES_ROOT="/test/tmpfiles"',
+      'readonly APPROVAL_SUDOERS="/test/sudoers"',
+      'readonly UNIT_ROOT="/test/systemd"',
+      'readonly RUNTIME_UNIT_ROOT="/test/run-systemd"',
+      "install() {",
+      "  local make_directory=false mode=0755 value",
+      "  local -a operands=()",
+      "  while (( $# > 0 )); do",
+      "    case \"$1\" in",
+      "      -d) make_directory=true; shift ;;",
+      "      -o|-g) shift 2 ;;",
+      "      -m) mode=\"$2\"; shift 2 ;;",
+      "      --) shift ;;",
+      "      *) operands+=(\"$1\"); shift ;;",
+      "    esac",
+      "  done",
+      "  if [[ \"${make_directory}\" == true ]]; then",
+      "    for value in \"${operands[@]}\"; do /bin/mkdir -p \"${value}\"; /bin/chmod \"${mode}\" \"${value}\"; done",
+      "  else",
+      "    /usr/bin/install -m \"${mode}\" \"${operands[0]}\" \"${operands[1]}\"",
+      "  fi",
+      "}",
+      "stat() {",
+      "  local format= path= value",
+      "  while (( $# > 0 )); do",
+      "    case \"$1\" in -c) format=\"$2\"; shift 2 ;; --) shift ;; *) path=\"$1\"; shift ;; esac",
+      "  done",
+      "  case \"${format}\" in",
+      "    %U:%G:%a)",
+      "      if [[ -n \"${TEST_UNSAFE_PATH}\" && \"${path}\" == \"${TEST_UNSAFE_PATH}\" ]]; then",
+      "        if [[ \"${path}\" == */credentials ]]; then value=nobody:root:700; else value=root:root:777; fi;",
+      "      elif [[ \"${path}\" == \"${CONFIG_ROOT}\" ]]; then value=root:root:755;",
+      "      elif [[ \"${path}\" == \"${CONFIG_ROOT}/credentials\" ]]; then value=root:root:700;",
+      "      else value=root:root:755; fi ;;",
+      "    %U:%G:%a:%h)",
+      "      if [[ -n \"${TEST_UNSAFE_PATH}\" && \"${path}\" == \"${TEST_UNSAFE_PATH}\" ]]; then value=root:ops-agent:640:2;",
+      "      elif [[ \"${path##*/}\" == *agentd.json* ]]; then value=root:ops-agent-client:640:1;",
+      "      else value=root:ops-agent:640:1; fi ;;",
+      "    *) printf 'unexpected stat format: %s\\n' \"${format}\" >&2; return 1 ;;",
+      "  esac",
+      "  printf '%s\\n' \"${value}\"",
+      "}",
+      "sha256sum() { while (( $# > 1 )); do shift; done; /usr/bin/shasum -a 256 \"$1\"; }",
+      "sync() { printf '%s\\n' \"$*\" >>\"${SYNC_LOG}\"; }",
+      "mv() { while (( $# > 2 )); do shift; done; /bin/mv -f \"$1\" \"$2\"; }",
+      "cp() { while (( $# > 2 )); do shift; done; /bin/cp -a \"$1\" \"$2\"; }",
+      "record_rollback_error() { printf 'rollback error: %s\\n' \"$1\" >&2; return 1; }",
+      productionFunctions,
+      "case \"${ACTION}\" in",
+      "  run)",
+      "    ensure_managed_directory \"${CONFIG_ROOT}\" root root 755",
+      "    ensure_managed_directory \"${CONFIG_ROOT}/credentials\" root root 700",
+      "    install_controller_configs \"${release_dir}\" ;;",
+      "  ensure-root) ensure_managed_directory \"${CONFIG_ROOT}\" root root 755 ;;",
+      "  rollback)",
+      "    TRANSACTION_PATHS=()",
+      "    TRANSACTION_PATH_STATES=()",
+      "    snapshot_managed_path \"${CONFIG_ROOT}\"",
+      "    ensure_managed_directory \"${CONFIG_ROOT}\" root root 755",
+      "    ensure_managed_directory \"${CONFIG_ROOT}/credentials\" root root 700",
+      "    install_controller_configs \"${release_dir}\"",
+      "    if OPS_AGENT_TEST_FAIL_AT=config maybe_inject_install_failure config; then exit 98; else injected_status=$?; fi",
+      "    [[ \"${injected_status}\" == 97 ]]",
+      "    restore_managed_path_snapshot 0 ;;",
+      "  *) exit 99 ;;",
+      "esac",
+    ].join("\n");
+
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "ops-agent-model-migration-"));
+    const releaseDir = join(root, "release");
+    const currentModels = repositoryFile("config/models.json");
+    const currentAgentd = repositoryFile("config/agentd.json");
+    const findmntFixture = join(root, "findmnt-fixture");
+    mkdirSync(join(releaseDir, "config"), { recursive: true });
+    writeFileSync(join(releaseDir, "config", "models.json"), currentModels, { mode: 0o640 });
+    writeFileSync(join(releaseDir, "config", "agentd.json"), currentAgentd, { mode: 0o640 });
+    writeFileSync(findmntFixture, [
+      "#!/bin/bash",
+      "[[ \"$*\" == \"--kernel --noheadings --raw --output TARGET\" ]] || exit 64",
+      "printf '/\\n'",
+    ].join("\n"), { mode: 0o755 });
+    chmodSync(findmntFixture, 0o755);
+    const run = (
+      configRoot: string,
+      action = "run",
+      unsafePath = "",
+    ): SpawnSyncReturns<string> => {
+      const syncLog = join(root, `sync-${Math.random().toString(16).slice(2)}.log`);
+      writeFileSync(syncLog, "");
+      const transaction = join(root, `transaction-${Math.random().toString(16).slice(2)}`);
+      return spawnSync(
+        "/bin/bash",
+        [
+          "-c", harness, "config-loop", configRoot, releaseDir, unsafePath, syncLog,
+          action, transaction, findmntFixture,
+        ],
+        { encoding: "utf8" },
+      );
+    };
+    try {
+      const freshRoot = join(root, "fresh");
+      const fresh = run(freshRoot);
+      expect(fresh.status, `${fresh.stdout}${fresh.stderr}`).toBe(0);
+      expect(readFileSync(join(freshRoot, "models.json"), "utf8")).toBe(currentModels);
+      expect(readFileSync(join(freshRoot, "agentd.json"), "utf8")).toBe(currentAgentd);
+      expect(existsSync(join(freshRoot, "models.json.dist"))).toBe(false);
+      expect(lstatSync(freshRoot).mode & 0o777).toBe(0o755);
+      expect(lstatSync(join(freshRoot, "credentials")).mode & 0o777).toBe(0o700);
+
+      const legacyRoot = join(root, "legacy");
+      mkdirSync(join(legacyRoot, "credentials"), { recursive: true, mode: 0o700 });
+      chmodSync(legacyRoot, 0o755);
+      writeFileSync(join(legacyRoot, "models.json"), legacyDefault, { mode: 0o640 });
+      const legacy = run(legacyRoot);
+      expect(legacy.status, `${legacy.stdout}${legacy.stderr}`).toBe(0);
+      expect(legacy.stdout).toContain("Migrated the unmodified legacy default models.json");
+      expect(readFileSync(join(legacyRoot, "models.json"), "utf8")).toBe(currentModels);
+      expect(readFileSync(join(legacyRoot, "models.json.dist"), "utf8")).toBe(currentModels);
+
+      const customRoot = join(root, "custom");
+      const customModels = `${legacyDefault} `;
+      mkdirSync(join(customRoot, "credentials"), { recursive: true, mode: 0o700 });
+      chmodSync(customRoot, 0o755);
+      writeFileSync(join(customRoot, "models.json"), customModels, { mode: 0o640 });
+      const custom = run(customRoot);
+      expect(custom.status, `${custom.stdout}${custom.stderr}`).toBe(0);
+      expect(readFileSync(join(customRoot, "models.json"), "utf8")).toBe(customModels);
+      expect(readFileSync(join(customRoot, "models.json.dist"), "utf8")).toBe(currentModels);
+
+      const hardlinkRoot = join(root, "hardlink");
+      mkdirSync(join(hardlinkRoot, "credentials"), { recursive: true, mode: 0o700 });
+      chmodSync(hardlinkRoot, 0o755);
+      const hardlinkModels = join(hardlinkRoot, "models.json");
+      writeFileSync(hardlinkModels, legacyDefault, { mode: 0o640 });
+      linkSync(hardlinkModels, join(hardlinkRoot, "models-hardlink.json"));
+      const hardlink = run(hardlinkRoot, "run", hardlinkModels);
+      expect(hardlink.status).not.toBe(0);
+      expect(hardlink.stderr).toContain("unsafe ownership, mode, or link count");
+      expect(readFileSync(hardlinkModels, "utf8")).toBe(legacyDefault);
+      expect(existsSync(join(hardlinkRoot, "models.json.dist"))).toBe(false);
+
+      const symlinkRoot = join(root, "symlink-config");
+      const symlinkReferent = join(root, "symlink-config-referent.json");
+      mkdirSync(join(symlinkRoot, "credentials"), { recursive: true, mode: 0o700 });
+      chmodSync(symlinkRoot, 0o755);
+      writeFileSync(symlinkReferent, legacyDefault, { mode: 0o640 });
+      symlinkSync(symlinkReferent, join(symlinkRoot, "models.json"));
+      const symlinkConfig = run(symlinkRoot);
+      expect(symlinkConfig.status).not.toBe(0);
+      expect(symlinkConfig.stderr).toContain("regular non-symlink file");
+      expect(readFileSync(symlinkReferent, "utf8")).toBe(legacyDefault);
+      expect(existsSync(join(symlinkRoot, "models.json.dist"))).toBe(false);
+
+      const rootReferent = join(root, "config-root-referent");
+      const rootSymlink = join(root, "config-root-link");
+      mkdirSync(rootReferent, { mode: 0o755 });
+      writeFileSync(join(rootReferent, "sentinel"), "unchanged\n");
+      const rootReferentMode = lstatSync(rootReferent).mode & 0o777;
+      symlinkSync(rootReferent, rootSymlink);
+      const unsafeRoot = run(rootSymlink, "ensure-root");
+      expect(unsafeRoot.status).not.toBe(0);
+      expect(unsafeRoot.stderr).toContain("not a real directory");
+      expect(readdirSync(rootReferent)).toEqual(["sentinel"]);
+      expect(readFileSync(join(rootReferent, "sentinel"), "utf8")).toBe("unchanged\n");
+      expect(lstatSync(rootReferent).mode & 0o777).toBe(rootReferentMode);
+
+      const wrongModeRoot = join(root, "wrong-mode-root");
+      mkdirSync(wrongModeRoot, { mode: 0o755 });
+      writeFileSync(join(wrongModeRoot, "sentinel"), "unchanged\n");
+      const wrongMode = run(wrongModeRoot, "ensure-root", wrongModeRoot);
+      expect(wrongMode.status).not.toBe(0);
+      expect(wrongMode.stderr).toContain("unsafe ownership or mode");
+      expect(readFileSync(join(wrongModeRoot, "sentinel"), "utf8")).toBe("unchanged\n");
+      expect(existsSync(join(wrongModeRoot, "credentials"))).toBe(false);
+
+      const credentialRoot = join(root, "credential-link-root");
+      const credentialReferent = join(root, "credential-referent");
+      mkdirSync(credentialRoot, { mode: 0o755 });
+      mkdirSync(credentialReferent, { mode: 0o700 });
+      writeFileSync(join(credentialReferent, "sentinel"), "unchanged\n");
+      const credentialReferentMode = lstatSync(credentialReferent).mode & 0o777;
+      symlinkSync(credentialReferent, join(credentialRoot, "credentials"));
+      const unsafeCredentials = run(credentialRoot);
+      expect(unsafeCredentials.status).not.toBe(0);
+      expect(unsafeCredentials.stderr).toContain("not a real directory");
+      expect(readdirSync(credentialReferent)).toEqual(["sentinel"]);
+      expect(readFileSync(join(credentialReferent, "sentinel"), "utf8")).toBe("unchanged\n");
+      expect(lstatSync(credentialReferent).mode & 0o777).toBe(credentialReferentMode);
+      expect(existsSync(join(credentialRoot, "models.json"))).toBe(false);
+
+      const wrongCredentialRoot = join(root, "wrong-credential-owner");
+      const wrongCredentialPath = join(wrongCredentialRoot, "credentials");
+      mkdirSync(wrongCredentialPath, { recursive: true, mode: 0o700 });
+      chmodSync(wrongCredentialRoot, 0o755);
+      writeFileSync(join(wrongCredentialPath, "sentinel"), "unchanged\n");
+      const wrongCredential = run(wrongCredentialRoot, "run", wrongCredentialPath);
+      expect(wrongCredential.status).not.toBe(0);
+      expect(wrongCredential.stderr).toContain("unsafe ownership or mode");
+      expect(readFileSync(join(wrongCredentialPath, "sentinel"), "utf8"))
+        .toBe("unchanged\n");
+      expect(existsSync(join(wrongCredentialRoot, "models.json"))).toBe(false);
+
+      const rollbackRoot = join(root, "rollback");
+      const oldAgentd = '{"custom":true}\n';
+      mkdirSync(join(rollbackRoot, "credentials"), { recursive: true, mode: 0o700 });
+      chmodSync(rollbackRoot, 0o755);
+      writeFileSync(join(rollbackRoot, "credentials", "sentinel"), "secret-state\n", { mode: 0o600 });
+      writeFileSync(join(rollbackRoot, "agentd.json"), oldAgentd, { mode: 0o640 });
+      writeFileSync(join(rollbackRoot, "models.json"), legacyDefault, { mode: 0o640 });
+      const beforeRoot = lstatSync(rollbackRoot);
+      const beforeModels = lstatSync(join(rollbackRoot, "models.json"));
+      const rollback = run(rollbackRoot, "rollback");
+      expect(rollback.status, `${rollback.stdout}${rollback.stderr}`).toBe(0);
+      expect(rollback.stderr).toContain("Injected install failure after stage config");
+      expect(readFileSync(join(rollbackRoot, "agentd.json"), "utf8")).toBe(oldAgentd);
+      expect(readFileSync(join(rollbackRoot, "models.json"), "utf8")).toBe(legacyDefault);
+      expect(readFileSync(join(rollbackRoot, "credentials", "sentinel"), "utf8"))
+        .toBe("secret-state\n");
+      expect(existsSync(join(rollbackRoot, "agentd.json.dist"))).toBe(false);
+      expect(existsSync(join(rollbackRoot, "models.json.dist"))).toBe(false);
+      const afterRoot = lstatSync(rollbackRoot);
+      const afterModels = lstatSync(join(rollbackRoot, "models.json"));
+      expect([afterRoot.uid, afterRoot.gid, afterRoot.mode & 0o777])
+        .toEqual([beforeRoot.uid, beforeRoot.gid, beforeRoot.mode & 0o777]);
+      expect([afterModels.uid, afterModels.gid, afterModels.mode & 0o777])
+        .toEqual([beforeModels.uid, beforeModels.gid, beforeModels.mode & 0o777]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses mounts below every snapshotted path before copy and rollback deletion", () => {
+    const installer = repositoryFile("scripts/install-release.sh");
+    const bashFunction = (name: string): string => {
+      const match = installer.match(new RegExp(
+        `^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}\\n`,
+        "mu",
+      ));
+      expect(match?.[0], `${name} must be a top-level executable helper`).toBeDefined();
+      if (match?.[0] === undefined) throw new Error(`missing ${name}`);
+      return match[0];
+    };
+    const mountGuard = bashFunction("refuse_mounts_at_or_below_managed_path");
+    const snapshot = bashFunction("snapshot_managed_path");
+    const restore = bashFunction("restore_managed_path_snapshot");
+    const begin = bashFunction("begin_install_transaction");
+    expect(installer).toContain('readonly FINDMNT_BIN="/bin/findmnt"');
+    expect(installer).toContain(
+      `[[ "$(stat -c '%U:%G:%a:%h' "\${FINDMNT_BIN}")" != "root:root:755:1" ]]`,
+    );
+    expect(mountGuard).toContain(
+      '"${FINDMNT_BIN}" \\\n      --kernel --noheadings --raw --output TARGET',
+    );
+    expect(mountGuard).not.toContain("--list");
+    expect(mountGuard).toContain('[[ "${target}" == / ]]');
+    expect(mountGuard).toContain('"${path}"|"${path}/"*');
+    expect(snapshot.indexOf("refuse_mounts_at_or_below_managed_path"))
+      .toBeLessThan(snapshot.indexOf("cp -a --no-dereference"));
+    expect(snapshot).not.toContain('"${path}" == "${CONFIG_ROOT}"');
+    expect(restore.indexOf("refuse_mounts_at_or_below_managed_path"))
+      .toBeLessThan(restore.indexOf('remove_managed_path "${path}"'));
+    expect(restore).not.toContain('"${path}" == "${CONFIG_ROOT}"');
+    expect(begin.indexOf('refuse_mounts_at_or_below_managed_path "${CONFIG_ROOT}"'))
+      .toBeLessThan(begin.indexOf('snapshot_managed_path "${CONFIG_ROOT}"'));
+    const beginCall = installer.indexOf("\nbegin_install_transaction\n");
+    const preflightCall = installer.lastIndexOf(
+      '\nrefuse_mounts_at_or_below_managed_path "${CONFIG_ROOT}"\n',
+      beginCall,
+    );
+    expect(preflightCall).toBeGreaterThan(0);
+    expect(preflightCall).toBeLessThan(beginCall);
+
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "ops-agent-mount-guard-"));
+    const findmntFixture = join(root, "findmnt-fixture");
+    writeFileSync(findmntFixture, [
+      "#!/bin/bash",
+      "[[ \"$*\" == \"--kernel --noheadings --raw --output TARGET\" ]] || exit 64",
+      "[[ \"${FINDMNT_TEST_MODE:-ok}\" != fail ]] || exit 42",
+      "printf '%s' \"${FINDMNT_TEST_INVENTORY:-}\"",
+    ].join("\n"), { mode: 0o755 });
+    chmodSync(findmntFixture, 0o755);
+    const managedPath = "/etc/ops-agent";
+    const runGuard = (
+      inventory: string,
+      mode = "ok",
+      path = managedPath,
+    ): SpawnSyncReturns<string> => spawnSync(
+      "/bin/bash",
+      [
+        "-c",
+        [
+          "set -euo pipefail",
+          'CONFIG_ROOT="$1"',
+          'FINDMNT_BIN="$2"',
+          mountGuard,
+          'refuse_mounts_at_or_below_managed_path "${CONFIG_ROOT}"',
+        ].join("\n"),
+        "mount-guard",
+        path,
+        findmntFixture,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FINDMNT_TEST_INVENTORY: inventory,
+          FINDMNT_TEST_MODE: mode,
+        },
+      },
+    );
+    try {
+      for (const inventory of [
+        "/\n",
+        "/\n/etc\n",
+        "/\n/etc/ops-agent-old\n",
+      ]) {
+        const allowed = runGuard(inventory);
+        expect(allowed.status, `${allowed.stdout}${allowed.stderr}`).toBe(0);
+      }
+      for (const target of [
+        managedPath,
+        `${managedPath}/credentials`,
+        `${managedPath}/models.json`,
+      ]) {
+        const refused = runGuard(`/\n${target}\n`);
+        expect(refused.status).not.toBe(0);
+        expect(refused.stderr).toContain("is at or below it");
+      }
+      const queryFailure = runGuard("/\n", "fail");
+      expect(queryFailure.status).not.toBe(0);
+      expect(queryFailure.stderr).toContain("Could not query kernel mount targets");
+      const empty = runGuard("");
+      expect(empty.status).not.toBe(0);
+      expect(empty.stderr).toContain("inventory is empty");
+      const noNamespaceRoot = runGuard("/proc\n/sys\n");
+      expect(noNamespaceRoot.status).not.toBe(0);
+      expect(noNamespaceRoot.stderr).toContain("inventory is incomplete");
+
+      const pluginRegistry = "/var/lib/ops-agent/plugins";
+      const unrelatedPluginPrefix = runGuard(
+        "/\n/var/lib/ops-agent/plugins-old\n",
+        "ok",
+        pluginRegistry,
+      );
+      expect(
+        unrelatedPluginPrefix.status,
+        `${unrelatedPluginPrefix.stdout}${unrelatedPluginPrefix.stderr}`,
+      ).toBe(0);
+      for (const target of [pluginRegistry, `${pluginRegistry}/sha256/deadbeef`]) {
+        const refusedPluginMount = runGuard(`/\n${target}\n`, "ok", pluginRegistry);
+        expect(refusedPluginMount.status).not.toBe(0);
+        expect(refusedPluginMount.stderr).toContain("is at or below it");
+      }
+
+      const snapshotMarker = join(root, "snapshot-write-called");
+      const guardedSnapshot = spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          [
+            "set -euo pipefail",
+            'CONFIG_ROOT="$1"',
+            'FINDMNT_BIN="$2"',
+            'INSTALL_TRANSACTION_DIR="$3"',
+            'SNAPSHOT_MARKER="$4"',
+            "TRANSACTION_PATHS=()",
+            "TRANSACTION_PATH_STATES=()",
+            'install() { : >"${SNAPSHOT_MARKER}"; }',
+            'cp() { : >"${SNAPSHOT_MARKER}"; }',
+            mountGuard,
+            snapshot,
+            'snapshot_managed_path "${CONFIG_ROOT}"',
+          ].join("\n"),
+          "mount-snapshot",
+          managedPath,
+          findmntFixture,
+          join(root, "snapshot-scratch"),
+          snapshotMarker,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            FINDMNT_TEST_INVENTORY: `/\n${managedPath}/models.json\n`,
+          },
+        },
+      );
+      expect(guardedSnapshot.status).not.toBe(0);
+      expect(guardedSnapshot.stderr).toContain("is at or below it");
+      expect(existsSync(snapshotMarker)).toBe(false);
+
+      const rollbackScratch = join(root, "rollback-scratch");
+      const runGuardedRestore = (
+        path: string,
+        inventory: string,
+        deleteMarker: string,
+      ): SpawnSyncReturns<string> => spawnSync(
+        "/bin/bash",
+        [
+          "-c",
+          [
+            "set -euo pipefail",
+            'CONFIG_ROOT="$1"',
+            'FINDMNT_BIN="$2"',
+            'INSTALL_TRANSACTION_DIR="$3"',
+            'DELETE_MARKER="$4"',
+            'TRANSACTION_PATHS=("${CONFIG_ROOT}")',
+            "TRANSACTION_PATH_STATES=(present)",
+            "INSTALL_TRANSACTION_ROLLBACK_FAILED=false",
+            "record_rollback_error() {",
+            "  printf 'Rollback warning: %s\\n' \"$1\" >&2",
+            "  INSTALL_TRANSACTION_ROLLBACK_FAILED=true",
+            "}",
+            'remove_managed_path() { : >"${DELETE_MARKER}"; }',
+            mountGuard,
+            restore,
+            "restore_managed_path_snapshot 0",
+            '[[ "${INSTALL_TRANSACTION_ROLLBACK_FAILED}" == true ]]',
+            '[[ ! -e "${DELETE_MARKER}" ]]',
+          ].join("\n"),
+          "mount-restore",
+          path,
+          findmntFixture,
+          rollbackScratch,
+          deleteMarker,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            FINDMNT_TEST_INVENTORY: inventory,
+          },
+        },
+      );
+      const configDeleteMarker = join(root, "config-delete-called");
+      const guardedConfigRestore = runGuardedRestore(
+        managedPath,
+        `/\n${managedPath}/credentials\n`,
+        configDeleteMarker,
+      );
+      expect(
+        guardedConfigRestore.status,
+        `${guardedConfigRestore.stdout}${guardedConfigRestore.stderr}`,
+      ).toBe(0);
+      expect(guardedConfigRestore.stderr).toContain("Rollback warning");
+      expect(existsSync(configDeleteMarker)).toBe(false);
+
+      const pluginDeleteMarker = join(root, "plugin-delete-called");
+      const guardedPluginRestore = runGuardedRestore(
+        pluginRegistry,
+        `/\n${pluginRegistry}/sha256/deadbeef\n`,
+        pluginDeleteMarker,
+      );
+      expect(
+        guardedPluginRestore.status,
+        `${guardedPluginRestore.stdout}${guardedPluginRestore.stderr}`,
+      ).toBe(0);
+      expect(guardedPluginRestore.stderr).toContain("Rollback warning");
+      expect(existsSync(pluginDeleteMarker)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps join endpoints server-and-broker-only", () => {
     const installer = repositoryFile("scripts/install-release.sh");
     const packager = repositoryFile("packaging/build-release.sh");
@@ -2233,7 +2778,8 @@ describe("installed client-plane isolation", () => {
     const transaction = installer.indexOf("\nbegin_install_transaction\n");
     const validation = installer.indexOf('"${server_binary}" validate-enrollment');
     const configMutation = installer.indexOf(
-      'install -d -o root -g root -m 0755 "${CONFIG_ROOT}"',
+      'ensure_managed_directory "${CONFIG_ROOT}" root root 755',
+      validation,
     );
     const failureInjection = installer.indexOf("maybe_inject_install_failure config");
     expect(transaction).toBeGreaterThan(0);

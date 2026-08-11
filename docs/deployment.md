@@ -22,6 +22,27 @@ endpoint config 与 server/core broker unit/tmpfiles；不创建共享 client/co
 bootstrap，也不会创建 `ops-agent.target` 或它的 wants dependency。PVE broker unit 默认只挂入
 `multi-user.target`；controller `init` 才显式把它加入 `ops-agent.target`。
 
+`init` upgrade 通常保留现有 `agentd.json`/`models.json`，并把新模板原子写到相邻 `.dist`。
+`init` 与 `join` 在任何 `/etc/ops-agent` 目录创建、临时文件或配置写入前，都要求已存在的
+config root 是 `root:root 0755` real non-symlink directory；只有安全缺失时才创建并立即后验。
+`init` 对 `credentials` 同样要求 `root:root 0700`，不会把 `install -d` 用在一个既存 symlink 上而
+修改其 referent。
+两种模式还会通过固定、root-owned `/bin/findmnt` 读取当前 kernel mount namespace：首先只要
+`/etc/ops-agent` 本身或其内任意 directory/file 是 mount target，就在事务开始前 fail closed。随后每个
+纳入事务 snapshot 的 config、release link、helper、plugin registry/source、unit/drop-in、sudoers、
+wrapper 与 wants path 都在 copy 前拒绝 exact/descendant mount，并在 rollback 递归清理前重新查询。
+正常 ancestor mount `/`、`/etc` 和相似前缀 `/etc/ops-agent-old` 不拒绝。查询失败、空输出或没有观察到
+namespace root `/` 都视为不可安全递归管理。若期间出现新 mount，rollback 记录 incomplete、保留该
+managed path 现场且不调用其删除原语。
+`find -xdev` 不能保护 exact root mount，不能替代这些检查；两次 kernel observation 之间只有
+`CAP_SYS_ADMIN` 才能制造的并发 mount race 不在本 Release 的 threat model 内。
+唯一的自动内容迁移是仓库已知的旧版 DeepSeek 默认 `models.json`：只有 active 文件仍逐字匹配
+固定 legacy SHA-256，且同时是 `root:ops-agent 0640`、regular non-symlink、单硬链接时，installer 才以
+同目录临时文件、file fsync、atomic rename 和 directory fsync 换成当前 verified template。任一字节
+自定义、owner/mode/link 漂移或未知旧模板都不会被猜测合并；不安全 metadata 直接 fail closed，合法
+自定义文件保持 active，仅更新 `.dist` 供管理员审阅。该路径位于 `/etc/ops-agent` 的安装事务 snapshot
+内，后续 config-stage failure 必须恢复旧 bytes 与 metadata，不能留下只迁了一半的 provider 配置。
+
 PVE 本机 `pvesh` 的 mutation handler 会写 pmxcfs。为让真实 PVE host 上的 typed mutation 工作，
 `ops-pve-root-helper.service` 保持 `ProtectSystem=full`，并且只开放精确
 `ReadWritePaths=/etc/pve`，不开放整个 `/etc`。core broker 明确把 `/etc/pve` 设为 inaccessible；
@@ -121,7 +142,8 @@ Bootstrap：
 `OPS_AGENT_RELEASE_BASE` 使用该镜像。
 
 Release installer 自身不调用 apt/dnf/yum 等包管理器。所有模式都要求 systemd、OpenSSL、diffutils
-等基础命令已由管理员或 image 提供；`init` 还要求固定 `/usr/bin/bwrap`、`sudo`/`visudo` 与 util-linux。
+等基础命令及 util-linux 的固定 `/bin/findmnt` 已由管理员或 image 提供；`init` 还要求固定
+`/usr/bin/bwrap`、`sudo`/`visudo` 与 util-linux `prlimit`。
 缺失项在账号、unit 或 policy mutation 前 fail closed。Noble restricted-userns controller 的
 unsupported guard 同样必须在任何持久 mutation 前执行。
 
