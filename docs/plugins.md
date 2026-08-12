@@ -87,6 +87,15 @@ required scopes 时允许调用。Tool capability 只需与同一 digest 的 man
 中实现工具 schema、业务安全 pattern、纯计算与 provider composition，但 root 行为仍必须新增并
 审核 typed broker arm/provider，不能传 shell、任意 argv 或动态扩展 Core。
 
+Provider wire compatibility 不属于 Plugin identity。对 exact DeepSeek `openai-completions`，Core 可在
+model-visible tool 浅副本上为一种已由真实 A/B 验证的 schema 形状补冗余根 `type: "object"`：原根
+没有 `type`，`anyOf` 非空且每个 arm 都显式为 object。投影不递归、不改 mixed/non-object union、
+不按 provider 前缀匹配，也不推广到其他 API。注册时解析的 canonical Source descriptor、invoke 时的
+原始 runtime `Check`/execute closure、immutable CAS tree/digest、manifest capability、requestedScopes
+和完整 Adapter/Workload authority 都保持逐字相同；不要为适配 provider 重写 snapshot 或复用旧
+grant。真实 A/B 的一个 `200`/tool call 只证明该 wire 形状被接受，不是完整 TUI 或 Plugin runtime
+验收；Release candidate 仍必须通过真实 provider 回放 installed active 的全部 model-visible tools。
+
 Workload invoke 不是靠“调用 provider 前后各读一次 current”防竞态。Runtime 不能打开 registry
 lock；它以自身真实 UID 连接固定 `/run/ops-agent/plugin-lease/lease.sock`，由独立非 root
 `agentd-plugin-lease-broker` 通过 `SO_PEERCRED` 将该 principal 限定到允许的 plugin class，再为请求的

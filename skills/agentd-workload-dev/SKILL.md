@@ -56,6 +56,18 @@ required by the provider-name policy. A matching capability name or first-party 
 host/root behavior therefore needs a narrow reviewed typed provider and, when
 privileged, a broker tagged-union arm; never add in-process import/eval, a shell callback, or an
 arbitrary command provider.
+Keep provider compatibility outside the canonical workload. For exact DeepSeek
+`openai-completions`, Core may make a model-visible shallow wrapper that adds redundant root
+`type: "object"` only when the original plain schema has no root `type`, has a non-empty root
+`anyOf`, and every arm explicitly has `type: "object"`. Do not recursively normalize schemas,
+rewrite mixed unions, infer arm types, match provider prefixes, generalize to other providers/APIs,
+or edit a Source tree to obtain this behavior. Tests must prove the canonical descriptor and original
+runtime `Check`/execute closure remain authoritative and byte-stable, so CAS/plugin digest,
+capabilities, requested scopes, provider grants, and runtime authority do not change. A real
+`ops_inspect` A/B reaching `200` plus `tool_calls` proves only this narrow endpoint compatibility;
+candidate validation must replay every installed active model-visible tool through the production
+TUI/gateway/agentd path and real provider, with safe read-only or prepare-and-reject handling, rather
+than treating that probe as full runtime or approval acceptance.
 Every invocation must connect as its real UID to the fixed peer-authenticated lease broker socket,
 acquire the registry's shared per-plugin lease for the exact active digest without opening the
 broker-only lock directory, and retain it through provider calls, signed status handling, and local

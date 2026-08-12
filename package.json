@@ -1,6 +1,6 @@
 {
   "name": "pi-ops-agent",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "A least-privilege, auditable Linux operations agent built on Pi.",
   "type": "module",

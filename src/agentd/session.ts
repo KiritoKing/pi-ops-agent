@@ -39,6 +39,8 @@ import {
 import { createSourceWorkloadTools } from "./source-workload-runtime.js";
 import { createTrustedBaseProviderCatalog } from "./workload-providers.js";
 import { PreparedChangeTracker } from "./prepared-changes.js";
+import { applyDeepSeekOpenAICompletionsSourceToolCompatibility } from
+  "./deepseek-tool-schema-compat.js";
 
 const SANDBOXED_WORKSPACE_RULE =
   "Use ops_inspect for target-scoped host observations. Use ops_bash only for offline, unprivileged work in this session's /workspace.";
@@ -249,7 +251,7 @@ export class SessionFactory {
       registrations: activeWorkloads,
       providers,
     });
-    const customTools = sourceTools;
+    const customTools = applyDeepSeekOpenAICompletionsSourceToolCompatibility(model, sourceTools);
     const result = await createAgentSession({
       cwd: sessionRecord.workspacePath,
       agentDir: this.#config.agentDir,

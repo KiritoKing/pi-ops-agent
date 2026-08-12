@@ -63,17 +63,17 @@ function expectAuditableActionPins(workflow: string): void {
 }
 
 describe("native release layout", () => {
-  it("separates the 0.3.1 product release from unchanged digest-bound plugin versions", () => {
+  it("separates the 0.3.2 product release from unchanged digest-bound plugin versions", () => {
     const packageDocument = JSON.parse(repositoryFile("package.json")) as { version?: unknown };
     const lockDocument = JSON.parse(repositoryFile("package-lock.json")) as {
       version?: unknown;
       packages?: { ""?: { version?: unknown } };
     };
-    expect(packageDocument.version).toBe("0.3.1");
-    expect(lockDocument.version).toBe("0.3.1");
-    expect(lockDocument.packages?.[""]?.version).toBe("0.3.1");
-    expect(repositoryFile("src/client/index.ts")).toContain('const VERSION = "0.3.1";');
-    expect(repositoryFile(".github/workflows/ci.yml")).toContain("RELEASE_VERSION: 0.3.1");
+    expect(packageDocument.version).toBe("0.3.2");
+    expect(lockDocument.version).toBe("0.3.2");
+    expect(lockDocument.packages?.[""]?.version).toBe("0.3.2");
+    expect(repositoryFile("src/client/index.ts")).toContain('const VERSION = "0.3.2";');
+    expect(repositoryFile(".github/workflows/ci.yml")).toContain("RELEASE_VERSION: 0.3.2");
 
     for (const manifestPath of [
       "plugins/adapter-botmux-source/manifest.json",

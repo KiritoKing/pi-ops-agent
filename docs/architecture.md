@@ -382,6 +382,20 @@ Session。生产环境只有 systemd 建立全新 agentd 进程后才能重连�
 同一个 chunk 中紧随 prompt 的 Ctrl-C 也能取消在途请求。abort 本身不会推进 prompt queue；原
 prompt 未 settle 时后续 prompt/ping 仍不得并发执行。
 
+DeepSeek 的 `openai-completions` function-schema 还有一个窄 wire 兼容层。真实 metadata-only A/B
+对同一份 `ops_inspect` parameters 只改变根级约束：只有根 `anyOf` 时 endpoint 返回 `400`，冗余加入
+`type: "object"` 后返回 `200` 和一个可校验的 `tool_calls`。因此 Core 只在构造 model-visible tools
+之后、交给 Pi 序列化之前做浅投影：model 必须精确为 `provider=deepseek` 且
+`api=openai-completions`，schema 必须是没有自有根 `type`、带非空 `anyOf`、且每个 arm 都自有
+`type: "object"` 的 plain JSON object，才在新 tool/schema wrapper 上补根 `type: "object"`。
+它不递归改写 nested schema，不覆盖已有 root type，不处理 mixed/non-object union，也不扩展到其他
+provider、名称前缀或 API。canonical Source descriptor、执行闭包使用的原始 runtime `Check`、CAS
+tree/digest、capability、requested scope 与 runtime authority 全部不变；这不是 plugin migration 或
+authority translation。该 A/B 只证明这一个 wire schema 从拒绝变为被 endpoint 接受并生成 tool call，
+不能当作 compiled TUI、gateway、agentd、tool execution、continuation 或审批链验收。Release candidate
+仍须通过真实外部 provider 对 installed active model-visible 全工具的回放，并分别验证只读、prepare/
+reject 与需要的 continuation，而不能用单个 `200` probe 代替。
+
 DeepSeek thinking tool replay 还需要 assistant tool-call message 的 `content` 非 `null`。固定的 Pi
 `0.84.1` 尚未提供上游命名的 `requiresAssistantContentForToolCalls` compat 开关；当前模型配置战术性
 使用该版本已有的 `requiresAssistantAfterToolResult=true`，使这类 message 序列化为 `content: ""`，

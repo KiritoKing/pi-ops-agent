@@ -61,6 +61,18 @@ Pi turn 使用固定 180 秒 absolute monotonic deadline，显式关闭 OpenAI-c
 旧执行是否仍在运行不可证明，必须 poison Session 并让 agentd fail-stop/systemd restart，不能在同一
 进程中自动重放 prompt 或接受下一个 turn。
 
+DeepSeek `openai-completions` 的 root-`anyOf` 兼容不能成为新的 schema 或授权来源。真实 A/B 已证明
+同一 `ops_inspect` wire parameters 在只增加冗余根 `type: "object"` 后由 `400` 变为 `200` 并返回
+`tool_calls`；Core 因而只对 exact DeepSeek protocol 的 model-visible 浅副本应用这一变换，并且只在
+根无自有 `type`、`anyOf` 非空、每个 arm 都显式为 object 时应用。不得递归遍历、推断等价类型、重写
+mixed union、按 provider 名称前缀匹配或推广到其他 OpenAI-compatible endpoint。Source descriptor
+仍是 canonical 输入；runtime `Check` 和 tool execute closure 继续绑定原 schema，plugin CAS tree/
+digest、capability、requested scope、provider policy 与 runtime authority 均不变化。因此这层投影
+不能扩大模型可调用工具或 root 权限，也不能让 wire request 替代 descriptor/manifest exact-match、
+lease 或 broker 校验。单次 `200`/tool-call A/B 只证明一个 schema 的 endpoint 兼容，不证明 TUI
+identity/session、完整工具集、tool continuation、审批或执行正确；候选验收必须经真实外部 provider
+回放 installed active 的全部 model-visible tools，并保留每层原有验证。
+
 backend `hello` 的 canonical `SessionId` 另受 agentd 进程内 opaque-token reservation 保护；reservation
 从 strict hello 解析后、异步 open 之前开始，贯穿 active turn 与 disconnect cleanup。断连不会直接
 `dispose()` 或释放名字：cleanup 必须复用 active turn 的同一 abort latch，并在 10 秒内同时取得 Pi

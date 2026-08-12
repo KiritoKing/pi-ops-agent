@@ -12,7 +12,7 @@ permissions:
 env:
   GO_VERSION: 1.26.5
   NODE_VERSION: 22.23.2
-  RELEASE_VERSION: 0.3.1
+  RELEASE_VERSION: 0.3.2
 
 jobs:
   check:

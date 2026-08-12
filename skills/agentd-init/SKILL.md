@@ -362,6 +362,19 @@ Use the current artifact names from the architecture document. Verify all applic
   Defaults, malformed hostnames, command listings, oversized output, or any extra prose.
 - `agentd-server` requires HTTPS/mTLS and exposes only current policy capabilities.
 - The TUI creates an isolated session; model-visible input cannot approve, reject, or roll back.
+- For an installed DeepSeek `openai-completions` candidate, inspect the active Source descriptors and
+  registrations before model execution, then prove the only provider compatibility projection is a
+  shallow redundant root `type: "object"` for a non-empty root `anyOf` whose every arm explicitly has
+  `type: "object"`. Assert the canonical descriptor bytes, original runtime `Check` and execute closure,
+  immutable CAS/plugin tree and digest, capabilities, requested scopes, provider policy, and runtime
+  authority are unchanged. Negative tests must cover nested schemas, existing root types, empty or
+  mixed unions, non-plain schemas, provider-name prefixes, other providers, and other APIs. The real
+  metadata-only A/B showing `ops_inspect` change from `400` to `200` plus `tool_calls` is only a narrow
+  endpoint-compatibility result. Before accepting a candidate, replay every installed active
+  model-visible tool through the production compiled TUI/gateway/agentd path and the real external
+  provider; use read-only calls or prepare-and-reject where mutation would otherwise occur, exercise
+  required tool continuation, and verify authoritative no-mutation/status evidence. Never call the
+  isolated probe's `200` a full TUI, tool-execution, or approval smoke.
 - Exercise the production model-turn deadline with a deterministic OpenAI-compatible fixture that
   returns `200` SSE headers and then keeps the body alive without a terminal event. The fixed
   180-second absolute deadline must not reset on bytes, keep-alive, Pi retry, compaction, or queued
