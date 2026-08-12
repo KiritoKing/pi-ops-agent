@@ -1,0 +1,539 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.26.5
+  NODE_VERSION: 22.23.2
+
+jobs:
+  ci-release-gates:
+    uses: ./.github/workflows/ci.yml
+
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      release_version: ${{ steps.release_identity.outputs.release_version }}
+      release_tag: ${{ steps.release_identity.outputs.release_tag }}
+      source_sha: ${{ steps.release_identity.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - name: Verify the source identity and release versions
+        id: release_identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          test "${source_sha}" = "${GITHUB_SHA}"
+          release_version="$(node -p 'require("./package.json").version')"
+          [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          expected_release_tag="v${release_version}"
+          release_tag=""
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              test "${GITHUB_REF_TYPE}" = "tag"
+              test "${GITHUB_REF}" = "refs/tags/${expected_release_tag}"
+              test "${GITHUB_REF_NAME}" = "${expected_release_tag}"
+              release_tag="${expected_release_tag}"
+              ;;
+            pull_request|workflow_dispatch)
+              ;;
+            *)
+              printf 'Unsupported release workflow event: %s\n' \
+                "${GITHUB_EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
+          lock_document_version="$(node -p 'require("./package-lock.json").version')"
+          lock_version="$(node -p 'require("./package-lock.json").packages[""].version')"
+          test "${release_version}" = "${lock_document_version}"
+          test "${release_version}" = "${lock_version}"
+          NODE_VERSION="${NODE_VERSION}" node <<'NODE'
+          const packageDocument = require("./package.json");
+          const match = /^>=(\d+)\.(\d+)\.(\d+)$/u.exec(packageDocument.engines?.node ?? "");
+          if (match === null) throw new Error("package engines.node must be one exact minimum");
+          const minimum = match.slice(1).map(Number);
+          const runtime = process.env.NODE_VERSION.split(".").map(Number);
+          for (let index = 0; index < 3; index += 1) {
+            if (runtime[index] > minimum[index]) break;
+            if (runtime[index] < minimum[index]) throw new Error("pinned runtime is below engines.node");
+          }
+          for (const dependency of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"]) {
+            if (!/^\d+\.\d+\.\d+$/u.test(packageDocument.dependencies?.[dependency] ?? "")) {
+              throw new Error(`${dependency} must use an exact version`);
+            }
+          }
+          NODE
+          client_version="$(sed -n 's/^const VERSION = "\([^"]*\)";$/\1/p' src/client/index.ts)"
+          test "${release_version}" = "${client_version}"
+          for manifest in plugins/*/manifest.json; do
+            plugin_version="$(node -p 'require("./'"${manifest}"'").version')"
+            (( ${#plugin_version} <= 96 ))
+            [[ "${plugin_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]
+          done
+          {
+            printf 'release_version=%s\n' "${release_version}"
+            printf 'release_tag=%s\n' "${release_tag}"
+            printf 'source_sha=%s\n' "${source_sha}"
+          } >>"${GITHUB_OUTPUT}"
+      - run: npm run check
+      - run: npm run build
+      - run: go vet ./cmd/... ./internal/...
+      - run: go test -race ./internal/...
+      - run: git diff --check
+
+  adapter-linux-runtime:
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - run: npm run build
+      - name: Install the pinned Adapter sandbox build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl libcap-dev libcap2-bin \
+            meson ninja-build pkg-config xz-utils
+      - name: Build and install the pinned unprivileged bubblewrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly bwrap_version="0.9.0"
+          readonly bwrap_sha256="c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1"
+          readonly bwrap_archive="${RUNNER_TEMP}/bubblewrap-${bwrap_version}.tar.xz"
+          readonly bwrap_source="${RUNNER_TEMP}/bubblewrap-${bwrap_version}"
+          readonly bwrap_build="${RUNNER_TEMP}/bubblewrap-build"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz" \
+            --output "${bwrap_archive}"
+          printf '%s  %s\n' "${bwrap_sha256}" "${bwrap_archive}" \
+            | sha256sum --check --strict
+          tar -xJf "${bwrap_archive}" -C "${RUNNER_TEMP}"
+          meson setup "${bwrap_build}" "${bwrap_source}" \
+            --buildtype=release \
+            -Dtests=false \
+            -Dman=disabled \
+            -Dselinux=disabled \
+            -Dbash_completion=disabled \
+            -Dzsh_completion=disabled
+          meson compile -C "${bwrap_build}" bwrap
+          if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]; then
+            echo "Refusing to replace a pre-existing /usr/bin/bwrap" >&2
+            exit 1
+          fi
+          sudo /usr/bin/install -o root -g root -m 0755 \
+            "${bwrap_build}/bwrap" /usr/bin/bwrap
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap ${bwrap_version}"
+          test "$(/usr/bin/readlink -f /usr/bin/bwrap)" = "/usr/bin/bwrap"
+          test -f /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test ! -u /usr/bin/bwrap
+          test ! -g /usr/bin/bwrap
+          test "$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)" = \
+            "root:root:755:nlink1"
+          bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"
+          test -z "${bwrap_capabilities}"
+          /usr/bin/bwrap --help | /usr/bin/grep -F -- '--disable-userns' >/dev/null
+      - name: Install the root-owned Adapter Node runtime fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly install_root="/opt/pi-ops-agent"
+          readonly release_version="${RELEASE_VERSION}"
+          readonly release_root="${install_root}/releases/${release_version}"
+          readonly node_bin="${release_root}/runtime/node"
+          readonly current_link="${install_root}/current"
+          node_source="$(/usr/bin/readlink -f "$(command -v node)")"
+          test -f "${node_source}"
+          test -x "${node_source}"
+          node_version="$("${node_source}" -p 'process.versions.node')"
+          test "${node_version}" = "${NODE_VERSION}"
+          node_digest="$(/usr/bin/sha256sum "${node_source}" | /usr/bin/cut -d' ' -f1)"
+          test -d /opt
+          test ! -L /opt
+          test "$(/usr/bin/stat -c '%U:%G' /opt)" = "root:root"
+          sudo /usr/bin/chmod 0755 /opt
+          test "$(/usr/bin/stat -c '%U:%G:%a' /opt)" = "root:root:755"
+          if [[ -e "${install_root}" || -L "${install_root}" ]]; then
+            echo "Refusing to reuse a pre-existing /opt/pi-ops-agent fixture" >&2
+            exit 1
+          fi
+          sudo /usr/bin/install -d -o root -g root -m 0755 \
+            "${install_root}" "${install_root}/releases" \
+            "${release_root}" "${release_root}/runtime"
+          sudo /usr/bin/install -o root -g root -m 0755 \
+            "${node_source}" "${node_bin}"
+          sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"
+          sudo /usr/bin/chown -h root:root "${current_link}"
+          for directory in \
+            "${install_root}" "${install_root}/releases" \
+            "${release_root}" "${release_root}/runtime"; do
+            test -d "${directory}"
+            test ! -L "${directory}"
+            test "$(/usr/bin/stat -c '%U:%G:%a' "${directory}")" = "root:root:755"
+          done
+          test -L "${current_link}"
+          test "$(/usr/bin/stat -c '%U:%G' "${current_link}")" = "root:root"
+          test "$(/usr/bin/readlink "${current_link}")" = \
+            "releases/${release_version}"
+          test "$(/usr/bin/readlink -f "${current_link}")" = "${release_root}"
+          test "$(/usr/bin/readlink -f "${current_link}/runtime/node")" = \
+            "${node_bin}"
+          test "$("${node_bin}" -p 'process.versions.node')" = "${NODE_VERSION}"
+          test "$(/usr/bin/sha256sum "${node_bin}" | /usr/bin/cut -d' ' -f1)" = \
+            "${node_digest}"
+          test "$(/usr/bin/readlink -f "${node_bin}")" = "${node_bin}"
+          test -f "${node_bin}"
+          test ! -L "${node_bin}"
+          test ! -u "${node_bin}"
+          test ! -g "${node_bin}"
+          test "$(/usr/bin/stat -c '%U:%G:%a:nlink%h' "${node_bin}")" = \
+            "root:root:755:nlink1"
+          node_capabilities="$(/usr/sbin/getcap "${node_bin}")"
+          test -z "${node_capabilities}"
+      - name: Create the disposable Adapter identity fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_identity="$(id -a)"
+          if /usr/bin/getent passwd ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Disposable runner unexpectedly contains an ops-agent probe identity" >&2
+            exit 1
+          fi
+          sudo /usr/sbin/groupadd --system ops-agent-client
+          sudo /usr/sbin/groupadd --system ops-agent-botmux
+          sudo /usr/sbin/useradd --system \
+            --gid ops-agent-botmux \
+            --groups ops-agent-client \
+            --home-dir /var/lib/ops-agent/adapters/botmux \
+            --shell /usr/sbin/nologin \
+            --no-create-home \
+            ops-agent-botmux
+          sudo /usr/bin/install -d \
+            -o ops-agent-botmux -g ops-agent-botmux -m 0700 \
+            /var/lib/ops-agent/adapters/botmux
+          test "$(id -a)" = "${runner_identity}"
+      - name: Run the release-blocking real Linux Adapter probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly node_bin="/opt/pi-ops-agent/current/runtime/node"
+          readonly node_directory="/opt/pi-ops-agent/current/runtime"
+          setup_node_directory="$(dirname "$(command -v node)")"
+          test -x "${node_bin}"
+          test -x "${setup_node_directory}/npm"
+          set +e
+          sudo /usr/bin/env \
+            "OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}" \
+            "PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            npm run test:adapter-linux-runtime
+          probe_status="$?"
+          set -e
+          if [[ "${probe_status}" -ne 0 ]]; then
+            echo "Real Linux Adapter probe failed with status ${probe_status}; status 77 is unverified and blocks release" >&2
+            exit "${probe_status}"
+          fi
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            node_arch: x64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            node_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - run: npm run build
+      - run: npm prune --omit=dev --ignore-scripts
+      - name: Build static Go commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-bin
+          release_commands=(
+            ops-agent-server
+            ops-root-helper
+            agentd-guardian
+            agentd-client-gateway
+            agentd-pluginctl
+            agentd-approval-submit
+            agentd-json-config-helper
+          )
+          for command_name in "${release_commands[@]}"; do
+            test -f "cmd/${command_name}/main.go"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" go build -trimpath \
+              -ldflags="-s -w" \
+              -o "release-bin/${command_name}" "./cmd/${command_name}"
+          done
+          test ! -e release-bin/ops-systemd-helper
+      - name: Download and verify the pinned Node runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_archive="node-v${NODE_VERSION}-linux-${{ matrix.node_arch }}.tar.xz"
+          node_base="https://nodejs.org/dist/v${NODE_VERSION}"
+          curl -fsSLO "${node_base}/${node_archive}"
+          curl -fsSLO "${node_base}/SHASUMS256.txt"
+          grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict
+          mkdir -p node-runtime
+          tar -xJf "${node_archive}" --strip-components=1 -C node-runtime
+          test "$(node-runtime/bin/node -p 'process.versions.node')" = "${NODE_VERSION}"
+      - name: Build native archive and Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          packaging/build-release.sh \
+            --version "${RELEASE_VERSION}" \
+            --arch "${{ matrix.arch }}" \
+            --node-runtime-dir node-runtime \
+            --bin-dir release-bin \
+            --output-dir release
+          packaging/verify-release.sh \
+            --version "${RELEASE_VERSION}" \
+            --arch "${{ matrix.arch }}" \
+            --node-version "${NODE_VERSION}" \
+            --archive "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" \
+            --deb "release/ops-agent-all_${RELEASE_VERSION}_${{ matrix.arch }}.deb"
+          mkdir -p sbom-root
+          tar -xzf "release/ops-agent-linux-${{ matrix.arch }}.tar.gz" -C sbom-root
+      - name: Isolate verified native packages before SBOM generation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-packages-${{ matrix.arch }}
+          path: |
+            release/ops-agent-linux-${{ matrix.arch }}.tar.gz
+            release/ops-agent-all_${{ needs.validate.outputs.release_version }}_${{ matrix.arch }}.deb
+          if-no-files-found: error
+          retention-days: 7
+      - name: Generate installed-payload SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: sbom-root/payload/app
+          format: spdx-json
+          output-file: release/ops-agent-linux-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Upload generated SBOM separately
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-sbom-${{ matrix.arch }}
+          path: release/ops-agent-linux-${{ matrix.arch }}.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release-candidate-verification:
+    needs:
+      - validate
+      - build
+      - adapter-linux-runtime
+      - ci-release-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: candidate
+          merge-multiple: true
+      - name: Re-verify downloaded native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          for arch in amd64 arm64; do
+            packaging/verify-release.sh \
+              --version "${RELEASE_VERSION}" \
+              --arch "${arch}" \
+              --node-version "${NODE_VERSION}" \
+              --archive "candidate/ops-agent-linux-${arch}.tar.gz" \
+              --deb "candidate/ops-agent-all_${RELEASE_VERSION}_${arch}.deb" \
+              --no-payload-execution
+          done
+      - name: Build optional first-party plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          botmux_plugin_version="$(node -p \
+            'require("./plugins/adapter-botmux/manifest.json").version')"
+          hermes_plugin_version="$(node -p \
+            'require("./plugins/workload-hermes/manifest.json").version')"
+          packaging/build-botmux-plugin.sh "${botmux_plugin_version}" candidate
+          packaging/build-hermes-workload-plugin.sh "${hermes_plugin_version}" candidate
+      - name: Generate release candidate manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/create-release-manifest.sh \
+            candidate "${RELEASE_VERSION}" "${GITHUB_REPOSITORY}" "${SOURCE_SHA}"
+          (
+            cd candidate
+            sha256sum -- * | sort -k 2 > checksums.txt
+          )
+      - name: Upload the aggregated verified release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-${{ needs.validate.outputs.source_sha }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record the non-publishing candidate result
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '## Release candidate verified\n\n'
+            printf -- '- Version: `%s`\n' "${RELEASE_VERSION}"
+            printf -- '- Source SHA: `%s`\n' "${SOURCE_SHA}"
+            printf -- '- Candidate verified; no release or tag was created.\n'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  publish:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_name == needs.validate.outputs.release_tag &&
+      github.ref == format('refs/tags/{0}', needs.validate.outputs.release_tag)
+    needs:
+      - validate
+      - build
+      - adapter-linux-runtime
+      - ci-release-gates
+      - release-candidate-verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate-${{ needs.validate.outputs.source_sha }}
+          path: release
+      - name: Verify the aggregated candidate and native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+          (
+            cd release
+            sha256sum --check --strict checksums.txt
+          )
+          jq -e \
+            --arg version "${RELEASE_VERSION}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit "${SOURCE_SHA}" \
+            '.version == $version and .repository == $repository and .commit == $commit' \
+            release/manifest.json >/dev/null
+          for arch in amd64 arm64; do
+            packaging/verify-release.sh \
+              --version "${RELEASE_VERSION}" \
+              --arch "${arch}" \
+              --node-version "${NODE_VERSION}" \
+              --archive "release/ops-agent-linux-${arch}.tar.gz" \
+              --deb "release/ops-agent-all_${RELEASE_VERSION}_${arch}.deb" \
+              --no-payload-execution
+          done
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release/*.deb
+            release/*.tar.gz
+            release/*.opspkg
+            release/*.spdx.json
+            release/manifest.json
+            release/checksums.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            printf 'Release %s already exists; published assets are immutable.\n' "${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" release/* \
+            --verify-tag --generate-notes --title "Pi Ops Agent ${RELEASE_TAG}"

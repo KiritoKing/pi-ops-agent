@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "adapter.botmux",
+  "kind": "im-adapter",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "coreProtocol": 1,
+  "entrypoint": "adapter.mjs",
+  "description": "Legacy packaged BotMux text adapter with verified private sender and bounded status-only delivery; remote approval is intentionally unsupported.",
+  "capabilities": {
+    "inboundText": true,
+    "verifiedSender": true,
+    "privateConversation": true,
+    "proactiveDelivery": true,
+    "approvalIntent": false,
+    "streaming": false
+  },
+  "secrets": [],
+  "setupOperations": []
+}

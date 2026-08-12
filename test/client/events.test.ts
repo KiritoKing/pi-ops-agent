@@ -19,6 +19,7 @@ describe("client completion events", () => {
     await new NdjsonEventSink(output).publish({
       version: 1,
       type: "completion",
+      eventId: "event-12345678",
       outcome: "success",
       content: `done ${secret}`,
     });
@@ -26,6 +27,7 @@ describe("client completion events", () => {
     expect(JSON.parse(saved)).toEqual({
       version: 1,
       type: "completion",
+      eventId: "event-12345678",
       outcome: "success",
       content: "done [REDACTED]",
     });

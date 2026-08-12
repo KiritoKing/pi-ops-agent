@@ -11,6 +11,8 @@ export default tseslint.config(
       "eslint.config.js",
       "scripts/*.mjs",
       "integrations/**/*.mjs",
+      "plugins/**/*.mjs",
+      "test/fixtures/**/*.mjs",
     ],
   },
   {

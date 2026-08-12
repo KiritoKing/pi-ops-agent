@@ -7,7 +7,9 @@ import {
   readSync,
 } from "node:fs";
 import { isAbsolute } from "node:path";
-import { parseAgentClientMessage } from "../shared/messages.js";
+import { parseSessionId } from "../shared/domain.js";
+import { unwrapBotMuxInput } from "./botmux-envelope.js";
+import { hasForbiddenTextControl } from "../shared/terminal-safety.js";
 
 const MAX_INITIAL_PROMPT_FILE_BYTES = 64 * 1024;
 
@@ -55,13 +57,22 @@ function readInitialPromptFile(argument: string): string {
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
-    return content.subarray(0, offset).toString("utf8");
+    try {
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+        .decode(content.subarray(0, offset));
+    } catch {
+      throw new Error("@file prompt is not valid UTF-8");
+    }
   } finally {
     closeSync(descriptor);
   }
 }
 
-export function parseClientArguments(argv: readonly string[]): ClientInvocation {
+export function parseClientArguments(
+  argv: readonly string[],
+  environment: NodeJS.ProcessEnv = process.env,
+  options: { allowInitialPrompt?: boolean } = {},
+): ClientInvocation {
   let sessionId: string | undefined;
   let ignoredExtension = false;
   const positional: string[] = [];
@@ -107,22 +118,30 @@ export function parseClientArguments(argv: readonly string[]): ClientInvocation 
   }
 
   if (!sessionId) throw new Error("--session-id is required");
-  const initialPrompt = positional.length > 0
+  if (positional.length > 0 && options.allowInitialPrompt === false) {
+    throw new Error("source Adapter initial prompts must arrive through the typed FD channel");
+  }
+  const rawInitialPrompt = positional.length > 0
     ? positional.length === 1 && positional[0]?.startsWith("@")
       ? readInitialPromptFile(positional[0])
       : positional.join(" ")
     : undefined;
-  const validated = parseAgentClientMessage({
-    type: "hello",
-    sessionId,
-    ...(initialPrompt === undefined ? {} : { initialPrompt }),
-  });
-  if (validated.type !== "hello") throw new Error("unexpected client argument validation result");
+  const initialPrompt = rawInitialPrompt === undefined
+    ? undefined
+    : environment.OPS_AGENT_INPUT_ENVELOPE === "botmux-v1"
+      ? unwrapBotMuxInput(rawInitialPrompt).text
+      : rawInitialPrompt;
+  if (initialPrompt !== undefined
+    && (Buffer.byteLength(initialPrompt, "utf8") > 64 * 1024
+      || hasForbiddenTextControl(initialPrompt, true))) {
+    throw new Error("initialPrompt exceeds its UTF-8 limit or contains a forbidden control character");
+  }
+  const validatedSessionId = parseSessionId(sessionId);
   return {
     kind: "run",
     arguments:
-      validated.initialPrompt === undefined
-        ? { sessionId: validated.sessionId }
-        : { sessionId: validated.sessionId, initialPrompt: validated.initialPrompt },
+      initialPrompt === undefined
+        ? { sessionId: validatedSessionId }
+        : { sessionId: validatedSessionId, initialPrompt },
   };
 }

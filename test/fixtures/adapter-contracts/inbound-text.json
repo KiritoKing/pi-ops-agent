@@ -1,0 +1,23 @@
+{
+  "apiVersion": "agentd.adapter-inbound/v1",
+  "schemaVersion": 1,
+  "type": "text",
+  "ingressId": "ingress:botmux:00000001",
+  "externalSessionId": "botmux/session/00000001",
+  "conversationType": "direct",
+  "text": "Inspect the service status.\nDo not make changes.",
+  "source": {
+    "authentication": "authenticated",
+    "principalId": "botmux:user:00000001",
+    "displayName": "Operations owner",
+    "evidence": {
+      "kind": "adapter-authentication",
+      "issuer": "adapter.botmux",
+      "subject": "botmux:user:00000001",
+      "evidenceId": "assertion:00000001",
+      "observedAt": "2026-08-08T04:00:00Z"
+    }
+  },
+  "observedAt": "2026-08-08T04:00:01Z",
+  "replyToMessageId": "message:00000001"
+}

@@ -1,63 +1,38 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  helperRequestFor,
-  helperTimeoutFor,
-  parseDirectCommand,
-} from "../../src/client/commands.js";
+import { describe, expect, it } from "vitest";
+import { parseDirectCommand } from "../../src/client/commands.js";
+import { encodeChangeRef } from "../../src/shared/approval.js";
+import { parseChangeId, parseMachineId, parseServerId, parseTargetId } from "../../src/shared/domain.js";
 
-afterEach(() => vi.useRealTimers());
+const CHANGE_REF = encodeChangeRef({
+  version: 1,
+  serverId: parseServerId("server-12345678"),
+  machineId: parseMachineId("machine-12345678"),
+  targetId: parseTargetId("target-12345678"),
+  changeId: parseChangeId("change-1234"),
+});
 
-describe("direct root-helper commands", () => {
+describe("model-external approval commands", () => {
   it("parses approval and rejection commands", () => {
-    expect(parseDirectCommand("/approve change-1234")).toEqual({
-      kind: "approve",
-      changeId: "change-1234",
-    });
-    expect(parseDirectCommand("/reject change-1234")).toEqual({
-      kind: "reject",
-      changeId: "change-1234",
-    });
-    expect(parseDirectCommand("/rollback change-1234")).toEqual({
-      kind: "rollback",
-      changeId: "change-1234",
-    });
+    const approve = parseDirectCommand(`/approve ${CHANGE_REF}`);
+    const reject = parseDirectCommand(`/reject ${CHANGE_REF}`);
+    const rollback = parseDirectCommand(`/rollback ${CHANGE_REF}`);
+    expect(approve?.kind).toBe("approve");
+    expect(approve?.changeRef.changeId).toBe("change-1234");
+    expect(reject?.kind).toBe("reject");
+    expect(reject?.changeRef.changeId).toBe("change-1234");
+    expect(rollback?.kind).toBe("rollback");
+    expect(rollback?.changeRef.changeId).toBe("change-1234");
   });
 
-  it("maps status with an id to change.status", () => {
-    const command = parseDirectCommand("/status change-1234");
+  it("parses status with its full C/S change reference", () => {
+    const command = parseDirectCommand(`/status ${CHANGE_REF}`);
     if (!command) throw new Error("expected status command");
-    expect(helperRequestFor(command)).toMatchObject({
-      version: 1,
-      method: "change.status",
-      changeId: "change-1234",
-    });
-  });
-
-  it("gives approve and rollback nine-minute deadlines and longer transport timeouts", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-05T00:00:00.000Z"));
-    const approve = parseDirectCommand("/approve change-1234");
-    const rollback = parseDirectCommand("/rollback change-1234");
-    const reject = parseDirectCommand("/reject change-1234");
-    const status = parseDirectCommand("/status change-1234");
-    if (!approve || !rollback || !reject || !status) throw new Error("expected direct commands");
-
-    expect(helperRequestFor(approve).deadline).toBe("2026-08-05T00:09:00.000Z");
-    expect(helperRequestFor(rollback)).toMatchObject({
-      method: "change.rollback",
-      deadline: "2026-08-05T00:09:00.000Z",
-    });
-    expect(helperTimeoutFor(approve)).toBeGreaterThan(9 * 60_000);
-    expect(helperTimeoutFor(rollback)).toBeGreaterThan(9 * 60_000);
-    expect(helperRequestFor(reject).deadline).toBe("2026-08-05T00:00:30.000Z");
-    expect(helperTimeoutFor(reject)).toBe(30_000);
-    expect(helperRequestFor(status).deadline).toBe("2026-08-05T00:00:30.000Z");
-    expect(helperTimeoutFor(status)).toBe(30_000);
+    expect(command).toMatchObject({ kind: "status", changeRef: { changeId: "change-1234" } });
   });
 
   it("leaves ordinary slash commands for agentd and rejects unsafe shapes", () => {
     expect(parseDirectCommand("/help")).toBeUndefined();
     expect(() => parseDirectCommand("/status")).toThrow("usage");
-    expect(() => parseDirectCommand("/approve change-1234 extra")).toThrow("usage");
+    expect(() => parseDirectCommand(`/approve ${CHANGE_REF} extra`)).toThrow("usage");
   });
 });

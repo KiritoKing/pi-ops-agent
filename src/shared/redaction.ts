@@ -1,10 +1,28 @@
 import { isRecord } from "./guards.js";
 
 const SECRET_KEY = /(?:api[_-]?key|secret|token|password|credential|authorization|cookie)/i;
-const SECRET_VALUE = /\b(?:sk-[a-zA-Z0-9_-]{16,}|Bearer\s+[a-zA-Z0-9._~-]{16,})\b/gi;
+// Bearer credentials are secret regardless of apparent length. Short values
+// are common in tests, local gateways, and opaque schemes; applying a length
+// threshold can also let assignment redaction consume only the word
+// "Bearer" and leave the credential behind.
+const SECRET_VALUE = /\b(?:sk-[a-zA-Z0-9_-]{16,}|Bearer\s+[a-zA-Z0-9._~+/-]+={0,2})\b/gi;
+const SECRET_ASSIGNMENT = /(\b[a-z0-9_.-]*(?:api[_-]?key|secret|token|password|credential|authorization|cookie)[a-z0-9_.-]*\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|Bearer\s+[a-zA-Z0-9._~+/-]+={0,2}|[^\s\r\n,;{}[\]]+)/gi;
 
 export function redactText(value: string): string {
-  return value.replace(SECRET_VALUE, "[REDACTED]");
+  return value
+    .replace(
+      SECRET_ASSIGNMENT,
+      (_match, prefix: string, secret: string) => {
+        if (secret.startsWith("\"") && secret.endsWith("\"")) {
+          return `${prefix}"[REDACTED]"`;
+        }
+        if (secret.startsWith("'") && secret.endsWith("'")) {
+          return `${prefix}'[REDACTED]'`;
+        }
+        return `${prefix}[REDACTED]`;
+      },
+    )
+    .replace(SECRET_VALUE, "[REDACTED]");
 }
 
 export function redact(value: unknown, depth = 0): unknown {

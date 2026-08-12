@@ -1,0 +1,55 @@
+{
+  "serverId": "server-pve-12345678",
+  "machineId": "machine-pve-12345678",
+  "targetId": "target-pve-root",
+  "policyRevision": "policy-pve-12345678",
+  "capabilityRevision": "capability-remote-v0.3-v8",
+  "planHash": "sha256:d3bdda0b3388eae10a9c30b259700cf3f36a5569c6c6a4c9401cb9feac605134",
+  "kind": "pve.guest.action",
+  "backupRefs": [],
+  "verification": "",
+  "rollbackAvailable": false,
+  "resolution": {
+    "kind": "pve.recovery-transfer/v1",
+    "basis": "local-unknown-clearance",
+    "parentChangeId": "pve-change-status-parent-0001",
+    "childChangeId": "pve-change-status-child-00001",
+    "childPlanHash": "sha256:925994d8797721463882c239d121b0821234d988b0a2385956ad987cf5f48456",
+    "resourceKey": "pve/vmid/100",
+    "transferredAt": "2026-08-08T00:00:00Z",
+    "parentMutationDisposition": "STARTED_OR_UNKNOWN",
+    "parentTaskEvidence": [],
+    "clearanceObservationDigest": "sha256:0b1f01cdd6c65043e3ab5d8296d18bd35e0dc18487adb3983b24f3bb1141e1a1",
+    "activeTaskDigest": "sha256:447ac92874c8607421c4e3a25174b289dfafb138eeeb0b74f9be82df2269ecfa",
+    "guestStateDigest": "sha256:c14de98e5ea1eb32f4d84c3f079936a4951bea7c6f4d3c40feb20838bba90b43",
+    "clusterStateDigest": "sha256:de38d3ee0755effa34068a60f2d795c67d99b74144f3e2dee61dc5227d838bfd"
+  },
+  "pveMutationVersion": 1,
+  "mutationDisposition": "STARTED_OR_UNKNOWN",
+  "recoveryOnly": false,
+  "plan": {
+    "version": 1,
+    "planHash": "sha256:d3bdda0b3388eae10a9c30b259700cf3f36a5569c6c6a4c9401cb9feac605134",
+    "policyRevision": "policy-pve-12345678",
+    "capabilityRevision": "capability-remote-v0.3-v8",
+    "preconditionDigest": "sha256:40877a8d0e9b39879d0905d5d2e77c8ae42a2f5b310370d1c5e3fb011c56e44c",
+    "pluginDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "steps": [
+      {
+        "id": "step-1",
+        "operation": "pve.guest.action",
+        "fields": [
+          { "name": "pluginId", "value": "workload.pve" },
+          { "name": "pluginDigest", "value": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+          { "name": "node", "value": "pve1" },
+          { "name": "guestType", "value": "qemu" },
+          { "name": "vmid", "value": "100" },
+          { "name": "action", "value": "start" },
+          { "name": "precondition.currentStatus", "value": "stopped" },
+          { "name": "precondition.currentLock", "value": "unlocked" }
+        ],
+        "reversible": false
+      }
+    ]
+  }
+}

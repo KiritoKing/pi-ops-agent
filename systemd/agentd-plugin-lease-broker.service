@@ -1,0 +1,49 @@
+[Unit]
+Description=Pi Ops Agent exact-digest plugin lease broker
+Documentation=file:/opt/pi-ops-agent/current/docs/security-model.md
+PartOf=ops-agent.target
+Before=ops-agentd.service
+After=local-fs.target
+ConditionPathIsDirectory=/var/lib/ops-agent/plugins/invocation-leases
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ops-agent-lease
+Group=ops-agent-lease
+# Runtime-only membership lets this process read immutable registrations. The
+# static account remains absent from ops-agent-client; SO_PEERCRED, not socket
+# DAC, authorizes each exact plugin lease request.
+SupplementaryGroups=ops-agent-client
+EnvironmentFile=/etc/ops-agent/runtime.env
+ExecStart=/opt/pi-ops-agent/current/bin/agentd-pluginctl lease-server --socket-gid=${OPS_CLIENT_GID} --agent-uid=${OPS_AGENT_UID} --administrator-uid=${OPS_ADMIN_UID} --botmux-uid=${OPS_BOTMUX_UID}
+Restart=always
+RestartSec=2s
+TimeoutStopSec=5s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/opt/pi-ops-agent /var/lib/ops-agent/plugins
+ReadWritePaths=/run/ops-agent/plugin-lease
+InaccessiblePaths=-/etc/ops-agent/credentials -/etc/ops-agent/tls -/etc/ops-agent/approver -/etc/ops-agent/broker-receipts/private -/var/lib/ops-agent/root-helper -/var/lib/ops-agent/pve-root-helper -/var/log/ops-agent -/run/ops-agent/helper -/run/ops-agent/reviewer

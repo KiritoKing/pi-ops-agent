@@ -1,0 +1,34 @@
+{
+  "supported": [
+    {
+      "operation": "service_status",
+      "unit": "hermes-gateway-coder.service"
+    },
+    {
+      "operation": "config_metadata",
+      "path": "/home/alice/.hermes/config.yaml"
+    },
+    {
+      "operation": "doctor",
+      "profileKey": "hermes.doctor"
+    },
+    {
+      "operation": "gateway_status",
+      "profileKey": "hermes.gateway.status"
+    },
+    {
+      "operation": "service_action",
+      "account": "alice",
+      "manager": "user",
+      "unit": "hermes-gateway.service",
+      "action": "restart"
+    }
+  ],
+  "unsupported": [
+    {
+      "operation": "arbitrary_cli",
+      "argv": ["--execute", "model-selected-command"]
+    },
+    { "operation": "config_write" }
+  ]
+}

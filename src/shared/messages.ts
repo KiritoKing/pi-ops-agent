@@ -4,41 +4,121 @@ import {
   requireRecord,
   requireString,
 } from "./guards.js";
+import {
+  parseChangeId as parseDomainChangeId,
+  parseSessionId,
+  parseTurnId,
+  type MachineId,
+  type SessionId,
+  type TargetId,
+  type TurnId,
+} from "./domain.js";
+import { requireExactRecord } from "./strict.js";
 
-const SESSION_ID = /^[a-zA-Z0-9._:-]{8,160}$/;
-const CHANGE_ID = /^[a-zA-Z0-9._-]{8,160}$/;
+export const AGENT_CLIENT_PEER_API_VERSION = "agentd.client-peer/v1" as const;
+
+export interface AgentClientPeerIdentity {
+  apiVersion: typeof AGENT_CLIENT_PEER_API_VERSION;
+  adapterId: string;
+  digest: string;
+}
 
 export type AgentClientMessage =
   | {
       type: "hello";
-      sessionId: string;
+      sessionId: SessionId;
+      peer: AgentClientPeerIdentity;
       initialPrompt?: string;
     }
-  | { type: "prompt"; text: string }
+  | { type: "prompt"; turnId: TurnId; text: string }
   | { type: "abort" }
   | { type: "ping" };
 
+interface AgentCorrelation {
+  sessionId: SessionId;
+  turnId: TurnId;
+  machineId?: MachineId;
+  targetId?: TargetId;
+}
+
 export type AgentServerMessage =
-  | { type: "ready"; sessionId: string }
-  | { type: "status"; state: "idle" | "working"; route?: string }
-  | { type: "delta"; text: string }
-  | { type: "tool"; phase: "start" | "end"; name: string; isError?: boolean }
-  | { type: "done" }
-  | { type: "error"; message: string }
+  | { type: "ready"; sessionId: SessionId }
+  | ({ type: "status"; state: "idle" | "working"; route?: string } & AgentCorrelation)
+  | ({ type: "delta"; text: string } & AgentCorrelation)
+  | ({
+      type: "tool";
+      phase: "start" | "end";
+      name: string;
+      isError?: boolean;
+      preparedChangeRefs?: readonly string[];
+    } & AgentCorrelation)
+  | ({ type: "done" } & AgentCorrelation)
+  | ({ type: "error"; message: string } & Partial<AgentCorrelation>)
   | { type: "pong" };
 
 export type RootOperation =
   | { kind: "package.install"; package: string; version?: string }
   | {
       kind: "service.action";
+      pluginId: "workload.base";
+      pluginDigest: string;
       unit: string;
       action: "restart" | "reload" | "start" | "stop";
     }
   | {
+      kind: "workload.service.action";
+      pluginId: string;
+      pluginDigest: string;
+      account: string;
+      manager: "system" | "user";
+      unit: string;
+      action: "reload" | "reset-failed" | "restart" | "start" | "stop";
+    }
+  | {
+      kind: "workload.json-config.edit";
+      pluginId: string;
+      sourceDigest: string;
+      profileKey: string;
+      selectorValue: string;
+      fieldKey: string;
+      value:
+        | { kind: "string"; stringValue: string }
+        | { kind: "boolean"; booleanValue: boolean }
+        | { kind: "clear" };
+    }
+  | {
       kind: "file.write";
+      pluginId: "workload.base";
+      pluginDigest: string;
       path: string;
       content: string;
       mode?: string;
+    }
+  | {
+      kind: "plugin.install";
+      pluginId: string;
+      version: string;
+      publisher: string;
+      digest: string;
+      artifactRef: string;
+    }
+  | {
+      kind: "plugin.register";
+      pluginId: string;
+      pluginKind: "adapter" | "workload";
+      version: string;
+      publisher: string;
+      digest: string;
+      capabilities: string[];
+      requestedScopes: string[];
+    }
+  | {
+      kind: "workload.deploy";
+      pluginId: string;
+      version: string;
+      publisher: string;
+      digest: string;
+      artifactRef: string;
     }
   | {
       kind: "breakglass.script";
@@ -46,6 +126,72 @@ export type RootOperation =
       backupPaths: string[];
       verifyScript?: string;
       network: boolean;
+    }
+  | {
+      kind: "pve.guest.action";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      action: "start" | "shutdown" | "stop" | "reboot";
+    }
+  | {
+      kind: "pve.snapshot.create";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      snapshot: string;
+      description?: string;
+    }
+  | {
+      kind: "pve.snapshot.delete" | "pve.snapshot.rollback";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      snapshot: string;
+      backupStorage: string;
+    }
+  | {
+      kind: "pve.guest.backup";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      storage: string;
+    }
+  | {
+      kind: "pve.guest.restore";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      backupVolume: string;
+      storage: string;
+    }
+  | {
+      kind: "pve.guest.migrate";
+      pluginId: string;
+      pluginDigest: string;
+      recoveryOfChangeId?: string;
+      node: string;
+      guestType: "qemu" | "lxc";
+      vmid: number;
+      targetNode: string;
+      online: boolean;
+      restart: boolean;
+      withLocalDisks: boolean;
     };
 
 export type HelperRequest =
@@ -97,29 +243,50 @@ export interface HelperResponse {
 }
 
 export function parseAgentClientMessage(value: unknown): AgentClientMessage {
-  const input = requireRecord(value, "agent message");
-  const type = requireString(input.type, "agent message.type", { max: 32 });
+  const base = requireRecord(value, "agent message");
+  const type = requireString(base.type, "agent message.type", { max: 32 });
   switch (type) {
     case "hello": {
-      const sessionId = requireString(input.sessionId, "sessionId", {
-        max: 160,
-        pattern: SESSION_ID,
-      });
+      const input = requireExactRecord(base, "agent hello", [
+        "type", "sessionId", "peer", "initialPrompt",
+      ]);
+      const sessionId = parseSessionId(input.sessionId);
+      const peer = requireExactRecord(input.peer, "agent hello.peer", [
+        "apiVersion", "adapterId", "digest",
+      ]);
+      if (peer.apiVersion !== AGENT_CLIENT_PEER_API_VERSION) {
+        throw new Error("agent hello.peer has an unsupported API version");
+      }
+      const parsedPeer: AgentClientPeerIdentity = {
+        apiVersion: AGENT_CLIENT_PEER_API_VERSION,
+        adapterId: requireString(peer.adapterId, "agent hello.peer.adapterId", {
+          max: 72,
+          pattern: /^adapter\.[a-z0-9][a-z0-9.-]{0,63}$/u,
+        }),
+        digest: requireString(peer.digest, "agent hello.peer.digest", {
+          pattern: /^sha256:[a-f0-9]{64}$/u,
+        }),
+      };
       const initialPrompt = optionalString(input.initialPrompt, "initialPrompt", {
         max: 64 * 1024,
       });
       return initialPrompt === undefined
-        ? { type, sessionId }
-        : { type, sessionId, initialPrompt };
+        ? { type, sessionId, peer: parsedPeer }
+        : { type, sessionId, peer: parsedPeer, initialPrompt };
     }
-    case "prompt":
+    case "prompt": {
+      const input = requireExactRecord(base, "agent prompt", ["type", "turnId", "text"]);
       return {
         type,
+        turnId: parseTurnId(input.turnId),
         text: requireString(input.text, "prompt.text", { max: 64 * 1024 }),
       };
+    }
     case "abort":
-    case "ping":
+    case "ping": {
+      requireExactRecord(base, `agent ${type}`, ["type"]);
       return { type };
+    }
     default:
       throw new Error(`unsupported agent message type: ${type}`);
   }
@@ -149,7 +316,7 @@ export function parseHelperResponse(value: unknown): HelperResponse {
 }
 
 export function parseChangeId(value: unknown): string {
-  return requireString(value, "changeId", { max: 160, pattern: CHANGE_ID });
+  return parseDomainChangeId(value);
 }
 
 export function isAgentServerMessage(value: unknown): value is AgentServerMessage {

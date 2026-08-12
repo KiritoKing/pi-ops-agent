@@ -1,0 +1,51 @@
+[Unit]
+Description=Pi Ops Agent peer-authenticated local client gateway
+Documentation=file:/opt/pi-ops-agent/current/docs/security-model.md
+PartOf=ops-agent.target
+Wants=ops-agentd.service
+After=ops-agentd.service
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ops-agent
+Group=ops-agent
+SupplementaryGroups=ops-agent-client
+EnvironmentFile=/etc/ops-agent/runtime.env
+ExecStart=/opt/pi-ops-agent/current/bin/agentd-client-gateway --socket-gid=${OPS_CLIENT_GID} --agent-uid=${OPS_AGENT_UID} --administrator-uid=${OPS_ADMIN_UID} --botmux-uid=${OPS_BOTMUX_UID}
+Restart=always
+RestartSec=2s
+TimeoutStopSec=5s
+TasksMax=128
+LimitNOFILE=512
+MemoryMax=256M
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/opt/pi-ops-agent /var/lib/ops-agent/plugins
+ReadWritePaths=/run/ops-agent/agentd
+InaccessiblePaths=-/etc/ops-agent/credentials -/etc/ops-agent/tls -/etc/ops-agent/approver -/etc/ops-agent/broker-receipts/private -/var/lib/ops-agent/root-helper -/var/lib/ops-agent/pve-root-helper -/var/lib/ops-agent/sessions -/var/lib/ops-agent/workspaces -/var/lib/ops-agent/registry -/var/lib/ops-agent/pi -/var/log/ops-agent -/run/ops-agent/helper -/run/ops-agent/reviewer
+
+[Install]
+WantedBy=ops-agent.target

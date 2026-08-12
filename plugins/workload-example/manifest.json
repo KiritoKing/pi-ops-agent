@@ -1,0 +1,14 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "workload.example",
+  "kind": "workload",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Minimal editable source-workload example with a pure, provider-free tool.",
+  "entrypoint": "workload.mjs",
+  "capabilities": [
+    "demo.echo"
+  ],
+  "requestedScopes": []
+}

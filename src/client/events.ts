@@ -1,5 +1,6 @@
 import { createWriteStream } from "node:fs";
 import type { Writable } from "node:stream";
+import type { MachineId, SessionId, TargetId, TurnId } from "../shared/domain.js";
 import { redactText } from "../shared/redaction.js";
 
 export const MAX_CLIENT_EVENT_CONTENT_BYTES = 64 * 1024;
@@ -10,8 +11,13 @@ export type ClientCompletionOutcome = "success" | "error";
 export interface ClientCompletionEvent {
   version: 1;
   type: "completion";
+  eventId: string;
   outcome: ClientCompletionOutcome;
   content: string;
+  sessionId?: SessionId;
+  turnId?: TurnId;
+  machineId?: MachineId;
+  targetId?: TargetId;
 }
 
 export interface ClientEventSink {

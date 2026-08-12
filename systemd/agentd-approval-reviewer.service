@@ -1,0 +1,44 @@
+[Unit]
+Description=Pi Ops Agent isolated approval plan reviewer
+Documentation=file:/opt/pi-ops-agent/current/docs/security-model.md
+PartOf=ops-agent.target
+Before=ops-agentd.service
+After=local-fs.target
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ops-agent-reviewer
+Group=ops-agent-reviewer
+ExecStart=/opt/pi-ops-agent/current/runtime/node /opt/pi-ops-agent/current/dist/reviewer/index.js --socket=/run/ops-agent/reviewer/reviewer.sock
+Restart=always
+RestartSec=2s
+TimeoutStopSec=5s
+UMask=0007
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/opt/pi-ops-agent
+ReadWritePaths=/run/ops-agent/reviewer
+InaccessiblePaths=-/etc/ops-agent -/run/ops-agent/agentd -/run/ops-agent/helper -/var/lib/ops-agent -/var/log/ops-agent -/run/docker.sock -/var/run/docker.sock
+
+[Install]
+WantedBy=ops-agent.target

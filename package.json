@@ -1,6 +1,6 @@
 {
   "name": "pi-ops-agent",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "private": true,
   "description": "A least-privilege, auditable Linux operations agent built on Pi.",
   "type": "module",
@@ -9,19 +9,21 @@
   },
   "bin": {
     "ops-agent": "dist/client/index.js",
-    "ops-agentd": "dist/agentd/index.js"
+    "ops-agentd": "dist/agentd/index.js",
+    "agentd-approval-reviewer": "dist/reviewer/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && node --check integrations/botmux/adapter.mjs && npm run test && go test ./...",
+    "test:adapter-linux-runtime": "bash scripts/probe-adapter-linux-runtime.sh",
+    "check": "npm run typecheck && npm run lint && node --check integrations/botmux/adapter.mjs && node --check plugins/workload-hermes/prepare-credentials.mjs && node --check scripts/configure-plugin-credentials.mjs && node --check scripts/initialize-target-policy.mjs && node --check test/fixtures/e2e/mock-openai-completions.mjs && node --check test/fixtures/e2e/local-ollama-openai-bridge.mjs && npm run test && go test ./...",
     "start:agentd": "node dist/agentd/index.js"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.83.0",
-    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
     "typebox": "1.3.10"
   },
   "devDependencies": {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agentd Adapter Development"
+  short_description: "Build safe source adapters for Agentd integrations"
+  default_prompt: "Use $agentd-adapter-dev to design and verify a source adapter for Agentd."

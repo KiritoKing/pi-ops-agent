@@ -1,13 +1,14 @@
 [Unit]
 Description=Read-only health report for Pi Ops Agent
-Documentation=file:/opt/pi-ops-agent/docs/operations.md
+Documentation=file:/opt/pi-ops-agent/current/docs/operations.md
 After=ops-agent.target
 
 [Service]
 Type=oneshot
 User=root
 Group=root
-ExecStart=/opt/pi-ops-agent/scripts/healthcheck.sh --strict
+ExecStart=/opt/pi-ops-agent/current/scripts/healthcheck.sh --strict
+SuccessExitStatus=2
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -19,6 +20,6 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 RestrictAddressFamilies=AF_UNIX
 ReadOnlyPaths=/opt/pi-ops-agent /etc/ops-agent /run/ops-agent /var/lib/ops-agent /var/log/ops-agent

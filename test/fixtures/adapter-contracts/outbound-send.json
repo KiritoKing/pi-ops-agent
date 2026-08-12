@@ -1,0 +1,8 @@
+{
+  "apiVersion": "agentd.adapter-outbound-action/v1",
+  "schemaVersion": 1,
+  "type": "send",
+  "actionId": "action:00000001",
+  "externalSessionId": "botmux/session/00000001",
+  "content": "The service is healthy."
+}

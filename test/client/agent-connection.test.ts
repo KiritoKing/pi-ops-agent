@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentConnection } from "../../src/client/agent-connection.js";
+import { parseSessionId, parseTurnId } from "../../src/shared/domain.js";
 import { encodeFrame, FrameDecoder } from "../../src/shared/framing.js";
 
 const temporaryDirectories: string[] = [];
@@ -31,10 +32,11 @@ describe("AgentConnection", () => {
         for (const frame of decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) {
           received.push(frame);
           if (received.length === 1) {
-            socket.write(encodeFrame({ type: "ready", sessionId: "session-1234" }));
-            socket.write(encodeFrame({ type: "status", state: "working" }));
-            socket.write(encodeFrame({ type: "delta", text: "ok" }));
-            socket.write(encodeFrame({ type: "done" }));
+            const correlation = { sessionId: "session-1234", turnId: "turn-12345678" };
+            socket.write(encodeFrame({ type: "ready", sessionId: correlation.sessionId }));
+            socket.write(encodeFrame({ type: "status", state: "working", ...correlation }));
+            socket.write(encodeFrame({ type: "delta", text: "ok", ...correlation }));
+            socket.write(encodeFrame({ type: "done", ...correlation }));
           } else {
             resolvePrompt?.();
           }
@@ -53,7 +55,15 @@ describe("AgentConnection", () => {
     });
     const connection = await AgentConnection.connect(
       socketPath,
-      { type: "hello", sessionId: "session-1234" },
+      {
+        type: "hello",
+        sessionId: parseSessionId("session-1234"),
+        peer: {
+          apiVersion: "agentd.client-peer/v1",
+          adapterId: "adapter.tui",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+      },
       {
         onMessage: (message) => {
           messages.push(message.type);
@@ -68,10 +78,22 @@ describe("AgentConnection", () => {
     connection.sendPrompt("next prompt");
     await Promise.all([promptReceived, messagesReceived]);
 
-    expect(received).toEqual([
-      { type: "hello", sessionId: "session-1234" },
-      { type: "prompt", text: "next prompt" },
-    ]);
+    expect(received[0]).toEqual(
+      {
+        type: "hello",
+        sessionId: "session-1234",
+        peer: {
+          apiVersion: "agentd.client-peer/v1",
+          adapterId: "adapter.tui",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+      },
+    );
+    expect(received[1]).toMatchObject({
+      type: "prompt",
+      text: "next prompt",
+    });
+    expect(() => parseTurnId((received[1] as { turnId?: unknown }).turnId)).not.toThrow();
     expect(messages).toEqual(["ready", "status", "delta", "done"]);
     connection.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));

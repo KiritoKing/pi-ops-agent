@@ -1,0 +1,28 @@
+{
+  "apiVersion": "agentd.plugin/v1",
+  "schemaVersion": 1,
+  "id": "workload.base",
+  "kind": "workload",
+  "version": "0.3.0",
+  "publisher": "KiritoKing/pi-ops-agent",
+  "description": "Baseline sandboxed diagnostics and workspace tools kept outside the security core.",
+  "entrypoint": "workload.mjs",
+  "capabilities": [
+    "artifact.catalog",
+    "breakglass.prepare",
+    "change.prepare",
+    "change.status",
+    "command.exec.sandbox",
+    "machine.describe",
+    "machine.list",
+    "target.inspect"
+  ],
+  "requestedScopes": [
+    "command.exec.sandbox",
+    "control.breakglass.prepare",
+    "control.machine.read",
+    "control.target.inspect",
+    "control.target.prepare",
+    "control.target.status"
+  ]
+}

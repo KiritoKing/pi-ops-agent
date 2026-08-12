@@ -1,0 +1,60 @@
+{
+  "supported": [
+    {
+      "operation": "service_status",
+      "unit": "botmux.service"
+    },
+    {
+      "operation": "config_metadata",
+      "path": "/home/alice/.botmux/bots.json"
+    },
+    {
+      "operation": "status",
+      "profileKey": "botmux.status"
+    },
+    {
+      "operation": "sessions_list",
+      "profileKey": "botmux.sessions.list"
+    },
+    {
+      "operation": "setup_summary",
+      "profileKey": "botmux.setup.summary"
+    },
+    {
+      "operation": "config_edit",
+      "selectorValue": "ops-agent",
+      "edit": {
+        "fieldKey": "model",
+        "value": {
+          "kind": "string",
+          "stringValue": "openai/gpt-5"
+        }
+      }
+    },
+    {
+      "operation": "config_edit",
+      "selectorValue": "ops-agent",
+      "edit": {
+        "fieldKey": "showInTeam",
+        "value": {
+          "kind": "boolean",
+          "booleanValue": true
+        }
+      }
+    },
+    {
+      "operation": "service_action",
+      "account": "alice",
+      "manager": "user",
+      "unit": "botmux.service",
+      "action": "restart"
+    }
+  ],
+  "unsupported": [
+    {
+      "operation": "raw_setup_json"
+    },
+    { "operation": "raw_config_write" },
+    { "operation": "arbitrary_cli", "argv": ["setup", "edit"] }
+  ]
+}

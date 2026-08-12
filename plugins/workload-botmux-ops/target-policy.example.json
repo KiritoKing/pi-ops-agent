@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "revision": "policy-botmux-example-v1",
+  "targets": [
+    {
+      "id": "target-alice-botmux",
+      "account": "alice",
+      "displayName": "Alice BotMux",
+      "inspect": {
+        "hostSnapshot": false,
+        "processList": false,
+        "units": ["botmux.service"],
+        "readPaths": ["/home/alice/.botmux/bots.json"]
+      },
+      "changes": {
+        "writePaths": [],
+        "units": [],
+        "packages": [],
+        "plugins": []
+      },
+      "authorization": {
+        "standingScopes": []
+      },
+      "serviceWorkloads": [
+        {
+          "pluginId": "workload.botmux-ops",
+          "pluginDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "account": "alice",
+          "manager": "user",
+          "units": ["botmux.service"],
+          "operations": ["reload", "reset-failed", "restart", "start", "stop"]
+        }
+      ],
+      "commandWorkloads": [
+        {
+          "pluginId": "workload.botmux-ops",
+          "pluginDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "targetAccount": "alice",
+          "profileKey": "botmux.sessions.list",
+          "runAsAccount": "alice",
+          "runAsHome": "/home/alice",
+          "executable": "/usr/local/bin/botmux",
+          "argv": ["list", "--plain"],
+          "timeoutSeconds": 30,
+          "maxOutputBytes": 32768
+        },
+        {
+          "pluginId": "workload.botmux-ops",
+          "pluginDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "targetAccount": "alice",
+          "profileKey": "botmux.setup.summary",
+          "runAsAccount": "alice",
+          "runAsHome": "/home/alice",
+          "executable": "/usr/local/bin/botmux",
+          "argv": ["setup", "list", "--json"],
+          "timeoutSeconds": 30,
+          "maxOutputBytes": 32768
+        },
+        {
+          "pluginId": "workload.botmux-ops",
+          "pluginDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "targetAccount": "alice",
+          "profileKey": "botmux.status",
+          "runAsAccount": "alice",
+          "runAsHome": "/home/alice",
+          "executable": "/usr/local/bin/botmux",
+          "argv": ["status"],
+          "timeoutSeconds": 30,
+          "maxOutputBytes": 32768
+        }
+      ],
+      "jsonConfigWorkloads": [
+        {
+          "pluginId": "workload.botmux-ops",
+          "pluginDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "targetAccount": "alice",
+          "profileKey": "botmux.bots",
+          "runAsUid": 1000,
+          "runAsHome": "/home/alice",
+          "relativeConfig": ".botmux/bots.json",
+          "selectorKey": "name",
+          "allowedSelectors": ["ops-agent"],
+          "fields": [
+            {
+              "fieldKey": "backendType",
+              "jsonField": "backendType",
+              "valueType": "string",
+              "allowClear": true,
+              "stringConstraint": "enum/v1",
+              "enumValues": ["pty", "tmux"]
+            },
+            {
+              "fieldKey": "defaultWorkingDir",
+              "jsonField": "defaultWorkingDir",
+              "valueType": "string",
+              "allowClear": true,
+              "stringConstraint": "absolute-path/v1",
+              "pathRoots": ["/home/alice", "/var/lib/ops-agent/workspace"]
+            },
+            {
+              "fieldKey": "model",
+              "jsonField": "model",
+              "valueType": "string",
+              "allowClear": true,
+              "stringConstraint": "model-id/v1"
+            },
+            {
+              "fieldKey": "showInTeam",
+              "jsonField": "showInTeam",
+              "valueType": "boolean",
+              "allowClear": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

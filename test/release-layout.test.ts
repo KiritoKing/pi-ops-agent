@@ -1,0 +1,991 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+function repositoryFile(path: string): string {
+  return readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+}
+
+const expectedActionPins = new Map<string, { sha: string; version: string }>([
+  [
+    "actions/checkout",
+    { sha: "3d3c42e5aac5ba805825da76410c181273ba90b1", version: "v7.0.1" },
+  ],
+  [
+    "actions/setup-node",
+    { sha: "820762786026740c76f36085b0efc47a31fe5020", version: "v7.0.0" },
+  ],
+  [
+    "actions/setup-go",
+    { sha: "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e", version: "v7.0.0" },
+  ],
+  [
+    "actions/upload-artifact",
+    { sha: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", version: "v7.0.1" },
+  ],
+  [
+    "actions/download-artifact",
+    { sha: "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", version: "v8.0.1" },
+  ],
+  [
+    "actions/attest",
+    { sha: "1e69f48acb82d1966a394da916b4c1698aa569d6", version: "v4.2.2" },
+  ],
+  [
+    "anchore/sbom-action",
+    { sha: "e22c389904149dbc22b58101806040fa8d37a610", version: "v0.24.0" },
+  ],
+]);
+
+function expectAuditableActionPins(workflow: string): void {
+  const usesLines = workflow
+    .split("\n")
+    .map((line) =>
+      /^\s*(?:-\s+)?uses:\s+(\S+)(?:\s+#\s+(\S+))?\s*$/u.exec(line),
+    )
+    .filter((match): match is RegExpExecArray => match !== null);
+
+  expect(usesLines.length).toBeGreaterThan(0);
+  for (const match of usesLines) {
+    const target = match[1];
+    if (target === undefined) throw new Error("workflow action match omitted its target");
+    if (target.startsWith("./")) continue;
+    const separator = target.lastIndexOf("@");
+    expect(separator, `remote action is missing an immutable ref: ${target}`).toBeGreaterThan(0);
+    const action = target.slice(0, separator);
+    const revision = target.slice(separator + 1);
+    const expected = expectedActionPins.get(action);
+    expect(expected, `unreviewed remote action in workflow: ${action}`).toBeDefined();
+    expect(revision).toMatch(/^[0-9a-f]{40}$/u);
+    expect(revision).toBe(expected?.sha);
+    expect(match[2]).toBe(expected?.version);
+  }
+}
+
+describe("native release layout", () => {
+  it("separates the 0.3.2 product release from unchanged digest-bound plugin versions", () => {
+    const packageDocument = JSON.parse(repositoryFile("package.json")) as { version?: unknown };
+    const lockDocument = JSON.parse(repositoryFile("package-lock.json")) as {
+      version?: unknown;
+      packages?: { ""?: { version?: unknown } };
+    };
+    expect(packageDocument.version).toBe("0.3.2");
+    expect(lockDocument.version).toBe("0.3.2");
+    expect(lockDocument.packages?.[""]?.version).toBe("0.3.2");
+    expect(repositoryFile("src/client/index.ts")).toContain('const VERSION = "0.3.2";');
+    expect(repositoryFile(".github/workflows/ci.yml")).toContain("RELEASE_VERSION: 0.3.2");
+
+    for (const manifestPath of [
+      "plugins/adapter-botmux-source/manifest.json",
+      "plugins/adapter-botmux/manifest.json",
+      "plugins/adapter-tui/manifest.json",
+      "plugins/workload-base/manifest.json",
+      "plugins/workload-botmux-ops/manifest.json",
+      "plugins/workload-example/manifest.json",
+      "plugins/workload-hermes-ops/manifest.json",
+      "plugins/workload-hermes/manifest.json",
+      "plugins/workload-pve/manifest.json",
+    ]) {
+      const manifest = JSON.parse(repositoryFile(manifestPath)) as { version?: unknown };
+      expect(manifest.version, manifestPath).toBe("0.3.0");
+    }
+
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    for (const releaseGuard of [packager, verifier]) {
+      expect(releaseGuard).toContain("pluginVersionPattern");
+      expect(releaseGuard).toContain("manifest.version.length > 96");
+      expect(releaseGuard).not.toContain("manifest.version !== expectedVersion");
+    }
+    expect(workflow).toContain("(( ${#plugin_version} <= 96 ))");
+    expect(workflow).not.toContain('test "${release_version}" = "${plugin_version}"');
+
+    const botmuxBuilder = repositoryFile("packaging/build-botmux-plugin.sh");
+    const hermesBuilder = repositoryFile("packaging/build-hermes-workload-plugin.sh");
+    expect(botmuxBuilder).toContain('[[ "${manifest_version}" != "${VERSION}" ]]');
+    expect(hermesBuilder).toContain('[[ "${manifest_version}" != "${VERSION}" ]]');
+    for (const caller of [packager, workflow]) {
+      expect(caller).toContain("botmux_plugin_version");
+      expect(caller).toContain("hermes_plugin_version");
+    }
+
+    const manifestBuilder = repositoryFile("packaging/create-release-manifest.sh");
+    expect(manifestBuilder).toContain('adapter-botmux_${botmux_plugin_version}.opspkg');
+    expect(manifestBuilder).toContain('workload-hermes_${hermes_plugin_version}.opspkg');
+    expect(manifestBuilder).not.toContain('adapter-botmux_${version}.opspkg');
+    expect(manifestBuilder).not.toContain('workload-hermes_${version}.opspkg');
+  });
+
+  it("builds only the current static Go command set", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+
+    expect(workflow).not.toContain("for command_dir in cmd/*");
+    for (const command of [
+      "ops-agent-server",
+      "ops-root-helper",
+      "agentd-guardian",
+      "agentd-client-gateway",
+      "agentd-pluginctl",
+      "agentd-approval-submit",
+      "agentd-json-config-helper",
+    ]) {
+      expect(workflow).toContain(command);
+      expect(packager).toContain(command);
+      expect(verifier).toContain(command);
+    }
+    expect(workflow).toContain("CGO_ENABLED=0 GOOS=linux");
+    expect(verifier).toContain("readelf -l");
+    expect(verifier).toContain("INTERP");
+    expect(packager).not.toContain('install -m 0755 "${BIN_DIR}/ops-systemd-helper"');
+    expect(verifier).toContain("bin/ops-systemd-helper");
+  });
+
+  it("ships and checks every v0.3 runtime plane and source extension surface", () => {
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+
+    for (const path of [
+      "config/agentd.json",
+      "config/models.json",
+      "dist/agentd/index.js",
+      "dist/client/index.js",
+      "dist/reviewer/index.js",
+      "dist/runtime/adapter-run.js",
+      "dist/runtime/botmux-setup-run.js",
+      "dist/runtime/workload-host.js",
+      "dist/shared/bubblewrap-containment.js",
+      "plugins/adapter-tui/manifest.json",
+      "plugins/adapter-tui/profile.json",
+      "plugins/adapter-botmux-source/manifest.json",
+      "plugins/adapter-botmux-source/adapter.mjs",
+      "plugins/workload-base/manifest.json",
+      "plugins/workload-base/workload.mjs",
+      "plugins/workload-botmux-ops/manifest.json",
+      "plugins/workload-botmux-ops/workload.mjs",
+      "plugins/workload-hermes-ops/manifest.json",
+      "plugins/workload-hermes-ops/workload.mjs",
+      "plugins/workload-pve/manifest.json",
+      "plugins/workload-pve/workload.mjs",
+      "plugins/workload-example/manifest.json",
+      "plugins/workload-example/workload.mjs",
+      "scripts/probe-adapter-linux-client.mjs",
+      "scripts/probe-adapter-linux-fixture.mjs",
+      "scripts/probe-adapter-linux-runtime.mjs",
+      "scripts/probe-adapter-linux-runtime.sh",
+      "scripts/probe-adapter-linux-socket.mjs",
+      "scripts/configure-noble-bwrap-apparmor.sh",
+      "skills/agentd-init/SKILL.md",
+      "skills/agentd-init/agents/openai.yaml",
+      "skills/agentd-adapter-dev/SKILL.md",
+      "skills/agentd-adapter-dev/agents/openai.yaml",
+      "skills/agentd-workload-dev/SKILL.md",
+      "skills/agentd-workload-dev/agents/openai.yaml",
+      "systemd/agentd-approval-reviewer.service",
+      "systemd/agentd-approval-reviewer.service.d/zzzz-ops-agent-security.conf",
+      "systemd/agentd-plugin-lease-broker.service",
+      "systemd/agentd-plugin-lease-broker.service.d/zzzz-ops-agent-security.conf",
+      "systemd/agentd-guardian.service",
+      "systemd/agentd-guardian.service.d/zzzz-ops-agent-security.conf",
+      "systemd/agentd-client-gateway.service",
+      "systemd/agentd-client-gateway.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agentd.service",
+      "systemd/ops-agentd.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-server.service",
+      "systemd/ops-agent-server.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-root-helper.service",
+      "systemd/ops-root-helper.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-healthcheck.service",
+      "systemd/ops-agent-healthcheck.service.d/zzzz-ops-agent-security.conf",
+      "systemd/ops-agent-healthcheck.timer",
+      "systemd/ops-agent.target",
+      "systemd/ops-agent.tmpfiles.conf",
+      "systemd/ops-agent-endpoint.tmpfiles.conf",
+      "systemd/ops-pve-root-helper.service",
+      "systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf",
+      "docs/workloads/pve.md",
+    ]) {
+      expect(packager).toContain(path);
+      expect(verifier).toContain(path);
+    }
+    expect(packager).toContain('cp -a "${REPOSITORY_ROOT}/plugins/."');
+    expect(packager).toContain('cp -a "${REPOSITORY_ROOT}/skills/."');
+    expect(packager).toContain("Refusing to package symlinks from Source Plugin or Skill trees");
+    expect(verifier).toContain("Release PVE broker must retain ProtectSystem=full");
+    expect(verifier).toContain(
+      "Release PVE broker is missing the exact /etc/pve pmxcfs write exception",
+    );
+    expect(verifier).toContain("Release core broker must keep /etc/pve inaccessible");
+    expect(verifier).toContain(
+      "Release non-PVE runtime must keep /etc/pve inaccessible",
+    );
+    expect(verifier).toContain("Release PVE broker opens a wider /etc path");
+    expect(verifier).toContain(
+      "Only the PVE broker may receive the /etc/pve write exception",
+    );
+    expect(repositoryFile("scripts/probe-adapter-linux-runtime.mjs")).toContain(
+      "lost: new Promise(() => {}),",
+    );
+    expect(packager).toContain(
+      "probe-adapter-linux-client.mjs probe-adapter-linux-fixture.mjs",
+    );
+  });
+
+  it("keeps the verified host-policy artifact as a fail-closed compatibility stage", () => {
+    const bootstrap = repositoryFile("scripts/install.sh");
+    const releaseBootstrap = repositoryFile("scripts/ops-agent-bootstrap.sh");
+    const packager = repositoryFile("packaging/build-release.sh");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+    const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
+
+    expect(bootstrap).toContain("host-policy status");
+    expect(bootstrap).not.toContain("host-policy ACTION");
+    expect(bootstrap).toContain("host-policy requires status");
+    expect(bootstrap).toContain(
+      "The Raw bootstrap requires an explicit OPS_AGENT_VERSION=vX.Y.Z",
+    );
+    expect(bootstrap).toContain(
+      '"$(cat "$payload_version_file")" != "${RELEASE_VERSION#v}"',
+    );
+    expect(bootstrap).toContain(
+      'release_bootstrap="${bootstrap_tmp}/release/ops-agent-bootstrap"',
+    );
+    expect(bootstrap).toContain('"$release_bootstrap" "$mode" "$@"');
+
+    expect(releaseBootstrap).toContain('if [[ "${mode}" == host-policy ]]');
+    expect(releaseBootstrap).toContain('exec "${host_policy_helper}" "$@"');
+    expect(releaseBootstrap).toContain('exec "${installer}" "${mode}" "$@"');
+    expect(releaseBootstrap).toContain("verify_root_release_tree");
+    expect(releaseBootstrap).toContain("-perm /022");
+    expect(releaseBootstrap).not.toContain("curl");
+    expect(releaseBootstrap).not.toContain("apt-get");
+
+    expect(packager).toContain(
+      '"${archive_root}/configure-noble-bwrap-apparmor.sh"',
+    );
+    expect(packager).toContain(
+      '"${archive_root}/ops-agent-bootstrap"',
+    );
+    expect(packager).toContain(
+      'exec "/usr/lib/ops-agent-payload/${VERSION}/ops-agent-bootstrap" "\\$@"',
+    );
+    expect(packager).toContain(
+      "host-policy inspect/install are unavailable and never mutate host policy",
+    );
+    expect(verifier).toContain("Archive is missing its executable pre-init host-policy helper");
+    expect(verifier).toContain("Outer and installed host-policy helpers differ");
+    expect(verifier).toContain("Archive is missing its executable release bootstrap");
+    const releaseBootstrapSha256 = createHash("sha256")
+      .update(releaseBootstrap)
+      .digest("hex");
+    expect(verifier).toContain(
+      `EXPECTED_RELEASE_BOOTSTRAP_SHA256="${releaseBootstrapSha256}"`,
+    );
+    expect(verifier).toContain(
+      "Debian bootstrap does not delegate exactly to its versioned release wrapper",
+    );
+    expect(verifier).toContain("dpkg-deb -e");
+    expect(verifier).toContain('dpkg-deb --fsys-tarfile "${DEBIAN_PACKAGE}"');
+    expect(verifier).toContain('dpkg-deb --ctrl-tarfile "${DEBIAN_PACKAGE}"');
+    expect(verifier).toContain(
+      "Debian data archive contains a non-root numeric owner/group",
+    );
+    expect(verifier).toContain(
+      "Debian postinst differs from the audited non-mutating contract",
+    );
+    expect(continuousIntegration).toContain(
+      "/var/tmp/ops-agent-bootstrap-ci.XXXXXX",
+    );
+    expect(continuousIntegration).toContain("host-policy inspect");
+    expect(continuousIntegration).toContain("host-policy install");
+    expect(continuousIntegration).toContain(
+      "Unsupported host-policy install unexpectedly succeeded",
+    );
+  });
+
+  it("checks archive/deb parity and the pinned production runtime before SBOM generation", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    const verifier = repositoryFile("packaging/verify-release.sh");
+
+    expect(workflow).toMatch(/NODE_VERSION: 22\.\d+\.\d+/u);
+    expect(workflow).toMatch(/GO_VERSION: 1\.\d+\.\d+/u);
+    expect(workflow).toContain("packaging/verify-release.sh");
+    expect(workflow).toContain("uses: ./.github/workflows/ci.yml");
+    expect(workflow).toContain("- ci-release-gates");
+    expect(workflow).toContain(
+      "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0",
+    );
+    expect(workflow).toContain("upload-release-assets: false");
+    expect(workflow.indexOf("packaging/verify-release.sh")).toBeLessThan(
+      workflow.indexOf("Generate installed-payload SPDX SBOM"),
+    );
+    expect(verifier).toContain("Debian and native archive payloads differ");
+    expect(verifier).toContain("process.versions.node");
+    expect(verifier).toContain('dist/client/index.js" --version');
+    expect(verifier).toContain('dist/reviewer/index.js" </dev/null');
+    expect(verifier).toContain("--no-payload-execution");
+    expect(verifier).toContain("without executing downloaded payload code");
+  });
+
+  it("blocks publish on the real Linux Adapter runtime probe", () => {
+    const releaseWorkflow = repositoryFile(".github/workflows/release.yml");
+    const continuousIntegration = repositoryFile(".github/workflows/ci.yml");
+    const adapterProbe = repositoryFile("scripts/probe-adapter-linux-runtime.sh");
+    const probeJobStart = releaseWorkflow.indexOf("  adapter-linux-runtime:\n");
+    const buildJobStart = releaseWorkflow.indexOf("\n  build:\n", probeJobStart);
+    const candidateJobStart = releaseWorkflow.indexOf(
+      "\n  release-candidate-verification:\n",
+      buildJobStart,
+    );
+    const publishJobStart = releaseWorkflow.indexOf(
+      "\n  publish:\n",
+      candidateJobStart,
+    );
+    const continuousProbeStart = continuousIntegration.indexOf(
+      "  adapter-linux-runtime:\n",
+    );
+    const installerStart = continuousIntegration.indexOf(
+      "\n  installer-runtime:\n",
+      continuousProbeStart,
+    );
+
+    expect(probeJobStart).toBeGreaterThan(0);
+    expect(buildJobStart).toBeGreaterThan(probeJobStart);
+    expect(candidateJobStart).toBeGreaterThan(buildJobStart);
+    expect(publishJobStart).toBeGreaterThan(candidateJobStart);
+    expect(continuousProbeStart).toBeGreaterThan(0);
+    expect(installerStart).toBeGreaterThan(continuousProbeStart);
+    const releaseProbeJob = releaseWorkflow.slice(probeJobStart, buildJobStart);
+    const continuousProbeJob = continuousIntegration.slice(
+      continuousProbeStart,
+      installerStart,
+    );
+    expect(releaseProbeJob).toContain("needs: validate");
+    expect(releaseProbeJob).toContain(
+      "RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}",
+    );
+    expect(releaseProbeJob).toContain(
+      'readonly release_version="${RELEASE_VERSION}"',
+    );
+    expect(continuousProbeJob).toContain(
+      'readonly release_version="${RELEASE_VERSION}"',
+    );
+    expect(adapterProbe).toContain(
+      'probe_node_override="${OPS_AGENT_ADAPTER_PROBE_NODE_PATH:-}"',
+    );
+    expect(adapterProbe).toContain(
+      'if [[ "${probe_node_override}" != /* ]]',
+    );
+    expect(adapterProbe).toContain(
+      "OPS_AGENT_ADAPTER_PROBE_NODE_PATH must be an absolute test fixture path",
+    );
+    expect(adapterProbe.indexOf('node_path="${probe_node_override}"')).toBeLessThan(
+      adapterProbe.indexOf('elif [[ -x "${REPOSITORY_ROOT}/runtime/node" ]]'),
+    );
+    expect(adapterProbe).toContain(
+      'node_path="$(readlink -f -- "${node_path}")"',
+    );
+
+    for (const probeJob of [releaseProbeJob, continuousProbeJob]) {
+      expect(probeJob).toContain("runs-on: ubuntu-22.04");
+      expect(probeJob).toContain("node-version: ${{ env.NODE_VERSION }}");
+      expect(probeJob).not.toContain("node-version: 24");
+      expect(probeJob).toContain("npm run build");
+      expect(probeJob).toContain(
+        "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz",
+      );
+      expect(probeJob).toContain(
+        'readonly bwrap_sha256="c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1"',
+      );
+      expect(probeJob).toContain("sha256sum --check --strict");
+      expect(probeJob).toContain(
+        "build-essential ca-certificates curl libcap-dev libcap2-bin \\",
+      );
+      expect(probeJob).toContain("meson ninja-build pkg-config xz-utils");
+      for (const buildOption of [
+        "-Dtests=false",
+        "-Dman=disabled",
+        "-Dselinux=disabled",
+        "-Dbash_completion=disabled",
+        "-Dzsh_completion=disabled",
+      ]) {
+        expect(probeJob).toContain(buildOption);
+      }
+      expect(probeJob).toContain(
+        "if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]",
+      );
+      expect(probeJob).toContain(
+        "Refusing to replace a pre-existing /usr/bin/bwrap",
+      );
+      expect(probeJob).toContain(
+        "sudo /usr/bin/install -o root -g root -m 0755",
+      );
+      expect(probeJob).toContain(
+        "test \"$(/usr/bin/bwrap --version)\" = \"bubblewrap ${bwrap_version}\"",
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f /usr/bin/bwrap)" = "/usr/bin/bwrap"',
+      );
+      expect(probeJob).toContain("test -f /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -L /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -u /usr/bin/bwrap");
+      expect(probeJob).toContain("test ! -g /usr/bin/bwrap");
+      expect(probeJob).toContain(
+        "test \"$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)\" = \\",
+      );
+      expect(probeJob).toContain('"root:root:755:nlink1"');
+      expect(probeJob).toContain(
+        'bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"',
+      );
+      expect(probeJob).toContain('test -z "${bwrap_capabilities}"');
+      expect(probeJob).toContain("-- '--disable-userns'");
+      expect(probeJob).toContain(
+        "Install the root-owned Adapter Node runtime fixture",
+      );
+      expect(probeJob).toContain(
+        'readonly install_root="/opt/pi-ops-agent"',
+      );
+      expect(probeJob).toContain(
+        'readonly release_root="${install_root}/releases/${release_version}"',
+      );
+      expect(probeJob).toContain(
+        'readonly node_bin="${release_root}/runtime/node"',
+      );
+      expect(probeJob).toContain(
+        'readonly current_link="${install_root}/current"',
+      );
+      expect(probeJob).toContain(
+        'node_source="$(/usr/bin/readlink -f "$(command -v node)")"',
+      );
+      expect(probeJob).toContain(
+        'node_version="$("${node_source}" -p \'process.versions.node\')"',
+      );
+      expect(probeJob).toContain(
+        'test "${node_version}" = "${NODE_VERSION}"',
+      );
+      expect(probeJob).toContain(
+        'node_digest="$(/usr/bin/sha256sum "${node_source}" | /usr/bin/cut -d\' \' -f1)"',
+      );
+      expect(probeJob).toContain(
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+      );
+      expect(probeJob).toContain(
+        "Refusing to reuse a pre-existing /opt/pi-ops-agent fixture",
+      );
+      expect(probeJob).toContain(
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+      );
+      expect(probeJob).toContain(
+        '"${node_source}" "${node_bin}"',
+      );
+      expect(probeJob).toContain(
+        'sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"',
+      );
+      expect(probeJob).toContain(
+        'sudo /usr/bin/chown -h root:root "${current_link}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)" = "root:root"',
+      );
+      expect(probeJob).toContain(
+        "sudo /usr/bin/chmod 0755 /opt",
+      );
+      expect(probeJob).not.toContain("chmod 777");
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)" = "root:root:755"',
+      );
+      const optDirectoryCheck = probeJob.indexOf("test -d /opt");
+      const optSymlinkCheck = probeJob.indexOf("test ! -L /opt", optDirectoryCheck);
+      const optOwnerCheck = probeJob.indexOf(
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)" = "root:root"',
+        optSymlinkCheck,
+      );
+      const optChmod = probeJob.indexOf(
+        "sudo /usr/bin/chmod 0755 /opt",
+        optOwnerCheck,
+      );
+      const optExactCheck = probeJob.indexOf(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)" = "root:root:755"',
+        optChmod,
+      );
+      const installRootReuseCheck = probeJob.indexOf(
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+        optExactCheck,
+      );
+      const installRootCreation = probeJob.indexOf(
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+        installRootReuseCheck,
+      );
+      expect(optDirectoryCheck).toBeGreaterThan(0);
+      expect(optSymlinkCheck).toBeGreaterThan(optDirectoryCheck);
+      expect(optOwnerCheck).toBeGreaterThan(optSymlinkCheck);
+      expect(optChmod).toBeGreaterThan(optOwnerCheck);
+      expect(optExactCheck).toBeGreaterThan(optChmod);
+      expect(installRootReuseCheck).toBeGreaterThan(optExactCheck);
+      expect(installRootCreation).toBeGreaterThan(installRootReuseCheck);
+      expect(probeJob).toContain(
+        '"${install_root}" "${install_root}/releases" \\',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' "${directory}")" = "root:root:755"',
+      );
+      expect(probeJob).toContain('test -L "${current_link}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G\' "${current_link}")" = "root:root"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink "${current_link}")" = \\',
+      );
+      expect(probeJob).toContain('"releases/${release_version}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${current_link}")" = "${release_root}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${current_link}/runtime/node")" = \\',
+      );
+      expect(probeJob).toContain(
+        'test "$("${node_bin}" -p \'process.versions.node\')" = "${NODE_VERSION}"',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/sha256sum "${node_bin}" | /usr/bin/cut -d\' \' -f1)" = \\',
+      );
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/readlink -f "${node_bin}")" = "${node_bin}"',
+      );
+      expect(probeJob).toContain('test -f "${node_bin}"');
+      expect(probeJob).toContain('test ! -L "${node_bin}"');
+      expect(probeJob).toContain('test ! -u "${node_bin}"');
+      expect(probeJob).toContain('test ! -g "${node_bin}"');
+      expect(probeJob).toContain(
+        'test "$(/usr/bin/stat -c \'%U:%G:%a:nlink%h\' "${node_bin}")" = \\',
+      );
+      expect(probeJob).toContain(
+        'node_capabilities="$(/usr/sbin/getcap "${node_bin}")"',
+      );
+      expect(probeJob).toContain('test -z "${node_capabilities}"');
+      expect(probeJob).toContain("Create the disposable Adapter identity fixture");
+      expect(probeJob).toContain(
+        'readonly node_bin="/opt/pi-ops-agent/current/runtime/node"',
+      );
+      expect(probeJob).toContain(
+        'readonly node_directory="/opt/pi-ops-agent/current/runtime"',
+      );
+      expect(probeJob).toContain(
+        'setup_node_directory="$(dirname "$(command -v node)")"',
+      );
+      expect(probeJob).toContain(
+        '"OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}"',
+      );
+      expect(probeJob).toContain(
+        '"PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+      );
+      expect(probeJob).toContain("npm run test:adapter-linux-runtime");
+      expect(probeJob).toContain('probe_status="$?"');
+      expect(probeJob).toContain("status 77 is unverified and blocks release");
+      expect(probeJob).not.toContain("continue-on-error");
+      expect(probeJob).not.toContain("apparmor_parser");
+      expect(probeJob).not.toContain("apparmor-profiles");
+      expect(probeJob).not.toContain("sysctl");
+      expect(probeJob).not.toContain("setcap");
+
+      const orderedMilestones = [
+        "sha256sum --check --strict",
+        'tar -xJf "${bwrap_archive}"',
+        'meson setup "${bwrap_build}"',
+        'meson compile -C "${bwrap_build}" bwrap',
+        "if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]",
+        "sudo /usr/bin/install -o root -g root -m 0755",
+        'test "$(/usr/bin/bwrap --version)"',
+        'test "$(/usr/bin/readlink -f /usr/bin/bwrap)"',
+        "test -f /usr/bin/bwrap",
+        "test ! -L /usr/bin/bwrap",
+        "test ! -u /usr/bin/bwrap",
+        "test ! -g /usr/bin/bwrap",
+        "test \"$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)\"",
+        'bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"',
+        'test -z "${bwrap_capabilities}"',
+        "/usr/bin/bwrap --help",
+        "name: Install the root-owned Adapter Node runtime fixture",
+        'node_source="$(/usr/bin/readlink -f "$(command -v node)")"',
+        'node_version="$("${node_source}" -p \'process.versions.node\')"',
+        'test "${node_version}" = "${NODE_VERSION}"',
+        'node_digest="$(/usr/bin/sha256sum "${node_source}"',
+        "test -d /opt",
+        "test ! -L /opt",
+        'test "$(/usr/bin/stat -c \'%U:%G\' /opt)"',
+        "sudo /usr/bin/chmod 0755 /opt",
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' /opt)"',
+        'if [[ -e "${install_root}" || -L "${install_root}" ]]',
+        "sudo /usr/bin/install -d -o root -g root -m 0755",
+        '"${node_source}" "${node_bin}"',
+        'sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"',
+        'sudo /usr/bin/chown -h root:root "${current_link}"',
+        'test "$(/usr/bin/stat -c \'%U:%G:%a\' "${directory}")"',
+        'test -L "${current_link}"',
+        'test "$(/usr/bin/readlink "${current_link}")"',
+        'test "$(/usr/bin/readlink -f "${current_link}")"',
+        'test "$(/usr/bin/readlink -f "${current_link}/runtime/node")"',
+        'test "$("${node_bin}" -p \'process.versions.node\')"',
+        'test "$(/usr/bin/sha256sum "${node_bin}"',
+        'test "$(/usr/bin/readlink -f "${node_bin}")"',
+        'test -f "${node_bin}"',
+        'test ! -L "${node_bin}"',
+        'test ! -u "${node_bin}"',
+        'test ! -g "${node_bin}"',
+        'test "$(/usr/bin/stat -c \'%U:%G:%a:nlink%h\' "${node_bin}")"',
+        'node_capabilities="$(/usr/sbin/getcap "${node_bin}")"',
+        'test -z "${node_capabilities}"',
+        "name: Create the disposable Adapter identity fixture",
+        'setup_node_directory="$(dirname "$(command -v node)")"',
+        '"OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}"',
+        '"PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+        "npm run test:adapter-linux-runtime",
+      ];
+      for (let index = 1; index < orderedMilestones.length; index += 1) {
+        const previous = orderedMilestones[index - 1];
+        const current = orderedMilestones[index];
+        if (previous === undefined || current === undefined) {
+          throw new Error("ordered Adapter gate milestone is missing");
+        }
+        expect(probeJob.indexOf(previous)).toBeGreaterThanOrEqual(0);
+        expect(probeJob.indexOf(previous)).toBeLessThan(probeJob.indexOf(current));
+      }
+    }
+
+    expect(continuousIntegration).toContain("workflow_call:");
+    const candidateJob = releaseWorkflow.slice(candidateJobStart, publishJobStart);
+    expect(candidateJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n/u,
+    );
+    const publishJob = releaseWorkflow.slice(publishJobStart);
+    expect(publishJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n\s+- release-candidate-verification\n/u,
+    );
+  });
+
+  it("verifies pull-request and manual release candidates without publishing", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    const validateStart = workflow.indexOf("  validate:\n");
+    const adapterStart = workflow.indexOf("\n  adapter-linux-runtime:\n", validateStart);
+    const candidateStart = workflow.indexOf("\n  release-candidate-verification:\n");
+    const publishStart = workflow.indexOf("\n  publish:\n", candidateStart);
+    expect(validateStart).toBeGreaterThan(0);
+    expect(adapterStart).toBeGreaterThan(validateStart);
+    expect(candidateStart).toBeGreaterThan(adapterStart);
+    expect(publishStart).toBeGreaterThan(candidateStart);
+
+    const triggerBlock = workflow.slice(0, workflow.indexOf("permissions:"));
+    expect(triggerBlock).toContain('tags:\n      - "v*.*.*"');
+    expect(triggerBlock).toContain("pull_request:\n    branches:\n      - main");
+    expect(triggerBlock).toContain("workflow_dispatch:");
+
+    const validateJob = workflow.slice(validateStart, adapterStart);
+    for (const output of ["release_version", "release_tag", "source_sha"]) {
+      expect(validateJob).toContain(
+        `${output}: \${{ steps.release_identity.outputs.${output} }}`,
+      );
+      expect(validateJob).toContain(`printf '${output}=%s\\n'`);
+    }
+    expect(validateJob).toContain('source_sha="$(git rev-parse HEAD)"');
+    expect(validateJob).toContain('test "${source_sha}" = "${GITHUB_SHA}"');
+    expect(validateJob).toContain(
+      'release_version="$(node -p \'require("./package.json").version\')"',
+    );
+    expect(validateJob).toContain('expected_release_tag="v${release_version}"');
+    expect(validateJob).toContain('release_tag=""');
+    expect(validateJob).toContain("pull_request|workflow_dispatch)");
+    expect(validateJob).toContain(
+      'test "${GITHUB_REF}" = "refs/tags/${expected_release_tag}"',
+    );
+    expect(validateJob).toContain('release_tag="${expected_release_tag}"');
+
+    const downstream = workflow.slice(adapterStart);
+    expect(downstream).not.toContain("${GITHUB_REF_NAME#v}");
+    expect(downstream).not.toContain('"${GITHUB_SHA}"');
+    expect(downstream).toContain(
+      "RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}",
+    );
+    expect(downstream).toContain(
+      "SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}",
+    );
+
+    const candidateJob = workflow.slice(candidateStart, publishStart);
+    expect(candidateJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n/u,
+    );
+    expect(candidateJob).toContain("pattern: native-*");
+    expect(candidateJob).toContain("merge-multiple: true");
+    expect(candidateJob).toContain("packaging/verify-release.sh");
+    expect(candidateJob).toContain("--no-payload-execution");
+    expect(candidateJob).toContain("packaging/build-botmux-plugin.sh");
+    expect(candidateJob).toContain("packaging/build-hermes-workload-plugin.sh");
+    expect(candidateJob).toContain("packaging/create-release-manifest.sh");
+    expect(candidateJob).toContain("sha256sum -- * | sort -k 2 > checksums.txt");
+    expect(candidateJob).toContain(
+      "name: release-candidate-${{ needs.validate.outputs.source_sha }}",
+    );
+    expect(candidateJob).toContain(
+      "Candidate verified; no release or tag was created.",
+    );
+    expect(candidateJob).not.toContain("permissions:");
+    expect(candidateJob).not.toContain("actions/attest@");
+    expect(candidateJob).not.toContain("gh release create");
+
+    const publishJob = workflow.slice(publishStart);
+    expect(publishJob).toContain("github.event_name == 'push'");
+    expect(publishJob).toContain("github.ref_type == 'tag'");
+    expect(publishJob).toContain(
+      "github.ref_name == needs.validate.outputs.release_tag",
+    );
+    expect(publishJob).toContain(
+      "github.ref == format('refs/tags/{0}', needs.validate.outputs.release_tag)",
+    );
+    expect(publishJob).toMatch(
+      /needs:\n\s+- validate\n\s+- build\n\s+- adapter-linux-runtime\n\s+- ci-release-gates\n\s+- release-candidate-verification\n/u,
+    );
+    expect(publishJob).toContain("contents: write");
+    expect(publishJob).toContain("id-token: write");
+    expect(publishJob).toContain("attestations: write");
+    expect(publishJob).toContain("artifact-metadata: write");
+    for (const writePermission of [
+      "contents: write",
+      "id-token: write",
+      "attestations: write",
+      "artifact-metadata: write",
+    ]) {
+      expect(workflow.split(writePermission)).toHaveLength(2);
+    }
+    expect(publishJob).toContain(
+      "name: release-candidate-${{ needs.validate.outputs.source_sha }}",
+    );
+    expect(publishJob).toContain(
+      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+    );
+    expect(publishJob).toContain("node-version: 24");
+    expect(publishJob).toContain("sha256sum --check --strict checksums.txt");
+    expect(publishJob).toContain("packaging/verify-release.sh");
+    expect(publishJob).toContain("actions/attest@");
+    expect(publishJob).toContain('gh release create "${RELEASE_TAG}"');
+  });
+
+  it("gates releases on a disposable signed non-PVE join and rollback", () => {
+    const workflow = repositoryFile(".github/workflows/ci.yml");
+    const installerStart = workflow.indexOf("  installer-runtime:\n");
+    const joinStart = workflow.indexOf("  join-installer-runtime:\n");
+    expect(installerStart).toBeGreaterThan(0);
+    expect(joinStart).toBeGreaterThan(installerStart);
+
+    const installerJob = workflow.slice(installerStart, joinStart);
+    expect(installerJob).toContain("name: Export the verified installer payload for the join gate");
+    expect(installerJob).toContain("name: installer-runtime-amd64");
+    expect(installerJob).toContain("release/ops-agent-linux-amd64.tar.gz");
+    expect(installerJob).toContain("ops-agent-linux-amd64.tar.gz.sha256");
+    expect(installerJob).toContain("if-no-files-found: error");
+    expect(installerJob).toContain("overwrite: true");
+    expect(installerJob).toContain(
+      "Reject host policy and controller init before persistent mutation",
+    );
+    expect(installerJob).toContain("Early rejection created managed path");
+    expect(installerJob).not.toContain(
+      "Install successfully under the restored effective policy",
+    );
+
+    const joinJob = workflow.slice(joinStart);
+    expect(joinJob).toContain("needs: installer-runtime");
+    expect(joinJob).toContain("runs-on: ubuntu-24.04");
+    expect(joinJob).toContain("name: installer-runtime-amd64");
+    expect(joinJob).toContain("sha256sum --check --strict ops-agent-linux-amd64.tar.gz.sha256");
+    expect(joinJob).not.toContain("actions/checkout@");
+    expect(joinJob).not.toContain("go build");
+    expect(joinJob).not.toContain("packaging/build-release.sh");
+    expect(joinJob).toContain("ops-agent-server\" \\\n            issue-enrollment");
+    expect(joinJob).toContain("--token-file \"${enrollment_token}\"");
+    expect(joinJob).toContain("issued enrollment is not a signed non-PVE v2 bundle");
+    expect(joinJob).toContain("Disposable join runner unexpectedly has the PVE entrypoint");
+
+    for (const evidence of [
+      "ops-pve-root-helper.service",
+      "multi-user.target.wants/ops-pve-root-helper.service",
+      "zzzz-ops-agent-security.conf",
+      "50-ci-third-party-pve.conf",
+      "/var/lib/ops-agent/pve-root-helper/historical.marker",
+      "/var/log/ops-agent/pve-root-helper/audit.jsonl",
+      "OPS_AGENT_TEST_FAIL_AT=services",
+      "all managed paths, identities and unit state were restored",
+      "upgraded with its validated enrollment unchanged",
+      "systemd-analyze verify",
+      "FragmentPath",
+      "DropInPaths",
+      "ReadWritePaths",
+      "SupplementaryGroups",
+      "ops-agent-failed-fresh-join.log",
+      "failed_fresh_status",
+      "fresh-join-token.sha256",
+      "fresh-join-token.stat",
+      "Fresh join rollback retained managed path",
+      "multi-user.target.wants/ops-agent-server.service",
+      "multi-user.target.wants/ops-root-helper.service",
+    ]) {
+      expect(joinJob).toContain(evidence);
+    }
+    const freshFailure = joinJob.indexOf("ops-agent-failed-fresh-join.log");
+    const freshSuccess = joinJob.indexOf("ops-agent-fresh-join.log");
+    expect(freshFailure).toBeGreaterThan(0);
+    expect(freshSuccess).toBeGreaterThan(freshFailure);
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      "OPS_AGENT_TEST_FAIL_AT=services",
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      '--token-file "${enrollment_token}"',
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      'test "${failed_fresh_status}" -eq 97',
+    );
+    expect(joinJob.slice(freshFailure, freshSuccess)).toContain(
+      '[[ -e "${path}" ]] || [[ -L "${path}" ]]',
+    );
+    expect(joinJob.indexOf("OPS_AGENT_TEST_FAIL_AT=services")).toBeLessThan(
+      joinJob.indexOf("Upgrade cleanly and verify the non-PVE join topology"),
+    );
+    expect(joinJob).not.toContain("continue-on-error");
+  });
+
+  it("pins every remote workflow action to a reviewed full commit", () => {
+    expectAuditableActionPins(repositoryFile(".github/workflows/ci.yml"));
+    expectAuditableActionPins(repositoryFile(".github/workflows/release.yml"));
+  });
+
+  it("isolates verified packages before third-party SBOM code and re-verifies downloads", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+    const nativeVerify = workflow.indexOf("packaging/verify-release.sh");
+    const packageUpload = workflow.indexOf(
+      "name: Isolate verified native packages before SBOM generation",
+    );
+    const sbom = workflow.indexOf("name: Generate installed-payload SPDX SBOM");
+    const sbomUpload = workflow.indexOf("name: Upload generated SBOM separately");
+    expect(nativeVerify).toBeGreaterThan(0);
+    expect(nativeVerify).toBeLessThan(packageUpload);
+    expect(packageUpload).toBeLessThan(sbom);
+    expect(sbom).toBeLessThan(sbomUpload);
+
+    const packageUploadBlock = workflow.slice(packageUpload, sbom);
+    expect(packageUploadBlock).toContain("name: native-packages-${{ matrix.arch }}");
+    expect(packageUploadBlock).toContain("ops-agent-linux-${{ matrix.arch }}.tar.gz");
+    expect(packageUploadBlock).toContain(
+      "ops-agent-all_${{ needs.validate.outputs.release_version }}",
+    );
+    expect(packageUploadBlock).toContain("if-no-files-found: error");
+    expect(packageUploadBlock).not.toContain("overwrite: true");
+    expect(packageUploadBlock).not.toContain("overwrite:");
+    expect(packageUploadBlock).not.toContain("spdx");
+    expect(packageUploadBlock).not.toContain("release/*");
+
+    const candidateStart = workflow.indexOf("release-candidate-verification:");
+    const publishStart = workflow.indexOf("\n  publish:\n", candidateStart);
+    const sbomUploadBlock = workflow.slice(sbomUpload, candidateStart);
+    expect(sbomUploadBlock).toContain("name: native-sbom-${{ matrix.arch }}");
+    expect(sbomUploadBlock).toContain(
+      "path: release/ops-agent-linux-${{ matrix.arch }}.spdx.json",
+    );
+    expect(sbomUploadBlock).not.toContain(".tar.gz");
+    expect(sbomUploadBlock).not.toContain(".deb");
+    expect(sbomUploadBlock).toContain("if-no-files-found: error");
+    expect(sbomUploadBlock).not.toContain("overwrite: true");
+    expect(sbomUploadBlock).not.toContain("overwrite:");
+
+    const candidateDownload = workflow.indexOf(
+      "actions/download-artifact@",
+      candidateStart,
+    );
+    const candidateVerify = workflow.indexOf(
+      "name: Re-verify downloaded native packages",
+      candidateDownload,
+    );
+    const manifest = workflow.indexOf(
+      "name: Generate release candidate manifest and checksums",
+      candidateVerify,
+    );
+    const candidateUpload = workflow.indexOf(
+      "name: Upload the aggregated verified release candidate",
+      manifest,
+    );
+    const publishDownload = workflow.indexOf("actions/download-artifact@", publishStart);
+    const publishVerify = workflow.indexOf(
+      "name: Verify the aggregated candidate and native packages",
+      publishDownload,
+    );
+    const attest = workflow.indexOf("name: Attest release artifacts");
+    const publish = workflow.indexOf("name: Publish GitHub Release");
+    expect(candidateDownload).toBeGreaterThan(sbomUpload);
+    expect(candidateDownload).toBeLessThan(candidateVerify);
+    expect(workflow.slice(candidateDownload, candidateVerify)).toContain(
+      "pattern: native-*",
+    );
+    expect(workflow.slice(candidateDownload, candidateVerify)).toContain(
+      "merge-multiple: true",
+    );
+    expect(candidateVerify).toBeLessThan(manifest);
+    expect(manifest).toBeLessThan(candidateUpload);
+    const candidateUploadBlock = workflow.slice(candidateUpload, publishDownload);
+    expect(candidateUploadBlock).toContain("if-no-files-found: error");
+    expect(candidateUploadBlock).not.toContain("overwrite: true");
+    expect(candidateUploadBlock).not.toContain("overwrite:");
+    expect(candidateUpload).toBeLessThan(publishDownload);
+    expect(publishDownload).toBeLessThan(publishVerify);
+    expect(publishVerify).toBeLessThan(attest);
+    expect(attest).toBeLessThan(publish);
+    for (const verificationBlock of [
+      workflow.slice(candidateVerify, manifest),
+      workflow.slice(publishVerify, attest),
+    ]) {
+      expect(verificationBlock).toContain("for arch in amd64 arm64");
+      expect(verificationBlock).toContain("packaging/verify-release.sh");
+      expect(verificationBlock).toContain("--no-payload-execution");
+    }
+  });
+
+  it("attests every published executable/package class and rejects version drift", () => {
+    const workflow = repositoryFile(".github/workflows/release.yml");
+
+    expect(workflow).toContain(
+      "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+    );
+    expect(workflow).toContain(
+      "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+    );
+    expect(workflow).toContain(
+      "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2",
+    );
+    expect(workflow).toContain("artifact-metadata: write");
+    expect(workflow).not.toContain("actions/attest-build-provenance");
+    for (const pattern of [
+      "release/*.deb",
+      "release/*.tar.gz",
+      "release/*.opspkg",
+      "release/*.spdx.json",
+      "release/manifest.json",
+      "release/checksums.txt",
+    ]) {
+      expect(workflow).toContain(pattern);
+    }
+    expect(workflow).toContain('require("./package-lock.json").packages[""].version');
+    expect(workflow).toContain("pinned runtime is below engines.node");
+    expect(workflow).toContain("--verify-tag");
+    const manifestBuilder = repositoryFile("packaging/create-release-manifest.sh");
+    for (const required of [
+      "ops-agent-linux-amd64.tar.gz",
+      "ops-agent-linux-arm64.tar.gz",
+      'ops-agent-all_${version}_amd64.deb',
+      'ops-agent-all_${version}_arm64.deb',
+      "ops-agent-linux-amd64.spdx.json",
+      "ops-agent-linux-arm64.spdx.json",
+      'adapter-botmux_${botmux_plugin_version}.opspkg',
+      'workload-hermes_${hermes_plugin_version}.opspkg',
+    ]) {
+      expect(manifestBuilder).toContain(required);
+    }
+    expect(manifestBuilder).toContain("Release asset set is incomplete");
+  });
+});

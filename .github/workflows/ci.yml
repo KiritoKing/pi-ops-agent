@@ -1,31 +1,1057 @@
 name: CI
 
 on:
+  workflow_call:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 permissions:
   contents: read
+
+env:
+  GO_VERSION: 1.26.5
+  NODE_VERSION: 22.23.2
+  RELEASE_VERSION: 0.3.2
 
 jobs:
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
       - run: npm run build
-      - run: go test ./cmd/... ./internal/...
+      - name: Validate native installer and packaging shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          bash -n scripts/*.sh packaging/*.sh
+          node --check plugins/workload-hermes/prepare-credentials.mjs
+          node --check scripts/configure-plugin-credentials.mjs
+          node --check scripts/initialize-target-policy.mjs
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("plugins/workload-hermes/ops-healthcheck.py").read_text())'
+      - run: go vet ./cmd/... ./internal/...
+      - run: go test -race ./internal/...
       - run: go build ./cmd/...
+      - run: git diff --check
+
+  adapter-linux-runtime:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
+      - run: npm run build
+      - name: Install the pinned Adapter sandbox build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates curl libcap-dev libcap2-bin \
+            meson ninja-build pkg-config xz-utils
+      - name: Build and install the pinned unprivileged bubblewrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly bwrap_version="0.9.0"
+          readonly bwrap_sha256="c6347eaced49ac0141996f46bba3b089e5e6ea4408bc1c43bab9f2d05dd094e1"
+          readonly bwrap_archive="${RUNNER_TEMP}/bubblewrap-${bwrap_version}.tar.xz"
+          readonly bwrap_source="${RUNNER_TEMP}/bubblewrap-${bwrap_version}"
+          readonly bwrap_build="${RUNNER_TEMP}/bubblewrap-build"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/containers/bubblewrap/releases/download/v0.9.0/bubblewrap-0.9.0.tar.xz" \
+            --output "${bwrap_archive}"
+          printf '%s  %s\n' "${bwrap_sha256}" "${bwrap_archive}" \
+            | sha256sum --check --strict
+          tar -xJf "${bwrap_archive}" -C "${RUNNER_TEMP}"
+          meson setup "${bwrap_build}" "${bwrap_source}" \
+            --buildtype=release \
+            -Dtests=false \
+            -Dman=disabled \
+            -Dselinux=disabled \
+            -Dbash_completion=disabled \
+            -Dzsh_completion=disabled
+          meson compile -C "${bwrap_build}" bwrap
+          if [[ -e /usr/bin/bwrap || -L /usr/bin/bwrap ]]; then
+            echo "Refusing to replace a pre-existing /usr/bin/bwrap" >&2
+            exit 1
+          fi
+          sudo /usr/bin/install -o root -g root -m 0755 \
+            "${bwrap_build}/bwrap" /usr/bin/bwrap
+          test "$(/usr/bin/bwrap --version)" = "bubblewrap ${bwrap_version}"
+          test "$(/usr/bin/readlink -f /usr/bin/bwrap)" = "/usr/bin/bwrap"
+          test -f /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test ! -u /usr/bin/bwrap
+          test ! -g /usr/bin/bwrap
+          test "$(/usr/bin/stat -c '%U:%G:%a:nlink%h' /usr/bin/bwrap)" = \
+            "root:root:755:nlink1"
+          bwrap_capabilities="$(/usr/sbin/getcap /usr/bin/bwrap)"
+          test -z "${bwrap_capabilities}"
+          /usr/bin/bwrap --help | /usr/bin/grep -F -- '--disable-userns' >/dev/null
+      - name: Install the root-owned Adapter Node runtime fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly install_root="/opt/pi-ops-agent"
+          readonly release_version="${RELEASE_VERSION}"
+          readonly release_root="${install_root}/releases/${release_version}"
+          readonly node_bin="${release_root}/runtime/node"
+          readonly current_link="${install_root}/current"
+          node_source="$(/usr/bin/readlink -f "$(command -v node)")"
+          test -f "${node_source}"
+          test -x "${node_source}"
+          node_version="$("${node_source}" -p 'process.versions.node')"
+          test "${node_version}" = "${NODE_VERSION}"
+          node_digest="$(/usr/bin/sha256sum "${node_source}" | /usr/bin/cut -d' ' -f1)"
+          test -d /opt
+          test ! -L /opt
+          test "$(/usr/bin/stat -c '%U:%G' /opt)" = "root:root"
+          sudo /usr/bin/chmod 0755 /opt
+          test "$(/usr/bin/stat -c '%U:%G:%a' /opt)" = "root:root:755"
+          if [[ -e "${install_root}" || -L "${install_root}" ]]; then
+            echo "Refusing to reuse a pre-existing /opt/pi-ops-agent fixture" >&2
+            exit 1
+          fi
+          sudo /usr/bin/install -d -o root -g root -m 0755 \
+            "${install_root}" "${install_root}/releases" \
+            "${release_root}" "${release_root}/runtime"
+          sudo /usr/bin/install -o root -g root -m 0755 \
+            "${node_source}" "${node_bin}"
+          sudo /usr/bin/ln -s "releases/${release_version}" "${current_link}"
+          sudo /usr/bin/chown -h root:root "${current_link}"
+          for directory in \
+            "${install_root}" "${install_root}/releases" \
+            "${release_root}" "${release_root}/runtime"; do
+            test -d "${directory}"
+            test ! -L "${directory}"
+            test "$(/usr/bin/stat -c '%U:%G:%a' "${directory}")" = "root:root:755"
+          done
+          test -L "${current_link}"
+          test "$(/usr/bin/stat -c '%U:%G' "${current_link}")" = "root:root"
+          test "$(/usr/bin/readlink "${current_link}")" = \
+            "releases/${release_version}"
+          test "$(/usr/bin/readlink -f "${current_link}")" = "${release_root}"
+          test "$(/usr/bin/readlink -f "${current_link}/runtime/node")" = \
+            "${node_bin}"
+          test "$("${node_bin}" -p 'process.versions.node')" = "${NODE_VERSION}"
+          test "$(/usr/bin/sha256sum "${node_bin}" | /usr/bin/cut -d' ' -f1)" = \
+            "${node_digest}"
+          test "$(/usr/bin/readlink -f "${node_bin}")" = "${node_bin}"
+          test -f "${node_bin}"
+          test ! -L "${node_bin}"
+          test ! -u "${node_bin}"
+          test ! -g "${node_bin}"
+          test "$(/usr/bin/stat -c '%U:%G:%a:nlink%h' "${node_bin}")" = \
+            "root:root:755:nlink1"
+          node_capabilities="$(/usr/sbin/getcap "${node_bin}")"
+          test -z "${node_capabilities}"
+      - name: Create the disposable Adapter identity fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_identity="$(id -a)"
+          if /usr/bin/getent passwd ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-botmux >/dev/null \
+            || /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Disposable runner unexpectedly contains an ops-agent probe identity" >&2
+            exit 1
+          fi
+          sudo /usr/sbin/groupadd --system ops-agent-client
+          sudo /usr/sbin/groupadd --system ops-agent-botmux
+          sudo /usr/sbin/useradd --system \
+            --gid ops-agent-botmux \
+            --groups ops-agent-client \
+            --home-dir /var/lib/ops-agent/adapters/botmux \
+            --shell /usr/sbin/nologin \
+            --no-create-home \
+            ops-agent-botmux
+          sudo /usr/bin/install -d \
+            -o ops-agent-botmux -g ops-agent-botmux -m 0700 \
+            /var/lib/ops-agent/adapters/botmux
+          test "$(id -a)" = "${runner_identity}"
+      - name: Run the release-blocking real Linux Adapter probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly node_bin="/opt/pi-ops-agent/current/runtime/node"
+          readonly node_directory="/opt/pi-ops-agent/current/runtime"
+          setup_node_directory="$(dirname "$(command -v node)")"
+          test -x "${node_bin}"
+          test -x "${setup_node_directory}/npm"
+          set +e
+          sudo /usr/bin/env \
+            "OPS_AGENT_ADAPTER_PROBE_NODE_PATH=${node_bin}" \
+            "PATH=${node_directory}:${setup_node_directory}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            npm run test:adapter-linux-runtime
+          probe_status="$?"
+          set -e
+          if [[ "${probe_status}" -ne 0 ]]; then
+            echo "Real Linux Adapter probe failed with status ${probe_status}; status 77 is unverified and blocks release" >&2
+            exit "${probe_status}"
+          fi
+
+  installer-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Install native release and fixture dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            apparmor apparmor-profiles binutils bubblewrap ca-certificates \
+            coreutils curl diffutils dpkg \
+            findutils gawk grep gzip libcap2-bin openssl sudo tar util-linux xz-utils
+      - name: Build the native amd64 release payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node -p 'require("./package.json").version')" = "${RELEASE_VERSION}"
+          test "$(node -p 'require("./package-lock.json").packages[""]?.version')" = "${RELEASE_VERSION}"
+          test "$(node -p 'process.versions.node')" = "${NODE_VERSION}"
+          npm ci --ignore-scripts --registry=https://registry.npmjs.org
+          npm run build
+          npm prune --omit=dev --ignore-scripts
+
+          install -d -m 0755 release-bin node-runtime release
+          release_commands=(
+            ops-agent-server
+            ops-root-helper
+            agentd-guardian
+            agentd-client-gateway
+            agentd-pluginctl
+            agentd-approval-submit
+            agentd-json-config-helper
+          )
+          for command_name in "${release_commands[@]}"; do
+            test -f "cmd/${command_name}/main.go"
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+              -ldflags="-s -w" \
+              -o "release-bin/${command_name}" "./cmd/${command_name}"
+          done
+          test ! -e release-bin/ops-systemd-helper
+
+          node_archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          node_base="https://nodejs.org/dist/v${NODE_VERSION}"
+          curl -fsSLo "${RUNNER_TEMP}/${node_archive}" "${node_base}/${node_archive}"
+          curl -fsSLo "${RUNNER_TEMP}/SHASUMS256.txt" "${node_base}/SHASUMS256.txt"
+          (
+            cd "${RUNNER_TEMP}"
+            grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict
+          )
+          tar -xJf "${RUNNER_TEMP}/${node_archive}" --strip-components=1 -C node-runtime
+          test "$(node-runtime/bin/node -p 'process.versions.node')" = "${NODE_VERSION}"
+
+          packaging/build-release.sh \
+            --version "${RELEASE_VERSION}" \
+            --arch amd64 \
+            --node-runtime-dir node-runtime \
+            --bin-dir release-bin \
+            --output-dir release
+          packaging/verify-release.sh \
+            --version "${RELEASE_VERSION}" \
+            --arch amd64 \
+            --node-version "${NODE_VERSION}" \
+            --archive "release/ops-agent-linux-amd64.tar.gz" \
+            --deb "release/ops-agent-all_${RELEASE_VERSION}_amd64.deb"
+
+          install_fixture="${RUNNER_TEMP}/ops-agent-install-fixture"
+          install -d -m 0755 "${install_fixture}"
+          tar -xzf release/ops-agent-linux-amd64.tar.gz -C "${install_fixture}"
+          test "$(<"${install_fixture}/payload/VERSION")" = "${RELEASE_VERSION}"
+          test -x "${install_fixture}/ops-agent-bootstrap"
+          test -x "${install_fixture}/configure-noble-bwrap-apparmor.sh"
+          cmp -s "${install_fixture}/configure-noble-bwrap-apparmor.sh" \
+            "${install_fixture}/payload/app/scripts/configure-noble-bwrap-apparmor.sh"
+          (
+            cd release
+            sha256sum ops-agent-linux-amd64.tar.gz \
+              >ops-agent-linux-amd64.tar.gz.sha256
+          )
+      - name: Export the verified installer payload for the join gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-runtime-amd64
+          path: |
+            release/ops-agent-linux-amd64.tar.gz
+            release/ops-agent-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+      - name: Prepare the disposable restricted-userns host fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^ID=(ubuntu|"ubuntu")$' /etc/os-release
+          grep -Eq '^VERSION_ID=(24\.04|"24\.04")$' /etc/os-release
+          grep -Eq '^[Yy]$' /sys/module/apparmor/parameters/enabled
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          if sudo /usr/bin/test -r /sys/kernel/security/apparmor/profiles; then
+            sudo /usr/bin/awk \
+              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print }' \
+              /sys/kernel/security/apparmor/profiles \
+              >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-before"
+          else
+            printf 'unavailable\n' >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-before"
+          fi
+          for path in /etc/apparmor.d/bwrap-userns-restrict \
+              /etc/apparmor.d/local/bwrap-userns-restrict; do
+            if sudo /usr/bin/test -e "${path}" || sudo /usr/bin/test -L "${path}"; then
+              echo "Disposable runner unexpectedly has managed host policy ${path}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent passwd opsadmin >/dev/null; then
+            echo "Disposable runner unexpectedly contains opsadmin" >&2
+            exit 1
+          fi
+          for identity in ops-agent ops-agent-server ops-agent-reviewer ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Disposable runner unexpectedly contains ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Disposable runner unexpectedly contains ops-agent-client" >&2
+            exit 1
+          fi
+          sudo /usr/sbin/useradd --user-group --create-home --shell /bin/bash opsadmin
+          ephemeral_password="$(openssl rand -hex 24)"
+          printf 'opsadmin:%s\n' "${ephemeral_password}" | sudo /usr/sbin/chpasswd
+          unset ephemeral_password
+          test "$(id -u opsadmin)" -gt 0
+          test "$(id -nG opsadmin)" = opsadmin
+          if sudo -n -u opsadmin /usr/bin/sudo -n /usr/bin/true 2>/dev/null; then
+            echo "opsadmin unexpectedly has passwordless sudo" >&2
+            exit 1
+          fi
+
+      - name: Reject host policy and controller init before persistent mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          root_bootstrap_fixture="$(sudo mktemp -d /var/tmp/ops-agent-bootstrap-ci.XXXXXX)"
+          case "${root_bootstrap_fixture}" in
+            /var/tmp/ops-agent-bootstrap-ci.*) ;;
+            *) echo "mktemp returned an unsafe bootstrap fixture" >&2; exit 1 ;;
+          esac
+          sudo tar -xzf release/ops-agent-linux-amd64.tar.gz \
+            -C "${root_bootstrap_fixture}"
+
+          inspect_log="${RUNNER_TEMP}/ops-agent-host-policy-inspect.log"
+          set +e
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" \
+            host-policy inspect >"${inspect_log}" 2>&1
+          inspect_status="$?"
+          set -e
+          if [[ "${inspect_status}" -eq 0 ]]; then
+            echo "Unsupported host-policy inspect unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'host-policy inspect is unsupported; no AppArmor policy was changed' \
+            "${inspect_log}"
+
+          install_log="${RUNNER_TEMP}/ops-agent-host-policy-install.log"
+          set +e
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" \
+            host-policy install \
+            --approve-digest sha256:d2b2928681d31e9430a9a2a1949ead607580311cba35b776e6a651e1d67254ef \
+            >"${install_log}" 2>&1
+          install_status="$?"
+          set -e
+          if [[ "${install_status}" -eq 0 ]]; then
+            echo "Unsupported host-policy install unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'host-policy install is unsupported; no AppArmor policy was changed' \
+            "${install_log}"
+
+          init_log="${RUNNER_TEMP}/ops-agent-early-init.log"
+          set +e
+          sudo "${root_bootstrap_fixture}/ops-agent-bootstrap" init \
+            --admin-user opsadmin \
+            --approve-required-plugins \
+            --no-start >"${init_log}" 2>&1
+          init_status="$?"
+          set -e
+          if [[ "${init_status}" -eq 0 ]]; then
+            echo "Restricted-userns controller init unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'Controller init is unsupported while AppArmor restricted unprivileged user namespaces are enabled.' \
+            "${init_log}"
+          grep -Fq 'No controller account, unit, plugin, release, or host AppArmor policy was changed.' \
+            "${init_log}"
+          if grep -Fq 'Installation failed;' "${init_log}"; then
+            echo "Restricted-userns rejection started an install transaction" >&2
+            exit 1
+          fi
+
+          managed_absent=(
+            /opt/pi-ops-agent
+            /etc/ops-agent
+            /var/lib/ops-agent
+            /var/log/ops-agent
+            /run/ops-agent
+            /etc/tmpfiles.d/ops-agent.conf
+            /etc/sudoers.d/zzzz-ops-agent-approval
+            /usr/local/bin/ops-agent
+            /usr/lib/ops-agent
+            /usr/libexec/pi-ops-agent
+            /etc/systemd/system/ops-agent.target
+            /etc/systemd/system/ops-agent.target.wants
+            /etc/systemd/system/ops-agentd.service
+            /etc/systemd/system/ops-agentd.service.d
+            /etc/systemd/system/agentd-client-gateway.service
+            /etc/systemd/system/agentd-client-gateway.service.d
+            /etc/systemd/system/agentd-guardian.service
+            /etc/systemd/system/agentd-guardian.service.d
+            /etc/systemd/system/agentd-approval-reviewer.service
+            /etc/systemd/system/agentd-approval-reviewer.service.d
+            /etc/systemd/system/agentd-plugin-lease-broker.service
+            /etc/systemd/system/agentd-plugin-lease-broker.service.d
+            /etc/systemd/system/ops-agent-server.service
+            /etc/systemd/system/ops-agent-server.service.d
+            /etc/systemd/system/ops-root-helper.service
+            /etc/systemd/system/ops-root-helper.service.d
+            /etc/systemd/system/ops-pve-root-helper.service
+            /etc/systemd/system/ops-pve-root-helper.service.d
+            /etc/systemd/system/ops-agent-healthcheck.service
+            /etc/systemd/system/ops-agent-healthcheck.service.d
+            /etc/systemd/system/ops-agent-healthcheck.timer
+          )
+          for path in "${managed_absent[@]}"; do
+            if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
+              echo "Early rejection created managed path ${path}" >&2
+              exit 1
+            fi
+          done
+          for identity in ops-agent ops-agent-server ops-agent-reviewer ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Early rejection created managed identity ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Early rejection created ops-agent-client" >&2
+            exit 1
+          fi
+          test "$(id -nG opsadmin)" = opsadmin
+          for path in /etc/apparmor.d/bwrap-userns-restrict \
+              /etc/apparmor.d/local/bwrap-userns-restrict; do
+            if sudo /usr/bin/test -e "${path}" || sudo /usr/bin/test -L "${path}"; then
+              echo "Unsupported path created host policy ${path}" >&2
+              exit 1
+            fi
+          done
+          if sudo /usr/bin/test -r /sys/kernel/security/apparmor/profiles; then
+            sudo /usr/bin/awk \
+              '/^(bwrap|unpriv_bwrap)( |\/\/)/ { print }' \
+              /sys/kernel/security/apparmor/profiles \
+              >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
+          else
+            printf 'unavailable\n' >"${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
+          fi
+          cmp -s "${RUNNER_TEMP}/ops-agent-bwrap-profiles-before" \
+            "${RUNNER_TEMP}/ops-agent-bwrap-profiles-after"
+          if find /run/systemd/system -maxdepth 2 \
+              -name 'ops-agent-bwrap-probe-*' -print -quit | grep -q .; then
+            echo "Early rejection created a static sandbox probe" >&2
+            exit 1
+          fi
+          if find /var/tmp -maxdepth 1 \
+              -name 'ops-agent-install.*' -print -quit | grep -q .; then
+            echo "Early rejection created transaction scratch" >&2
+            exit 1
+          fi
+          test -z "$(systemctl list-units --all --plain --no-legend \
+            'ops-agent-bwrap-probe-*.service')"
+
+          sudo find "${root_bootstrap_fixture}" -xdev -mindepth 1 -depth -delete
+          sudo rmdir "${root_bootstrap_fixture}"
+  join-installer-runtime:
+    needs: installer-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Download the installer-runtime verified payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installer-runtime-amd64
+          path: ${{ runner.temp }}/ops-agent-join-release
+      - name: Prepare a fresh non-PVE systemd host
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ca-certificates coreutils diffutils findutils grep gzip openssl tar
+
+          if [[ -e /usr/bin/pvesh ]] || [[ -x /usr/bin/pvesh ]]; then
+            echo "Disposable join runner unexpectedly has the PVE entrypoint" >&2
+            exit 1
+          fi
+          for identity in ops-agent ops-agent-server ops-agent-reviewer ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Disposable join runner unexpectedly contains ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Disposable join runner unexpectedly contains ops-agent-client" >&2
+            exit 1
+          fi
+          for path in /opt/pi-ops-agent /etc/ops-agent /var/lib/ops-agent \
+              /var/log/ops-agent /etc/systemd/system/ops-agent-server.service \
+              /etc/systemd/system/ops-root-helper.service \
+              /etc/systemd/system/ops-pve-root-helper.service; do
+            if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
+              echo "Disposable join runner is not fresh: ${path}" >&2
+              exit 1
+            fi
+          done
+
+          install_fixture="${RUNNER_TEMP}/ops-agent-join-fixture"
+          install -d -m 0755 "${install_fixture}"
+          (
+            cd "${RUNNER_TEMP}/ops-agent-join-release"
+            sha256sum --check --strict ops-agent-linux-amd64.tar.gz.sha256
+          )
+          tar -xzf \
+            "${RUNNER_TEMP}/ops-agent-join-release/ops-agent-linux-amd64.tar.gz" \
+            -C "${install_fixture}"
+          test "$(<"${install_fixture}/payload/VERSION")" = "${RELEASE_VERSION}"
+
+          # Model a host-wide policy that weakens service defaults. The
+          # unit-name-specific release policies must restore the join plane's
+          # complete effective security vector after PID 1 merges all drop-ins.
+          cat >"${RUNNER_TEMP}/10-ci-weak-reset.conf" <<'EOF'
+          [Service]
+          ProcSubset=all
+          ProtectProc=default
+          ProtectControlGroups=no
+          ProtectKernelTunables=no
+          NoNewPrivileges=no
+          PrivateNetwork=no
+          ProtectHome=no
+          ProtectSystem=no
+          PrivateDevices=no
+          PrivateTmp=no
+          ProtectKernelLogs=no
+          ProtectKernelModules=no
+          ReadWritePaths=
+          ReadOnlyPaths=
+          SupplementaryGroups=
+          EOF
+          sudo /usr/bin/install -d -o root -g root -m 0755 \
+            /run/systemd/system/service.d
+          sudo /usr/bin/install -o root -g root -m 0644 \
+            "${RUNNER_TEMP}/10-ci-weak-reset.conf" \
+            /run/systemd/system/service.d/10-ci-weak-reset.conf
+          sudo /usr/bin/systemctl daemon-reload
+      - name: Issue a signed bundle and perform a fresh non-PVE join
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_fixture="${RUNNER_TEMP}/ops-agent-join-fixture"
+          issuer_root=/root/ops-agent-ci-enrollment-issuer
+          enrollment_token=/root/ops-agent-ci-endpoint.opstoken
+          controller_origin=https://controller-ci.invalid:7443
+
+          sudo /usr/sbin/groupadd --system ops-agent-ci-controller
+          sudo /usr/bin/install -d -o root -g root -m 0750 "${issuer_root}"
+          sudo /usr/bin/install -d -o root -g root -m 0700 "${issuer_root}/tls"
+          sudo /usr/bin/openssl req -x509 -newkey ed25519 -nodes -days 1 \
+            -subj '/CN=Pi Ops Agent CI Enrollment CA' \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign,digitalSignature' \
+            -keyout "${issuer_root}/tls/ca.key" \
+            -out "${issuer_root}/tls/ca.crt"
+          sudo /usr/bin/openssl genpkey -algorithm ED25519 \
+            -out "${issuer_root}/tls/approval.key.pem"
+          sudo /usr/bin/openssl pkey \
+            -in "${issuer_root}/tls/approval.key.pem" -pubout \
+            -out "${issuer_root}/tls/approval.pub.pem"
+          sudo /usr/bin/openssl genpkey -algorithm ED25519 \
+            -out "${issuer_root}/tls/agent.key"
+          sudo /usr/bin/openssl req -new \
+            -key "${issuer_root}/tls/agent.key" \
+            -subj '/CN=Pi Ops Agent CI Controller' \
+            -out "${issuer_root}/tls/agent.csr"
+          sudo /usr/bin/openssl x509 -req -days 1 \
+            -in "${issuer_root}/tls/agent.csr" \
+            -CA "${issuer_root}/tls/ca.crt" \
+            -CAkey "${issuer_root}/tls/ca.key" \
+            -CAcreateserial -out "${issuer_root}/tls/agent.crt"
+          sudo /usr/bin/chown -R root:root "${issuer_root}/tls"
+          sudo /usr/bin/chmod 0600 \
+            "${issuer_root}/tls/ca.key" \
+            "${issuer_root}/tls/approval.key.pem" \
+            "${issuer_root}/tls/agent.key"
+          sudo /usr/bin/chmod 0644 \
+            "${issuer_root}/tls/ca.crt" \
+            "${issuer_root}/tls/approval.pub.pem" \
+            "${issuer_root}/tls/agent.crt"
+
+          cat >"${RUNNER_TEMP}/controller-servers.json" <<EOF
+          {"version":1,"servers":[{"serverId":"server-controller-ci-12345678","machineId":"machine-controller-ci-12345678","baseUrl":"${controller_origin}","caPath":"${issuer_root}/tls/ca.crt","certPath":"${issuer_root}/tls/agent.crt","keyPath":"${issuer_root}/tls/agent.key","approvalSigningKeyPath":"${issuer_root}/tls/approval.key.pem","approvalKeyId":"local-approver-v1","enabled":true}]}
+          EOF
+          sudo /usr/bin/install -o root -g ops-agent-ci-controller -m 0640 \
+            "${RUNNER_TEMP}/controller-servers.json" "${issuer_root}/servers.json"
+
+          issue_result="$(sudo "${install_fixture}/payload/app/bin/ops-agent-server" \
+            issue-enrollment \
+            --controller "${controller_origin}" \
+            --endpoint https://endpoint-ci.invalid:7443 \
+            --machine-id machine-endpoint-ci-12345678 \
+            --machine-name endpoint-ci \
+            --output "${enrollment_token}" \
+            --config-root "${issuer_root}")"
+          controller_pin="${issue_result#controller-ca-sha256=}"
+          test "${issue_result}" = "controller-ca-sha256=${controller_pin}"
+          [[ "${controller_pin}" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' "${enrollment_token}")" = \
+            root:root:600:1
+          sudo "${install_fixture}/payload/app/runtime/node" -e '
+            const fs = require("node:fs");
+            const bundle = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (bundle.version !== 2 || bundle.controller !== process.argv[2]
+                || typeof bundle.signature !== "string" || bundle.signature.length < 80
+                || bundle.pveReceiptKeyId !== undefined
+                || bundle.pveReceiptPrivateKeyPem !== undefined
+                || bundle.pveReceiptPublicKeyPem !== undefined) {
+              throw new Error("issued enrollment is not a signed non-PVE v2 bundle");
+            }
+          ' "${enrollment_token}" "${controller_origin}"
+
+          sudo /usr/bin/sha256sum "${enrollment_token}" \
+            >"${RUNNER_TEMP}/fresh-join-token.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_token}" \
+            >"${RUNNER_TEMP}/fresh-join-token.stat"
+          failed_fresh_log="${RUNNER_TEMP}/ops-agent-failed-fresh-join.log"
+          set +e
+          sudo /usr/bin/env \
+            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
+            OPS_AGENT_TEST_FAIL_AT=services \
+            "${install_fixture}/install-release.sh" join \
+              --controller "${controller_origin}" \
+              --controller-ca-sha256 "${controller_pin}" \
+              --token-file "${enrollment_token}" \
+              --no-start 2>&1 | tee "${failed_fresh_log}"
+          failed_fresh_status="${PIPESTATUS[0]}"
+          set -e
+          test "${failed_fresh_status}" -eq 97
+          grep -Fq 'Injected install failure after stage services.' \
+            "${failed_fresh_log}"
+          grep -Fq \
+            'Installation failed; all managed paths, identities and unit state were restored.' \
+            "${failed_fresh_log}"
+          if grep -Fq 'rollback was incomplete' "${failed_fresh_log}"; then
+            echo "Fresh join failure reported an incomplete rollback" >&2
+            exit 1
+          fi
+
+          fresh_managed_absent=(
+            /opt/pi-ops-agent
+            /etc/ops-agent
+            /var/lib/ops-agent
+            /var/log/ops-agent
+            /run/ops-agent
+            /etc/tmpfiles.d/ops-agent.conf
+            /usr/lib/ops-agent
+            /etc/systemd/system/ops-agent-server.service
+            /etc/systemd/system/ops-agent-server.service.d
+            /etc/systemd/system/ops-root-helper.service
+            /etc/systemd/system/ops-root-helper.service.d
+            /etc/systemd/system/ops-pve-root-helper.service
+            /etc/systemd/system/ops-pve-root-helper.service.d
+            /etc/systemd/system/ops-agent.target.wants
+            /etc/systemd/system/multi-user.target.wants/ops-agent-server.service
+            /etc/systemd/system/multi-user.target.wants/ops-root-helper.service
+            /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service
+          )
+          for path in "${fresh_managed_absent[@]}"; do
+            if [[ -e "${path}" ]] || [[ -L "${path}" ]]; then
+              echo "Fresh join rollback retained managed path ${path}" >&2
+              exit 1
+            fi
+          done
+          for identity in ops-agent ops-agent-server ops-agent-reviewer \
+              ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Fresh join rollback retained managed identity ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Fresh join rollback retained ops-agent-client" >&2
+            exit 1
+          fi
+          sudo /usr/bin/sha256sum "${enrollment_token}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/fresh-join-token.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_token}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/fresh-join-token.stat"
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/10-ci-weak-reset.conf" \
+            /run/systemd/system/service.d/10-ci-weak-reset.conf
+          test -z "$(find /var/tmp -maxdepth 1 \
+            -name 'ops-agent-install.*' -print -quit)"
+
+          fresh_log="${RUNNER_TEMP}/ops-agent-fresh-join.log"
+          sudo /usr/bin/env \
+            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
+            "${install_fixture}/install-release.sh" join \
+              --controller "${controller_origin}" \
+              --controller-ca-sha256 "${controller_pin}" \
+              --token-file "${enrollment_token}" \
+              --no-start 2>&1 | tee "${fresh_log}"
+          grep -Fq "Pi Ops Agent endpoint ${RELEASE_VERSION} installed and enrolled." \
+            "${fresh_log}"
+          sudo /usr/bin/rm -f -- "${enrollment_token}"
+          sudo /usr/bin/find "${issuer_root}" -mindepth 1 -depth -delete
+          sudo /usr/bin/rmdir -- "${issuer_root}"
+          sudo /usr/sbin/groupdel ops-agent-ci-controller
+          test ! -e "${issuer_root}"
+          if /usr/bin/getent group ops-agent-ci-controller >/dev/null; then
+            echo "Enrollment issuer fixture group survived bundle issuance" >&2
+            exit 1
+          fi
+          printf '%s\n' "${controller_pin}" >"${RUNNER_TEMP}/join-controller-pin"
+
+          enrollment_files=(
+            /etc/ops-agent/endpoint-enrollment.json
+            /etc/ops-agent/server-identity.json
+            /etc/ops-agent/targets.json
+            /etc/ops-agent/runtime.env
+            /etc/ops-agent/tls/ca.crt
+            /etc/ops-agent/tls/client-ca.crt
+            /etc/ops-agent/tls/server.crt
+            /etc/ops-agent/tls/server.key
+            /etc/ops-agent/tls/approval.pub.pem
+            /etc/ops-agent/broker-receipts/private/core.key.pem
+            /etc/ops-agent/broker-receipts/core-public.pem
+          )
+          sudo /usr/bin/sha256sum "${enrollment_files[@]}" \
+            >"${RUNNER_TEMP}/join-config.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_files[@]}" \
+            >"${RUNNER_TEMP}/join-config.stat"
+
+          test "$(systemctl is-enabled ops-agent-server.service)" = enabled
+          test "$(systemctl is-enabled ops-root-helper.service)" = enabled
+          for unit in ops-agent-server.service ops-root-helper.service; do
+            if systemctl is-active --quiet "${unit}"; then
+              echo "Fresh --no-start join left ${unit} active" >&2
+              exit 1
+            fi
+          done
+          test ! -e /etc/systemd/system/ops-pve-root-helper.service
+          test ! -e /etc/systemd/system/ops-pve-root-helper.service.d
+          test ! -e /etc/ops-agent/broker-receipts/private/pve.key.pem
+          test ! -e /etc/ops-agent/broker-receipts/pve-public.pem
+      - name: Prove a late join failure restores stale PVE surfaces and evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_fixture="${RUNNER_TEMP}/ops-agent-join-fixture"
+          controller_origin=https://controller-ci.invalid:7443
+          controller_pin="$(<"${RUNNER_TEMP}/join-controller-pin")"
+          pve_dropin_root=/etc/systemd/system/ops-pve-root-helper.service.d
+
+          cat >"${RUNNER_TEMP}/50-ci-third-party-pve.conf" <<'EOF'
+          [Service]
+          TimeoutStartSec=45s
+          EOF
+          printf '%s\n' 'historical-pve-state-must-survive' \
+            >"${RUNNER_TEMP}/pve-state-marker"
+          printf '%s\n' \
+            '{"version":1,"event":"historical-pve-audit-must-survive"}' \
+            >"${RUNNER_TEMP}/pve-audit-marker"
+          sudo /usr/bin/install -d -o root -g root -m 0700 \
+            /var/lib/ops-agent/pve-root-helper \
+            /var/log/ops-agent/pve-root-helper
+          sudo /usr/bin/install -o root -g root -m 0600 \
+            "${RUNNER_TEMP}/pve-state-marker" \
+            /var/lib/ops-agent/pve-root-helper/historical.marker
+          sudo /usr/bin/install -o root -g root -m 0600 \
+            "${RUNNER_TEMP}/pve-audit-marker" \
+            /var/log/ops-agent/pve-root-helper/audit.jsonl
+
+          sudo /usr/bin/install -o root -g root -m 0644 \
+            "${install_fixture}/payload/app/systemd/ops-pve-root-helper.service" \
+            /etc/systemd/system/ops-pve-root-helper.service
+          sudo /usr/bin/install -d -o root -g root -m 0755 "${pve_dropin_root}"
+          sudo /usr/bin/install -o root -g root -m 0644 \
+            "${install_fixture}/payload/app/systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf" \
+            "${pve_dropin_root}/zzzz-ops-agent-security.conf"
+          sudo /usr/bin/install -o root -g root -m 0644 \
+            "${RUNNER_TEMP}/50-ci-third-party-pve.conf" \
+            "${pve_dropin_root}/50-ci-third-party-pve.conf"
+          sudo /usr/bin/systemctl daemon-reload
+          sudo /usr/bin/systemctl enable ops-pve-root-helper.service
+          test "$(readlink -f \
+            /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service)" = \
+            /etc/systemd/system/ops-pve-root-helper.service
+          sudo /usr/bin/install -d -o root -g root -m 0755 \
+            /etc/systemd/system/ops-agent.target.wants
+          sudo /usr/bin/ln -s \
+            /etc/systemd/system/ops-pve-root-helper.service \
+            /etc/systemd/system/ops-agent.target.wants/ops-pve-root-helper.service
+          sudo /usr/bin/systemctl daemon-reload
+
+          failed_log="${RUNNER_TEMP}/ops-agent-failed-join-upgrade.log"
+          set +e
+          sudo /usr/bin/env \
+            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
+            OPS_AGENT_TEST_FAIL_AT=services \
+            "${install_fixture}/install-release.sh" join \
+              --controller "${controller_origin}" \
+              --controller-ca-sha256 "${controller_pin}" \
+              --no-start 2>&1 | tee "${failed_log}"
+          failed_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "${failed_status}" -eq 0 ]]; then
+            echo "Injected late join failure unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -Fq 'Injected install failure after stage services.' "${failed_log}"
+          grep -Fq \
+            'Installation failed; all managed paths, identities and unit state were restored.' \
+            "${failed_log}"
+          if grep -Fq 'rollback was incomplete' "${failed_log}"; then
+            echo "Late join failure reported an incomplete rollback" >&2
+            exit 1
+          fi
+
+          sudo /usr/bin/cmp -s \
+            "${install_fixture}/payload/app/systemd/ops-pve-root-helper.service" \
+            /etc/systemd/system/ops-pve-root-helper.service
+          sudo /usr/bin/cmp -s \
+            "${install_fixture}/payload/app/systemd/ops-pve-root-helper.service.d/zzzz-ops-agent-security.conf" \
+            "${pve_dropin_root}/zzzz-ops-agent-security.conf"
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
+            /etc/systemd/system/ops-pve-root-helper.service)" = root:root:644:1
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
+            "${pve_dropin_root}/zzzz-ops-agent-security.conf")" = root:root:644:1
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/50-ci-third-party-pve.conf" \
+            "${pve_dropin_root}/50-ci-third-party-pve.conf"
+          test "$(readlink -f \
+            /etc/systemd/system/ops-agent.target.wants/ops-pve-root-helper.service)" = \
+            /etc/systemd/system/ops-pve-root-helper.service
+          test "$(readlink -f \
+            /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service)" = \
+            /etc/systemd/system/ops-pve-root-helper.service
+          test -L \
+            /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/pve-state-marker" \
+            /var/lib/ops-agent/pve-root-helper/historical.marker
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/pve-audit-marker" \
+            /var/log/ops-agent/pve-root-helper/audit.jsonl
+
+          enrollment_files=(
+            /etc/ops-agent/endpoint-enrollment.json
+            /etc/ops-agent/server-identity.json
+            /etc/ops-agent/targets.json
+            /etc/ops-agent/runtime.env
+            /etc/ops-agent/tls/ca.crt
+            /etc/ops-agent/tls/client-ca.crt
+            /etc/ops-agent/tls/server.crt
+            /etc/ops-agent/tls/server.key
+            /etc/ops-agent/tls/approval.pub.pem
+            /etc/ops-agent/broker-receipts/private/core.key.pem
+            /etc/ops-agent/broker-receipts/core-public.pem
+          )
+          sudo /usr/bin/sha256sum "${enrollment_files[@]}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/join-config.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_files[@]}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/join-config.stat"
+          test "$(systemctl is-enabled ops-agent-server.service)" = enabled
+          test "$(systemctl is-enabled ops-root-helper.service)" = enabled
+          test -z "$(find /var/tmp -maxdepth 1 \
+            -name 'ops-agent-install.*' -print -quit)"
+      - name: Upgrade cleanly and verify the non-PVE join topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_fixture="${RUNNER_TEMP}/ops-agent-join-fixture"
+          controller_origin=https://controller-ci.invalid:7443
+          controller_pin="$(<"${RUNNER_TEMP}/join-controller-pin")"
+          pve_dropin_root=/etc/systemd/system/ops-pve-root-helper.service.d
+
+          upgrade_log="${RUNNER_TEMP}/ops-agent-clean-join-upgrade.log"
+          sudo /usr/bin/env \
+            "OPS_AGENT_PAYLOAD_DIR=${install_fixture}/payload" \
+            "${install_fixture}/install-release.sh" join \
+              --controller "${controller_origin}" \
+              --controller-ca-sha256 "${controller_pin}" \
+              --no-start 2>&1 | tee "${upgrade_log}"
+          grep -Fq \
+            "Pi Ops Agent endpoint ${RELEASE_VERSION} upgraded with its validated enrollment unchanged." \
+            "${upgrade_log}"
+
+          for removed_surface in \
+              /etc/systemd/system/ops-pve-root-helper.service \
+              "${pve_dropin_root}/zzzz-ops-agent-security.conf" \
+              /etc/systemd/system/ops-agent.target.wants \
+              /etc/systemd/system/ops-agent.target.wants/ops-pve-root-helper.service \
+              /etc/systemd/system/multi-user.target.wants/ops-pve-root-helper.service; do
+            if [[ -e "${removed_surface}" ]] || [[ -L "${removed_surface}" ]]; then
+              echo "Non-PVE upgrade retained managed PVE surface ${removed_surface}" >&2
+              exit 1
+            fi
+          done
+          test -f "${pve_dropin_root}/50-ci-third-party-pve.conf"
+          test "$(find "${pve_dropin_root}" -mindepth 1 -maxdepth 1 -printf '%f\n')" = \
+            50-ci-third-party-pve.conf
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/50-ci-third-party-pve.conf" \
+            "${pve_dropin_root}/50-ci-third-party-pve.conf"
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
+            "${pve_dropin_root}/50-ci-third-party-pve.conf")" = root:root:644:1
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/pve-state-marker" \
+            /var/lib/ops-agent/pve-root-helper/historical.marker
+          sudo /usr/bin/cmp -s "${RUNNER_TEMP}/pve-audit-marker" \
+            /var/log/ops-agent/pve-root-helper/audit.jsonl
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
+            /var/lib/ops-agent/pve-root-helper/historical.marker)" = root:root:600:1
+          test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' \
+            /var/log/ops-agent/pve-root-helper/audit.jsonl)" = root:root:600:1
+
+          enrollment_files=(
+            /etc/ops-agent/endpoint-enrollment.json
+            /etc/ops-agent/server-identity.json
+            /etc/ops-agent/targets.json
+            /etc/ops-agent/runtime.env
+            /etc/ops-agent/tls/ca.crt
+            /etc/ops-agent/tls/client-ca.crt
+            /etc/ops-agent/tls/server.crt
+            /etc/ops-agent/tls/server.key
+            /etc/ops-agent/tls/approval.pub.pem
+            /etc/ops-agent/broker-receipts/private/core.key.pem
+            /etc/ops-agent/broker-receipts/core-public.pem
+          )
+          sudo /usr/bin/sha256sum "${enrollment_files[@]}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/join-config.sha256"
+          sudo /usr/bin/stat -c '%n|%U:%G:%a:%h|%s' "${enrollment_files[@]}" \
+            | /usr/bin/cmp -s - "${RUNNER_TEMP}/join-config.stat"
+
+          test -f /etc/systemd/system/ops-agent-server.service
+          test -f /etc/systemd/system/ops-root-helper.service
+          test -f /etc/systemd/system/ops-agent-server.service.d/zzzz-ops-agent-security.conf
+          test -f /etc/systemd/system/ops-root-helper.service.d/zzzz-ops-agent-security.conf
+          for forbidden_path in \
+              /etc/systemd/system/ops-agent.target \
+              /etc/systemd/system/ops-agentd.service \
+              /etc/systemd/system/agentd-client-gateway.service \
+              /etc/systemd/system/agentd-guardian.service \
+              /etc/systemd/system/agentd-approval-reviewer.service \
+              /etc/systemd/system/agentd-plugin-lease-broker.service \
+              /etc/systemd/system/ops-agent-healthcheck.service \
+              /etc/systemd/system/ops-agent-healthcheck.timer \
+              /etc/sudoers.d/zzzz-ops-agent-approval \
+              /usr/local/bin/ops-agent \
+              /usr/libexec/pi-ops-agent \
+              /var/lib/ops-agent/plugin-sources \
+              /var/lib/ops-agent/plugins \
+              /etc/ops-agent/agentd.json \
+              /etc/ops-agent/models.json \
+              /etc/ops-agent/approver \
+              /etc/ops-agent/servers.json; do
+            if [[ -e "${forbidden_path}" ]] || [[ -L "${forbidden_path}" ]]; then
+              echo "Join installed controller-only surface ${forbidden_path}" >&2
+              exit 1
+            fi
+          done
+          for identity in ops-agent ops-agent-reviewer ops-agent-botmux ops-agent-lease; do
+            if /usr/bin/getent passwd "${identity}" >/dev/null \
+                || /usr/bin/getent group "${identity}" >/dev/null; then
+              echo "Join created controller-only identity ${identity}" >&2
+              exit 1
+            fi
+          done
+          if /usr/bin/getent group ops-agent-client >/dev/null; then
+            echo "Join created the controller client group" >&2
+            exit 1
+          fi
+          test "$(id -nG ops-agent-server)" = ops-agent-server
+          test "$(systemctl is-enabled ops-agent-server.service)" = enabled
+          test "$(systemctl is-enabled ops-root-helper.service)" = enabled
+          for unit in ops-agent-server.service ops-root-helper.service; do
+            if systemctl is-active --quiet "${unit}"; then
+              echo "Join --no-start left ${unit} active" >&2
+              exit 1
+            fi
+          done
+
+          sudo /usr/bin/systemd-analyze verify \
+            /etc/systemd/system/ops-agent-server.service \
+            /etc/systemd/system/ops-root-helper.service
+          for unit in ops-agent-server.service ops-root-helper.service; do
+            test "$(systemctl show --no-pager --property=FragmentPath --value "${unit}")" = \
+              "/etc/systemd/system/${unit}"
+            dropins=" $(systemctl show --no-pager --property=DropInPaths --value "${unit}") "
+            case "${dropins}" in
+              *" /run/systemd/system/service.d/10-ci-weak-reset.conf "*) ;;
+              *) echo "PID 1 omitted the weak host policy for ${unit}" >&2; exit 1 ;;
+            esac
+            final_dropin="/etc/systemd/system/${unit}.d/zzzz-ops-agent-security.conf"
+            case "${dropins}" in
+              *" ${final_dropin} "*) ;;
+              *) echo "PID 1 omitted the release final policy for ${unit}" >&2; exit 1 ;;
+            esac
+            test "$(sudo /usr/bin/stat -c '%U:%G:%a:%h' "${final_dropin}")" = \
+              root:root:644:1
+            for property in NoNewPrivileges PrivateTmp PrivateDevices \
+                ProtectKernelTunables ProtectHome; do
+              test "$(systemctl show --no-pager --property="${property}" --value "${unit}")" = yes
+            done
+            test -z "$(systemctl show --no-pager --property=ReadWritePaths --value "${unit}")"
+            test -z "$(systemctl show --no-pager --property=SupplementaryGroups --value "${unit}")"
+          done
+          test "$(systemctl show --no-pager --property=ProtectSystem --value \
+            ops-agent-server.service)" = strict
+          test "$(systemctl show --no-pager --property=ProtectProc --value \
+            ops-agent-server.service)" = invisible
+          test "$(systemctl show --no-pager --property=ProcSubset --value \
+            ops-agent-server.service)" = pid
+          test -z "$(systemctl show --no-pager --property=CapabilityBoundingSet --value \
+            ops-agent-server.service)"
+          test "$(systemctl show --no-pager --property=PrivateNetwork --value \
+            ops-root-helper.service)" = yes
+          if grep -Fq pve-root-helper /etc/tmpfiles.d/ops-agent.conf; then
+            echo "Non-PVE join retained a managed PVE tmpfiles entry" >&2
+            exit 1
+          fi
+          test -z "$(find /var/tmp -maxdepth 1 \
+            -name 'ops-agent-install.*' -print -quit)"
